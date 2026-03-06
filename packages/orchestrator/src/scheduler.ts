@@ -22,11 +22,8 @@ export class Scheduler extends EventEmitter {
     // Break recovery: check if agents should come back from break
     this.breakCheckInterval = setInterval(() => this.checkBreaks(), breakCheckMs);
 
-    // Periodic CEO status report
+    // Periodic CEO status report (only fires when at least 1 agent is active)
     this.statusReportInterval = setInterval(() => this.triggerStatusReport(), statusReportMs);
-
-    // First status report after 2 minutes of startup
-    setTimeout(() => this.triggerStatusReport(), 2 * 60_000);
   }
 
   stop(): void {
@@ -78,6 +75,11 @@ export class Scheduler extends EventEmitter {
       const active = agents.filter(a => a.status === 'active');
       const onBreak = agents.filter(a => a.status === 'on_break');
       const idle = agents.filter(a => a.status === 'idle');
+
+      // Skip status report if nobody is working (all idle/paused)
+      if (active.length === 0 && onBreak.length === 0) {
+        return;
+      }
       const inProgress = tasks.filter(t => t.status === 'in_progress');
       const completed = tasks.filter(t => t.status === 'done' || t.status === 'review');
       const blocked = tasks.filter(t => t.status === 'blocked');

@@ -1,7 +1,10 @@
+import Image from "next/image";
+
 interface AgentCardProps {
   name: string;
   role: string;
   status: string;
+  avatar?: string | null;
   currentTask?: string;
   onClick?: () => void;
 }
@@ -22,20 +25,11 @@ const STATUS_LABELS: Record<string, string> = {
   error: "Error",
 };
 
-const ROLE_EMOJI: Record<string, string> = {
-  CEO: "briefcase",
-  "HR Manager": "people",
-  "Software Architect": "building",
-  "Tech Lead / PM": "clipboard",
-  "Senior Developer": "computer",
-  "UI/UX Designer": "palette",
-  Researcher: "magnifier",
-};
-
 export function AgentCard({
   name,
   role,
   status,
+  avatar,
   currentTask,
   onClick,
 }: AgentCardProps) {
@@ -46,9 +40,19 @@ export function AgentCard({
     >
       <div className="flex items-center justify-between mb-3">
         <div className="flex items-center gap-3">
-          <div className="w-10 h-10 bg-gray-100 rounded-full flex items-center justify-center text-lg font-bold text-gray-600">
-            {name[0]}
-          </div>
+          {avatar ? (
+            <Image
+              src={avatar}
+              alt={name}
+              width={40}
+              height={40}
+              className="w-10 h-10 rounded-full object-cover"
+            />
+          ) : (
+            <div className="w-10 h-10 bg-gray-100 rounded-full flex items-center justify-center text-lg font-bold text-gray-600">
+              {name[0]}
+            </div>
+          )}
           <div>
             <p className="font-semibold text-gray-900">{name}</p>
             <p className="text-sm text-gray-500">{role}</p>

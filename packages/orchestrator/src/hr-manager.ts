@@ -8,6 +8,11 @@ import type { StateStore } from './state-store.js';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CUSTOM_BLUEPRINTS_DIR = resolve(__dirname, '../../../data/blueprints');
 
+// Avatar pool counters — track which avatars are assigned
+let nextMaleAvatar = 5;   // m1-m4 used by defaults (Bob, Charlie, Frank, Alex)
+let nextFemaleAvatar = 6; // f1-f5 used by defaults (Alice, Diana, Eve, Grace, Maya)
+const MAX_AVATARS = 15;
+
 export class HRManager {
   private agentManager: AgentManager;
   private store: StateStore;
@@ -63,6 +68,12 @@ export class HRManager {
     blueprint.canCollabWith = blueprint.canCollabWith ?? [];
     blueprint.blacklistOverrides = blueprint.blacklistOverrides ?? [];
 
+    // Assign avatar if not set
+    if (!blueprint.avatar) {
+      blueprint.gender = blueprint.gender ?? 'male';
+      blueprint.avatar = this.assignAvatar(blueprint.gender);
+    }
+
     // Save to disk
     const filePath = resolve(CUSTOM_BLUEPRINTS_DIR, `${blueprint.id}.json`);
     writeFileSync(filePath, JSON.stringify(blueprint, null, 2));
@@ -115,6 +126,16 @@ export class HRManager {
 
   getCustomBlueprints(): AgentBlueprint[] {
     return Array.from(this.customBlueprints.values());
+  }
+
+  private assignAvatar(gender: 'male' | 'female'): string {
+    if (gender === 'male') {
+      const idx = nextMaleAvatar <= MAX_AVATARS ? nextMaleAvatar++ : Math.ceil(Math.random() * MAX_AVATARS);
+      return `/avatars/male/m${idx}.jpg`;
+    } else {
+      const idx = nextFemaleAvatar <= MAX_AVATARS ? nextFemaleAvatar++ : Math.ceil(Math.random() * MAX_AVATARS);
+      return `/avatars/female/f${idx}.jpg`;
+    }
   }
 
   private injectCommunicationStyle(blueprint: AgentBlueprint): string {

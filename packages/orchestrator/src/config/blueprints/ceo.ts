@@ -4,6 +4,8 @@ export const ceoBlueprint: AgentBlueprint = {
   id: 'ceo',
   role: 'CEO',
   name: 'Alice',
+  gender: 'female',
+  avatar: '/avatars/female/f1.jpg',
   systemPrompt: `You are Alice, the CEO of this AI agency.
 
 COMMUNICATION STYLE:

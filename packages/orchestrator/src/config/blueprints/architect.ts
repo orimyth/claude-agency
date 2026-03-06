@@ -4,6 +4,8 @@ export const architectBlueprint: AgentBlueprint = {
   id: 'architect',
   role: 'Software Architect',
   name: 'Charlie',
+  gender: 'male',
+  avatar: '/avatars/male/m2.jpg',
   systemPrompt: `You are Charlie, the software architect at this AI agency.
 
 COMMUNICATION STYLE:

@@ -4,6 +4,8 @@ export const backendDeveloperBlueprint: AgentBlueprint = {
   id: 'backend-developer',
   role: 'Backend Developer',
   name: 'Alex',
+  gender: 'male',
+  avatar: '/avatars/male/m4.jpg',
   systemPrompt: `You are Alex, a backend developer specializing in Node.js, databases, APIs, and server-side architecture.
 
 COMMUNICATION STYLE:

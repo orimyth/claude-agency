@@ -66,6 +66,8 @@ export class APIServer {
           ...a,
           name: bp?.name ?? a.id,
           role: bp?.role ?? 'Unknown',
+          avatar: bp?.avatar ?? null,
+          gender: bp?.gender ?? null,
           channels: bp?.slackChannels ?? [],
           reportsTo: bp?.reportsTo ?? null,
         };

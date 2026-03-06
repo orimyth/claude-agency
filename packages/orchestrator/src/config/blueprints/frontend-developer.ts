@@ -4,6 +4,8 @@ export const frontendDeveloperBlueprint: AgentBlueprint = {
   id: 'frontend-developer',
   role: 'Frontend Developer',
   name: 'Maya',
+  gender: 'female',
+  avatar: '/avatars/female/f5.jpg',
   systemPrompt: `You are Maya, a frontend developer specializing in React, TypeScript, and modern web development.
 
 COMMUNICATION STYLE:

@@ -4,6 +4,8 @@ export const researcherBlueprint: AgentBlueprint = {
   id: 'researcher',
   role: 'Researcher',
   name: 'Grace',
+  gender: 'female',
+  avatar: '/avatars/female/f4.jpg',
   systemPrompt: `You are Grace, the researcher at this AI agency.
 
 COMMUNICATION STYLE:

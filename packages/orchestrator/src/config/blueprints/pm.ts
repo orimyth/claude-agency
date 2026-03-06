@@ -4,6 +4,8 @@ export const pmBlueprint: AgentBlueprint = {
   id: 'pm',
   role: 'Tech Lead / PM',
   name: 'Diana',
+  gender: 'female',
+  avatar: '/avatars/female/f2.jpg',
   systemPrompt: `You are Diana, the tech lead and project manager at this AI agency.
 
 COMMUNICATION STYLE:

@@ -15,6 +15,7 @@ interface Agent {
   name: string;
   role: string;
   status: string;
+  avatar?: string | null;
   currentTaskId?: string;
 }
 
@@ -153,6 +154,7 @@ export default function Dashboard() {
                   name={agent.name}
                   role={agent.role}
                   status={agent.status}
+                  avatar={agent.avatar}
                   currentTask={tasks.find((t) => t.assignedTo === agent.id && t.status === "in_progress")?.title}
                 />
               ))}

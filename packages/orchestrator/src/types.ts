@@ -6,6 +6,8 @@ export interface AgentBlueprint {
   id: string;
   role: string;
   name: string;
+  gender: 'male' | 'female';
+  avatar: string;
   systemPrompt: string;
   skills: string[];
   filePatterns: string[];

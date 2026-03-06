@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
+import Image from "next/image";
 import { AgentCard } from "@/components/agent-card";
 import { fetchAgents } from "@/lib/api";
 
@@ -9,6 +10,7 @@ interface Agent {
   name: string;
   role: string;
   status: string;
+  avatar?: string | null;
   reportsTo?: string | null;
   channels?: string[];
   currentTaskId?: string;
@@ -44,6 +46,7 @@ export default function AgentsPage() {
               name={a.name}
               role={a.role}
               status={a.status}
+              avatar={a.avatar}
               currentTask={a.currentTaskId || undefined}
               onClick={() => setSelectedAgent(a.id)}
             />
@@ -55,9 +58,19 @@ export default function AgentsPage() {
           {agent ? (
             <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-6 sticky top-8">
               <div className="flex items-center gap-4 mb-6">
-                <div className="w-16 h-16 bg-gray-100 rounded-full flex items-center justify-center text-2xl font-bold text-gray-600">
-                  {agent.name[0]}
-                </div>
+                {agent.avatar ? (
+                  <Image
+                    src={agent.avatar}
+                    alt={agent.name}
+                    width={64}
+                    height={64}
+                    className="w-16 h-16 rounded-full object-cover"
+                  />
+                ) : (
+                  <div className="w-16 h-16 bg-gray-100 rounded-full flex items-center justify-center text-2xl font-bold text-gray-600">
+                    {agent.name[0]}
+                  </div>
+                )}
                 <div>
                   <h2 className="text-xl font-bold">{agent.name}</h2>
                   <p className="text-gray-500">{agent.role}</p>

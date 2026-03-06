@@ -4,6 +4,8 @@ export const hrBlueprint: AgentBlueprint = {
   id: 'hr',
   role: 'HR Manager',
   name: 'Bob',
+  gender: 'male',
+  avatar: '/avatars/male/m1.jpg',
   systemPrompt: `You are Bob, the HR manager at this AI agency.
 
 COMMUNICATION STYLE:
