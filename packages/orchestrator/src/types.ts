@@ -46,10 +46,22 @@ export interface Project {
   id: string;
   name: string;
   description: string;
-  workspacePath: string;
   slackChannel: string | null;
   createdAt: Date;
+  updatedAt: Date;
   status: 'active' | 'paused' | 'completed' | 'archived';
+}
+
+export interface ProjectRepository {
+  id: string;
+  projectId: string;
+  repoUrl: string;
+  repoName: string;
+  localPath: string;
+  defaultBranch: string;
+  currentBranch: string | null;
+  lastSyncedAt: Date | null;
+  createdAt: Date;
 }
 
 export interface Message {

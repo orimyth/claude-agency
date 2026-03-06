@@ -1,11 +1,12 @@
-import { query, type SDKMessage, type SDKResultMessage } from '@anthropic-ai/claude-code';
+import { query } from '@anthropic-ai/claude-code';
 import type { AgentManager } from './agent-manager.js';
 import type { StateStore } from './state-store.js';
 import type { TaskBoard } from './task-board.js';
 import { HRManager } from './hr-manager.js';
 import type { AgentBlueprint, Task, AgencyConfig } from './types.js';
 import { EventEmitter } from 'events';
-import { dirname } from 'path';
+import { dirname, resolve } from 'path';
+import { fileURLToPath } from 'url';
 
 // Same PATH fix as agent-manager
 const nodeDir = dirname(process.execPath);
@@ -46,14 +47,31 @@ export class WorkflowEngine extends EventEmitter {
     this.config = config;
   }
 
+  private resolveWorkDir(): string {
+    let workDir = this.config.workspace;
+    if (!workDir.startsWith('/')) {
+      workDir = resolve(dirname(fileURLToPath(import.meta.url)), '../../..', workDir);
+    }
+    return workDir;
+  }
+
   /**
-   * CEO evaluates a new idea and decides the workflow.
-   * For complex tasks: CEO → Architect → Investor approval → PM sprint
-   * For simple tasks: CEO → PM assignment
+   * CEO evaluates a new idea.
+   * Now the CEO gets agency tools so they can create projects/tasks directly,
+   * rather than us parsing JSON from their output.
    */
   async evaluateIdea(task: Task): Promise<void> {
     const ceoBlueprint = this.agentManager.getBlueprint('ceo');
     if (!ceoBlueprint) return;
+
+    // Get the list of available agents for the CEO
+    const agents = this.agentManager.getAllBlueprints();
+    const agentList = agents
+      .filter(a => a.id !== 'ceo')
+      .map(a => `- ${a.id}: ${a.name} (${a.role})`)
+      .join('\n');
+
+    const apiUrl = `http://localhost:${this.config.wsPort + 1}`;
 
     const evaluationPrompt = [
       `You are ${ceoBlueprint.name}, the ${ceoBlueprint.role}.`,
@@ -62,18 +80,24 @@ export class WorkflowEngine extends EventEmitter {
       `Title: ${task.title}`,
       `Description: ${task.description}`,
       ``,
-      `Evaluate this idea and respond with a JSON decision:`,
-      `{`,
-      `  "complexity": "simple" | "complex",`,
-      `  "reasoning": "1 sentence why",`,
-      `  "needsArchitect": true | false,`,
-      `  "needsResearch": true | false,`,
-      `  "suggestedTeam": ["developer", "designer", etc],`,
-      `  "subtasks": [{"title": "...", "description": "...", "assignTo": "role-id"}]`,
-      `}`,
+      `## Available Team Members`,
+      agentList,
       ``,
-      `If complex: set needsArchitect=true and provide high-level subtasks.`,
-      `If simple: set needsArchitect=false and provide detailed subtasks ready for assignment.`,
+      `## Agency API (use via curl in Bash)`,
+      `- Create project: curl -s -X POST ${apiUrl}/api/agency/projects -H 'Content-Type: application/json' -d '{"name":"...","description":"..."}'`,
+      `- Add repo: curl -s -X POST ${apiUrl}/api/agency/repositories -H 'Content-Type: application/json' -d '{"projectId":"...","repoUrl":"..."}'`,
+      `- Clone repo: curl -s -X POST ${apiUrl}/api/agency/repositories/{repoId}/clone`,
+      `- Create task: curl -s -X POST ${apiUrl}/api/agency/tasks -H 'Content-Type: application/json' -d '{"projectId":"...","title":"...","description":"...","assignTo":"developer","priority":7}'`,
+      `- List agents: curl -s ${apiUrl}/api/agents`,
+      ``,
+      `## Your Job`,
+      `Evaluate this idea and take action:`,
+      `1. Create a project via the API`,
+      `2. Break it down into tasks and assign to the right agents via the API`,
+      `3. For complex projects, create an architecture task for Charlie first`,
+      `4. For simple tasks, assign directly to the right developer/designer`,
+      ``,
+      `Take action now. Use curl to call the Agency API.`,
     ].join('\n');
 
     try {
@@ -81,8 +105,9 @@ export class WorkflowEngine extends EventEmitter {
         prompt: evaluationPrompt,
         options: {
           customSystemPrompt: ceoBlueprint.systemPrompt,
-          cwd: this.config.workspace,
-          maxTurns: 3,
+          cwd: this.resolveWorkDir(),
+          allowedTools: ['Bash'],
+          maxTurns: 15,
           permissionMode: 'bypassPermissions',
           env: wfEnv,
         },
@@ -95,18 +120,13 @@ export class WorkflowEngine extends EventEmitter {
         }
       }
 
-      const decision = this.parseDecision(resultText);
-      if (!decision) {
-        // Fallback: treat as complex
-        await this.requestArchitectConsult(task);
-        return;
+      // Announce completion
+      if (resultText) {
+        this.emit('message', 'ceo', 'leadership', resultText.slice(0, 300));
       }
 
-      if (decision.needsArchitect) {
-        await this.requestArchitectConsult(task, decision);
-      } else {
-        await this.createSprintFromDecision(task, decision);
-      }
+      // Mark the original idea task as done
+      await this.store.updateTaskStatus(task.id, 'done');
     } catch (err: any) {
       this.emit('error', 'ceo', err);
       // Fallback: assign directly to PM
@@ -115,113 +135,7 @@ export class WorkflowEngine extends EventEmitter {
   }
 
   /**
-   * CEO consults with the architect for complex tasks.
-   */
-  private async requestArchitectConsult(task: Task, ceoDecision?: any): Promise<void> {
-    const architectBlueprint = this.agentManager.getBlueprint('architect');
-    if (!architectBlueprint) {
-      await this.assignToPM(task);
-      return;
-    }
-
-    this.emit('message', 'ceo', 'leadership', `hey charlie, need your input on this one — "${task.title.replace('[Investor Idea] ', '')}"`);
-    this.emit('message', 'ceo', 'general', `consulting with charlie on the architecture for "${task.title.replace('[Investor Idea] ', '')}"`);
-
-    const consultPrompt = [
-      `You are ${architectBlueprint.name}, the ${architectBlueprint.role}.`,
-      ``,
-      `The CEO has asked you to review this project idea:`,
-      `Title: ${task.title}`,
-      `Description: ${task.description}`,
-      ceoDecision ? `CEO's initial thoughts: ${ceoDecision.reasoning}` : '',
-      ``,
-      `Provide a technical plan. Respond with JSON:`,
-      `{`,
-      `  "techStack": "brief tech stack recommendation",`,
-      `  "architecture": "1-2 sentence architecture description",`,
-      `  "phases": [{"name": "Phase name", "tasks": [{"title": "...", "description": "...", "assignTo": "role-id"}]}],`,
-      `  "risks": ["risk 1", "risk 2"],`,
-      `  "estimatedComplexity": "small" | "medium" | "large"`,
-      `}`,
-    ].join('\n');
-
-    try {
-      const stream = query({
-        prompt: consultPrompt,
-        options: {
-          customSystemPrompt: architectBlueprint.systemPrompt,
-          cwd: this.config.workspace,
-          maxTurns: 3,
-          permissionMode: 'bypassPermissions',
-          env: wfEnv,
-        },
-      });
-
-      let resultText = '';
-      for await (const message of stream) {
-        if (message.type === 'result' && message.subtype === 'success') {
-          resultText = (message as any).result;
-        }
-      }
-
-      const plan = this.parsePlan(resultText);
-      if (plan) {
-        this.emit('message', 'architect', 'leadership',
-          `here's my take on "${task.title}": ${plan.architecture}. tech: ${plan.techStack}`);
-
-        // Request investor approval
-        await this.requestInvestorApproval(task, plan);
-      } else {
-        this.emit('message', 'architect', 'leadership', resultText.slice(0, 300));
-        await this.assignToPM(task);
-      }
-    } catch (err: any) {
-      this.emit('error', 'architect', err);
-      await this.assignToPM(task);
-    }
-  }
-
-  /**
-   * Request investor approval for a plan.
-   */
-  private async requestInvestorApproval(task: Task, plan: any): Promise<void> {
-    const description = [
-      `**Project:** ${task.title}`,
-      `**Tech Stack:** ${plan.techStack}`,
-      `**Architecture:** ${plan.architecture}`,
-      `**Complexity:** ${plan.estimatedComplexity}`,
-      ``,
-      `**Phases:**`,
-      ...(plan.phases ?? []).map((p: any, i: number) =>
-        `${i + 1}. ${p.name} (${p.tasks?.length ?? 0} tasks)`
-      ),
-      ``,
-      `**Risks:** ${(plan.risks ?? []).join(', ')}`,
-    ].join('\n');
-
-    this.emit('approval:request', {
-      taskId: task.id,
-      title: `Plan for: ${task.title}`,
-      description,
-      plan,
-    });
-
-    // Store the plan for when approval comes back
-    await this.store.createApproval({
-      id: crypto.randomUUID(),
-      title: `Plan for: ${task.title}`,
-      description,
-      requestedBy: 'ceo',
-      status: 'pending',
-      projectId: task.projectId,
-      response: JSON.stringify(plan),
-      createdAt: new Date(),
-      resolvedAt: null,
-    });
-  }
-
-  /**
-   * Handle approval response — create sprint from the approved plan.
+   * Handle approval response — on approve, CEO creates tasks.
    */
   async handleApprovalResponse(approvalId: string, status: 'approved' | 'rejected' | 'modified', feedback?: string): Promise<void> {
     if (status === 'rejected') {
@@ -235,45 +149,33 @@ export class WorkflowEngine extends EventEmitter {
       return;
     }
 
-    // Approved — announce and mobilize
+    // Approved — CEO should now create sprint tasks
     this.emit('message', 'ceo', 'general', `plan approved by the investor, let's go team`);
 
-    // CEO tells PM to start
-    try {
-      await this.agentManager.agentToAgentChat(
-        'ceo', 'pm',
-        `we got the green light. start breaking this down into sprint tasks and assign to the team`,
-        'leadership'
-      );
-    } catch { /* non-critical */ }
-  }
+    // Create a task for the PM to start sprint planning with agency tools
+    const pmTask: Task = {
+      id: crypto.randomUUID(),
+      title: 'Sprint planning for approved project',
+      description: [
+        `The investor just approved a project plan.`,
+        feedback ? `Feedback: ${feedback}` : '',
+        ``,
+        `Break down the work into concrete tasks and assign them to the team.`,
+        `Use agency_create_task to create tasks and assign them.`,
+        `Use agency_list_agents to see who's available.`,
+      ].filter(Boolean).join('\n'),
+      status: 'assigned',
+      projectId: null,
+      assignedTo: 'pm',
+      createdBy: 'ceo',
+      parentTaskId: null,
+      priority: 9,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
 
-  /**
-   * Create sprint tasks from a CEO decision (simple tasks).
-   */
-  private async createSprintFromDecision(parentTask: Task, decision: any): Promise<void> {
-    if (!decision.subtasks?.length) {
-      await this.assignToPM(parentTask);
-      return;
-    }
-
-    const subtasks = decision.subtasks.map((st: any) => ({
-      title: st.title,
-      description: st.description,
-      assignedTo: st.assignTo,
-      priority: parentTask.priority,
-    }));
-
-    const created = await this.taskBoard.createSubtasks(parentTask.id, subtasks);
-    this.emit('message', 'ceo', 'leadership',
-      `broken down "${parentTask.title}" into ${created.length} tasks, diana take it from here`);
-
-    // Assign each task to the appropriate agent
-    for (const task of created) {
-      if (task.assignedTo) {
-        await this.agentManager.assignTask(task.assignedTo, task);
-      }
-    }
+    await this.store.createTask(pmTask);
+    await this.agentManager.assignTask('pm', pmTask);
   }
 
   /**
@@ -304,17 +206,5 @@ export class WorkflowEngine extends EventEmitter {
         `couldn't hire: ${err.message}`);
       return null;
     }
-  }
-
-  private parseDecision(text: string): any | null {
-    const match = text.match(/\{[\s\S]*"complexity"[\s\S]*\}/);
-    if (!match) return null;
-    try { return JSON.parse(match[0]); } catch { return null; }
-  }
-
-  private parsePlan(text: string): any | null {
-    const match = text.match(/\{[\s\S]*"techStack"[\s\S]*\}/);
-    if (!match) return null;
-    try { return JSON.parse(match[0]); } catch { return null; }
   }
 }

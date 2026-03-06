@@ -3,6 +3,8 @@ import type { StateStore } from './state-store.js';
 import type { AgentManager } from './agent-manager.js';
 import type { TaskRouter } from './task-router.js';
 import type { TaskBoard } from './task-board.js';
+import type { MemoryManager } from './memory-manager.js';
+import type { AgentToolHandler } from './agent-tools.js';
 
 /**
  * Simple HTTP API for the dashboard.
@@ -13,6 +15,8 @@ export class APIServer {
   private agentManager: AgentManager;
   private taskRouter: TaskRouter;
   private taskBoard: TaskBoard;
+  private memoryManager: MemoryManager | null = null;
+  private toolHandler: AgentToolHandler | null = null;
   private server: ReturnType<typeof createServer> | null = null;
   private onSettingsChanged: (() => Promise<void>) | null = null;
 
@@ -23,6 +27,14 @@ export class APIServer {
     this.taskBoard = taskBoard;
   }
 
+  setMemoryManager(mm: MemoryManager): void {
+    this.memoryManager = mm;
+  }
+
+  setToolHandler(handler: AgentToolHandler): void {
+    this.toolHandler = handler;
+  }
+
   setOnSettingsChanged(cb: () => Promise<void>): void {
     this.onSettingsChanged = cb;
   }
@@ -31,7 +43,7 @@ export class APIServer {
     this.server = createServer(async (req, res) => {
       // CORS
       res.setHeader('Access-Control-Allow-Origin', '*');
-      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, OPTIONS');
       res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
       if (req.method === 'OPTIONS') {
@@ -76,12 +88,49 @@ export class APIServer {
       return;
     }
 
+    // Blueprint management
+    if (req.method === 'GET' && path === '/api/blueprints') {
+      const blueprints = await this.store.getAllBlueprints();
+      this.json(res, blueprints);
+      return;
+    }
+
+    if (req.method === 'GET' && path.match(/^\/api\/blueprints\/[^/]+$/)) {
+      const id = path.split('/').pop()!;
+      const bp = await this.store.getBlueprint(id);
+      if (!bp) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Blueprint not found' }));
+        return;
+      }
+      this.json(res, bp);
+      return;
+    }
+
+    if (req.method === 'PUT' && path.match(/^\/api\/blueprints\/[^/]+$/)) {
+      const id = path.split('/').pop()!;
+      const body = JSON.parse(await this.readBody(req));
+      const existing = await this.store.getBlueprint(id);
+      if (!existing) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Blueprint not found' }));
+        return;
+      }
+      const updated = { ...existing, ...body, id };
+      await this.store.updateBlueprint(id, updated);
+      this.agentManager.registerBlueprint(updated); // hot-reload
+      this.json(res, updated);
+      return;
+    }
+
     if (req.method === 'GET' && path === '/api/projects') {
       const projects = await this.store.getAllProjects();
       const enriched = await Promise.all(projects.map(async p => {
         const tasks = await this.store.getTasksByProject(p.id);
+        const repos = await this.store.getProjectRepositories(p.id);
         return {
           ...p,
+          repositories: repos,
           taskCount: tasks.length,
           taskCounts: {
             backlog: tasks.filter(t => t.status === 'backlog').length,
@@ -94,6 +143,27 @@ export class APIServer {
         };
       }));
       this.json(res, enriched);
+      return;
+    }
+
+    if (req.method === 'GET' && path.match(/^\/api\/projects\/[^/]+$/)) {
+      const projectId = path.split('/').pop()!;
+      const project = await this.store.getProject(projectId);
+      if (!project) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Project not found' }));
+        return;
+      }
+      const repos = await this.store.getProjectRepositories(projectId);
+      const tasks = await this.store.getTasksByProject(projectId);
+      this.json(res, { ...project, repositories: repos, tasks });
+      return;
+    }
+
+    if (req.method === 'GET' && path.match(/^\/api\/projects\/[^/]+\/repositories$/)) {
+      const projectId = path.split('/')[3];
+      const repos = await this.store.getProjectRepositories(projectId);
+      this.json(res, repos);
       return;
     }
 
@@ -144,6 +214,78 @@ export class APIServer {
       }
       if (this.onSettingsChanged) await this.onSettingsChanged();
       this.json(res, { ok: true });
+      return;
+    }
+
+    if (req.method === 'GET' && path === '/api/memories') {
+      const scope = url.searchParams.get('scope') ?? undefined;
+      if (this.memoryManager) {
+        const memories = await this.memoryManager.getAll(scope);
+        this.json(res, memories);
+      } else {
+        this.json(res, []);
+      }
+      return;
+    }
+
+    // --- Agency action endpoints (called by agents via curl) ---
+
+    if (req.method === 'POST' && path === '/api/agency/projects' && this.toolHandler) {
+      const body = JSON.parse(await this.readBody(req));
+      const result = await this.toolHandler.handleToolCall(body.agentId ?? 'system', 'agency_create_project', body);
+      this.json(res, result);
+      return;
+    }
+
+    if (req.method === 'POST' && path === '/api/agency/repositories' && this.toolHandler) {
+      const body = JSON.parse(await this.readBody(req));
+      const result = await this.toolHandler.handleToolCall(body.agentId ?? 'system', 'agency_add_repository', body);
+      this.json(res, result);
+      return;
+    }
+
+    if (req.method === 'POST' && path.match(/^\/api\/agency\/repositories\/[^/]+\/clone$/) && this.toolHandler) {
+      const repositoryId = path.split('/')[4];
+      const result = await this.toolHandler.handleToolCall('system', 'agency_clone_repository', { repositoryId });
+      this.json(res, result);
+      return;
+    }
+
+    if (req.method === 'POST' && path.match(/^\/api\/agency\/repositories\/[^/]+\/push$/) && this.toolHandler) {
+      const repositoryId = path.split('/')[4];
+      const body = JSON.parse(await this.readBody(req));
+      const result = await this.toolHandler.handleToolCall('system', 'agency_git_push', { repositoryId, ...body });
+      this.json(res, result);
+      return;
+    }
+
+    if (req.method === 'POST' && path === '/api/agency/hire' && this.toolHandler) {
+      // Quick hire by forking an existing blueprint
+      const body = JSON.parse(await this.readBody(req));
+      const { sourceRole, name, id, gender, customPrompt } = body;
+      if (!sourceRole || !name) {
+        this.json(res, { success: false, error: 'sourceRole and name are required' });
+        return;
+      }
+      // Find a blueprint with this role to fork from
+      const blueprints = this.agentManager.getAllBlueprints();
+      const source = blueprints.find(b => b.role.toLowerCase().includes(sourceRole.toLowerCase()) || b.id === sourceRole);
+      if (!source) {
+        this.json(res, { success: false, error: `No blueprint found for role '${sourceRole}'` });
+        return;
+      }
+      const agentId = id ?? name.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+      this.json(res, {
+        success: true,
+        data: { message: `Fork ${source.id} as ${agentId}. Use PUT /api/blueprints/${agentId} to finalize.`, sourceId: source.id, agentId },
+      });
+      return;
+    }
+
+    if (req.method === 'POST' && path === '/api/agency/tasks' && this.toolHandler) {
+      const body = JSON.parse(await this.readBody(req));
+      const result = await this.toolHandler.handleToolCall(body.agentId ?? 'system', 'agency_create_task', body);
+      this.json(res, result);
       return;
     }
 

@@ -1,13 +1,14 @@
-import { query, type SDKMessage, type SDKResultMessage } from '@anthropic-ai/claude-code';
+import { query, type SDKResultMessage } from '@anthropic-ai/claude-code';
 import { EventEmitter } from 'events';
 import { dirname, resolve } from 'path';
 import { fileURLToPath } from 'url';
 import type { AgentBlueprint, AgentState, Task, AgencyConfig } from './types.js';
 import type { StateStore } from './state-store.js';
 import type { PermissionEngine } from './permission-engine.js';
+import type { MemoryManager } from './memory-manager.js';
+import type { AgentToolHandler } from './agent-tools.js';
 
 // Build an env with node's directory in PATH for the Claude Code SDK.
-// pnpm replaces PATH with only node_modules/.bin dirs, so nvm's node isn't found.
 const nodeDir = dirname(process.execPath);
 const sdkEnv: Record<string, string> = {};
 for (const [k, v] of Object.entries(process.env)) {
@@ -16,6 +17,9 @@ for (const [k, v] of Object.entries(process.env)) {
 if (!sdkEnv.PATH?.includes(nodeDir)) {
   sdkEnv.PATH = `${nodeDir}:${sdkEnv.PATH || ''}`;
 }
+
+/** Roles that get agency management tools (can create projects, tasks, etc.) */
+const MANAGEMENT_ROLES = new Set(['ceo', 'pm', 'architect', 'hr']);
 
 export interface AgentEvents {
   message: (agentId: string, channel: string, content: string) => void;
@@ -35,12 +39,22 @@ export class AgentManager extends EventEmitter {
   private activeSessions: Map<string, AbortController> = new Map();
   private activeCount = 0;
   private languageOverride: string | null = null;
+  private memoryManager: MemoryManager | null = null;
+  private toolHandler: AgentToolHandler | null = null;
 
   constructor(store: StateStore, permissions: PermissionEngine, config: AgencyConfig) {
     super();
     this.store = store;
     this.permissions = permissions;
     this.config = config;
+  }
+
+  setMemoryManager(mm: MemoryManager): void {
+    this.memoryManager = mm;
+  }
+
+  setToolHandler(handler: AgentToolHandler): void {
+    this.toolHandler = handler;
   }
 
   setLanguage(lang: string | null): void {
@@ -56,6 +70,14 @@ export class AgentManager extends EventEmitter {
       return `IMPORTANT: Always respond in ${this.languageOverride}. Every message must be in ${this.languageOverride}, regardless of what language the user writes in.`;
     }
     return `IMPORTANT: Always respond in the same language the user is writing in. If they write in German, respond in German. If English, respond in English. Match their language exactly.`;
+  }
+
+  private resolveWorkDir(path?: string | null): string {
+    let workDir = path || this.config.workspace;
+    if (!workDir.startsWith('/')) {
+      workDir = resolve(dirname(fileURLToPath(import.meta.url)), '../../..', workDir);
+    }
+    return workDir;
   }
 
   registerBlueprint(blueprint: AgentBlueprint): void {
@@ -106,7 +128,6 @@ export class AgentManager extends EventEmitter {
     await this.store.updateAgentStatus(agentId, 'active');
     await this.store.upsertAgent({ ...agent, status: 'active', currentTaskId: task.id });
 
-    // Announce task pickup
     this.emit('message', agentId, 'general', `picking up "${task.title.replace('[Investor Idea] ', '')}"`);
 
     this.runAgent(blueprint, task).catch(err => {
@@ -114,19 +135,36 @@ export class AgentManager extends EventEmitter {
     });
   }
 
+  /**
+   * Determine the working directory for a task.
+   * If the task has a project with repos, use the first repo's local path.
+   */
+  private async resolveTaskWorkDir(task: Task): Promise<string> {
+    if (task.projectId) {
+      const repos = await this.store.getProjectRepositories(task.projectId);
+      if (repos.length > 0 && repos[0].localPath) {
+        const { existsSync } = await import('fs');
+        if (existsSync(repos[0].localPath)) {
+          return repos[0].localPath;
+        }
+      }
+    }
+    return this.resolveWorkDir();
+  }
+
   private async runAgent(blueprint: AgentBlueprint, task: Task): Promise<void> {
     const abortController = new AbortController();
     this.activeSessions.set(blueprint.id, abortController);
     this.activeCount++;
 
-    const project = task.projectId ? await this.store.getProject(task.projectId) : null;
-    let workDir = project?.workspacePath || this.config.workspace;
-    // Resolve relative workspace paths against project root
-    if (!workDir.startsWith('/')) {
-      workDir = resolve(dirname(fileURLToPath(import.meta.url)), '../../..', workDir);
-    }
+    const workDir = await this.resolveTaskWorkDir(task);
+    const prompt = await this.buildTaskPrompt(blueprint, task);
 
-    const prompt = this.buildTaskPrompt(blueprint, task);
+    // Inject AGENCY_API_URL so agents can call the API via curl/Bash
+    const agentEnv = { ...sdkEnv };
+    const apiPort = this.config.wsPort + 1;
+    agentEnv.AGENCY_API_URL = `http://localhost:${apiPort}`;
+    agentEnv.AGENCY_AGENT_ID = blueprint.id;
 
     try {
       const stream = query({
@@ -138,7 +176,7 @@ export class AgentManager extends EventEmitter {
           abortController,
           permissionMode: 'bypassPermissions',
           maxTurns: 50,
-          env: sdkEnv,
+          env: agentEnv,
         },
       });
 
@@ -147,10 +185,8 @@ export class AgentManager extends EventEmitter {
       let lastResult: SDKResultMessage | null = null;
 
       for await (const message of stream) {
-        // Track turns for progress updates
         if (message.type === 'assistant') {
           turnCount++;
-          // Emit periodic progress (every 5 turns)
           if (turnCount % 5 === 0) {
             this.emit('message', blueprint.id, 'general',
               `still working on "${task.title.replace('[Investor Idea] ', '')}"...`);
@@ -172,7 +208,7 @@ export class AgentManager extends EventEmitter {
       this.emit('message', blueprint.id, channel, summary);
       this.emit('taskComplete', blueprint.id, task.id);
 
-      // Record usage from the result message
+      // Record usage
       if (lastResult) {
         await this.store.recordUsage({
           id: crypto.randomUUID(),
@@ -193,6 +229,12 @@ export class AgentManager extends EventEmitter {
       await this.store.updateAgentStatus(blueprint.id, 'idle');
       await this.store.recordKPI(blueprint.id, 'tasks_completed', 1);
 
+      // Extract learnings
+      if (this.memoryManager && resultText) {
+        this.memoryManager.extractLearnings(blueprint.id, task.title, resultText, task.projectId)
+          .catch(() => { /* non-critical */ });
+      }
+
       // Autonomous loop: pick up next task
       await this.pickUpNextTask(blueprint.id);
     } catch (err: any) {
@@ -212,11 +254,79 @@ export class AgentManager extends EventEmitter {
     }
   }
 
-  private buildTaskPrompt(blueprint: AgentBlueprint, task: Task): string {
-    return [
+  private async buildTaskPrompt(blueprint: AgentBlueprint, task: Task): Promise<string> {
+    const parts = [
       `You are ${blueprint.name}, the ${blueprint.role}.`,
       this.getLanguageInstruction(),
       ``,
+    ];
+
+    // Inject organizational memory context
+    if (this.memoryManager) {
+      try {
+        const memoryContext = await this.memoryManager.buildContext(blueprint.id, task.projectId);
+        if (memoryContext) {
+          parts.push(memoryContext);
+          parts.push('');
+        }
+      } catch { /* non-critical */ }
+    }
+
+    // Inject project context if available
+    if (task.projectId) {
+      try {
+        const project = await this.store.getProject(task.projectId);
+        const repos = await this.store.getProjectRepositories(task.projectId);
+        if (project) {
+          parts.push(`## Project Context`);
+          parts.push(`**Project:** ${project.name}`);
+          parts.push(`**Description:** ${project.description}`);
+          if (repos.length > 0) {
+            parts.push(`**Repositories:**`);
+            for (const repo of repos) {
+              parts.push(`- ${repo.repoName} (${repo.repoUrl}) → ${repo.localPath}`);
+            }
+          }
+          parts.push('');
+        }
+      } catch { /* non-critical */ }
+    }
+
+    // Agency API instructions for management roles
+    if (MANAGEMENT_ROLES.has(blueprint.id)) {
+      const apiUrl = `http://localhost:${this.config.wsPort + 1}`;
+      parts.push(
+        `## Agency Management API`,
+        `You can manage projects, tasks, and repos via the Agency API using curl.`,
+        `Base URL: ${apiUrl}`,
+        ``,
+        `**Project management:**`,
+        `- Create project: curl -X POST ${apiUrl}/api/agency/projects -H 'Content-Type: application/json' -d '{"name":"...","description":"..."}'`,
+        `- List projects: curl ${apiUrl}/api/projects`,
+        `- Get project detail: curl ${apiUrl}/api/projects/{projectId}`,
+        ``,
+        `**Repository management:**`,
+        `- Add repo to project: curl -X POST ${apiUrl}/api/agency/repositories -H 'Content-Type: application/json' -d '{"projectId":"...","repoUrl":"https://github.com/..."}'`,
+        `- Clone repo locally: curl -X POST ${apiUrl}/api/agency/repositories/{repoId}/clone`,
+        `- List repos: curl ${apiUrl}/api/projects/{projectId}/repositories`,
+        ``,
+        `**Task management:**`,
+        `- Create & assign task: curl -X POST ${apiUrl}/api/agency/tasks -H 'Content-Type: application/json' -d '{"projectId":"...","title":"...","description":"...","assignTo":"developer","priority":7}'`,
+        `- List tasks: curl ${apiUrl}/api/tasks?projectId={id}`,
+        `- List agents: curl ${apiUrl}/api/agents`,
+        ``,
+        `**Git operations:**`,
+        `- Push changes: curl -X POST ${apiUrl}/api/agency/repositories/{repoId}/push -H 'Content-Type: application/json' -d '{"commitMessage":"..."}'`,
+        ``,
+        `When the investor gives you a project idea:`,
+        `1. Create a project via API`,
+        `2. If repos are mentioned, add and clone them via API`,
+        `3. Break down the work into tasks and assign to the right agents via API`,
+        ``,
+      );
+    }
+
+    parts.push(
       `## Current Task`,
       `**${task.title}**`,
       task.description,
@@ -225,7 +335,9 @@ export class AgentManager extends EventEmitter {
       `- Complete this task autonomously`,
       `- When done, summarize what you did in 1-2 short sentences`,
       `- If you're blocked, say exactly what you need`,
-    ].join('\n');
+    );
+
+    return parts.join('\n');
   }
 
   private isRateLimitError(err: any): boolean {
@@ -288,10 +400,7 @@ export class AgentManager extends EventEmitter {
     const blueprint = this.blueprints.get(agentId);
     if (!blueprint) throw new Error(`No blueprint for agent ${agentId}`);
 
-    let workDir = this.config.workspace;
-    if (!workDir.startsWith('/')) {
-      workDir = resolve(dirname(fileURLToPath(import.meta.url)), '../../..', workDir);
-    }
+    const workDir = this.resolveWorkDir();
 
     // Mark agent as active while chatting
     await this.store.updateAgentStatus(agentId, 'active');
@@ -319,7 +428,6 @@ export class AgentManager extends EventEmitter {
       if (msg.type === 'result') {
         const r = msg as SDKResultMessage;
         if (r.subtype === 'success') result = r.result;
-        // Track chat usage
         try {
           await this.store.recordUsage({
             id: crypto.randomUUID(),
@@ -338,7 +446,6 @@ export class AgentManager extends EventEmitter {
       }
     }
 
-    // Return to idle after chat
     await this.store.updateAgentStatus(agentId, 'idle');
 
     return result || "hey, give me a sec";
@@ -346,7 +453,6 @@ export class AgentManager extends EventEmitter {
 
   /**
    * One agent asks another agent a question and gets a response.
-   * Both sides are posted to the specified channel.
    */
   async agentToAgentChat(
     fromId: string, toId: string, message: string, channel = 'leadership'
@@ -355,10 +461,8 @@ export class AgentManager extends EventEmitter {
     const to = this.blueprints.get(toId);
     if (!from || !to) throw new Error(`Blueprint not found`);
 
-    // Post the question
     this.emit('message', fromId, channel, message);
 
-    // Get the response
     const context = [
       `You are ${to.name} (${to.role}).`,
       `${from.name} (${from.role}) just said to you in #${channel}:`,
@@ -374,7 +478,6 @@ export class AgentManager extends EventEmitter {
 
   /**
    * Hand off work from one agent to another with context.
-   * Creates a task assigned to the target agent.
    */
   async requestHandoff(
     fromId: string, toId: string, title: string, description: string, channel = 'general'
@@ -383,11 +486,9 @@ export class AgentManager extends EventEmitter {
     const to = this.blueprints.get(toId);
     if (!from || !to) return;
 
-    // Announce the handoff
     this.emit('message', fromId, channel,
       `hey ${to.name.toLowerCase()}, handing this off to you: ${title}`);
 
-    // Create and assign the task
     const task = {
       id: crypto.randomUUID(),
       title,
