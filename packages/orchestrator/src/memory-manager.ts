@@ -21,6 +21,12 @@ const MAX_CONTEXT_CHARS = MAX_CONTEXT_TOKENS * CHARS_PER_TOKEN;
 const SUMMARIZE_THRESHOLD = 15;
 
 /**
+ * Lightweight model for utility tasks (JSON extraction, summarization).
+ * Uses Haiku for simple structured output tasks — ~15x cheaper than Opus.
+ */
+const UTILITY_MODEL = 'claude-haiku-4-5-20251001';
+
+/**
  * Role → relevant memory categories mapping.
  * Agents only see memories relevant to their function.
  */
@@ -150,6 +156,7 @@ export class MemoryManager {
       const stream = query({
         prompt,
         options: {
+          model: UTILITY_MODEL,
           allowedTools: [],
           maxTurns: 1,
           permissionMode: 'bypassPermissions',
@@ -226,7 +233,7 @@ export class MemoryManager {
 
       const stream = query({
         prompt,
-        options: { allowedTools: [], maxTurns: 1, permissionMode: 'bypassPermissions', env: memEnv },
+        options: { model: UTILITY_MODEL, allowedTools: [], maxTurns: 1, permissionMode: 'bypassPermissions', env: memEnv },
       });
 
       let result = '';

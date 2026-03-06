@@ -336,6 +336,13 @@ export class StateStore {
     }
   }
 
+  async updateTaskDescription(id: string, description: string): Promise<void> {
+    await this.pool.query(
+      'UPDATE tasks SET description = ? WHERE id = ?',
+      [description, id]
+    );
+  }
+
   // Project operations
   async createProject(project: Omit<Project, 'createdAt' | 'updatedAt'>): Promise<void> {
     await this.pool.query(

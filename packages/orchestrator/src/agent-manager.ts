@@ -21,6 +21,9 @@ if (!sdkEnv.PATH?.includes(nodeDir)) {
 /** Roles that get agency management tools (can create projects, tasks, etc.) */
 const MANAGEMENT_ROLES = new Set(['ceo', 'pm', 'architect', 'hr']);
 
+/** Mid-tier model for conversational responses (chat, notifications). */
+const CHAT_MODEL = 'claude-sonnet-4-6';
+
 /** Worker roles that only get git push/repo listing APIs */
 const WORKER_ROLES = new Set(['developer', 'frontend-developer', 'backend-developer', 'designer']);
 
@@ -84,7 +87,65 @@ export class AgentManager extends EventEmitter {
   }
 
   registerBlueprint(blueprint: AgentBlueprint): void {
-    this.blueprints.set(blueprint.id, blueprint);
+    // Inject role-specific API instructions into the system prompt at registration time.
+    // This makes them cacheable by the SDK instead of re-sent as user tokens every task.
+    const enriched = { ...blueprint, systemPrompt: this.enrichSystemPrompt(blueprint) };
+    this.blueprints.set(enriched.id, enriched);
+  }
+
+  /**
+   * Append API usage instructions to the system prompt based on role.
+   * Management roles get full API access; workers get git push only.
+   * These are static instructions that benefit from prompt caching.
+   */
+  private enrichSystemPrompt(blueprint: AgentBlueprint): string {
+    const apiUrl = `http://localhost:${this.config.wsPort + 1}`;
+    let extra = '';
+
+    if (MANAGEMENT_ROLES.has(blueprint.id)) {
+      extra = [
+        `\n\n## Agency Management API`,
+        `You can manage projects, tasks, and repos via the Agency API using curl.`,
+        `Base URL: ${apiUrl}`,
+        ``,
+        `**Project management:**`,
+        `- Create project: curl -X POST ${apiUrl}/api/agency/projects -H 'Content-Type: application/json' -d '{"name":"...","description":"..."}'`,
+        `- List projects: curl ${apiUrl}/api/projects`,
+        `- Get project detail: curl ${apiUrl}/api/projects/{projectId}`,
+        ``,
+        `**Repository management:**`,
+        `- Add repo to project: curl -X POST ${apiUrl}/api/agency/repositories -H 'Content-Type: application/json' -d '{"projectId":"...","repoUrl":"https://github.com/..."}'`,
+        `- Clone repo locally: curl -X POST ${apiUrl}/api/agency/repositories/{repoId}/clone`,
+        `- List repos: curl ${apiUrl}/api/projects/{projectId}/repositories`,
+        ``,
+        `**Task management:**`,
+        `- Create & assign task: curl -X POST ${apiUrl}/api/agency/tasks -H 'Content-Type: application/json' -d '{"projectId":"...","title":"...","description":"...","assignTo":"developer","priority":7}'`,
+        `- Create task with dependency: add "dependsOn":"<taskId>" to make it wait for another task to finish first`,
+        `- List tasks: curl ${apiUrl}/api/tasks?projectId={id}`,
+        `- List agents: curl ${apiUrl}/api/agents`,
+        ``,
+        `**Git operations:**`,
+        `- Push changes (auto feature branch): curl -X POST ${apiUrl}/api/agency/repositories/{repoId}/push -H 'Content-Type: application/json' -d '{"commitMessage":"...","taskId":"..."}'`,
+        `- Merge feature branch to main (after QA passes): curl -X POST ${apiUrl}/api/agency/repositories/{repoId}/merge -H 'Content-Type: application/json' -d '{"featureBranch":"feature/..."}'`,
+        `Note: Push automatically creates a feature branch. Merge to main only after QA approves.`,
+      ].join('\n');
+    } else if (WORKER_ROLES.has(blueprint.id)) {
+      extra = [
+        `\n\n## Git Push API`,
+        `After committing your changes locally, push them via the Agency API (do NOT use git push directly).`,
+        `The API auto-creates a feature branch so you never push to main.`,
+        ``,
+        `**Push changes:**`,
+        `curl -X POST ${apiUrl}/api/agency/repositories/{repoId}/push -H 'Content-Type: application/json' -d '{"commitMessage":"describe what you did","taskId":"<your-task-id>"}'`,
+        ``,
+        `**List repos (to find repoId):**`,
+        `curl ${apiUrl}/api/projects/{projectId}/repositories`,
+        ``,
+        `The repoId is shown in the Project Context in your task prompt. Use it directly.`,
+      ].join('\n');
+    }
+
+    return blueprint.systemPrompt + extra;
   }
 
   getBlueprint(id: string): AgentBlueprint | undefined {
@@ -269,8 +330,9 @@ export class AgentManager extends EventEmitter {
       await this.store.updateAgentStatus(blueprint.id, 'idle');
       await this.store.recordKPI(blueprint.id, 'tasks_completed', 1);
 
-      // Extract learnings
-      if (this.memoryManager && resultText) {
+      // Extract learnings — skip for QA reviews and short results (they're derivative, not worth the model call)
+      const isQAReview = task.title.startsWith('QA Review:') || task.title.startsWith('Fix bugs:');
+      if (this.memoryManager && resultText && resultText.length >= 100 && !isQAReview) {
         this.memoryManager.extractLearnings(blueprint.id, task.title, resultText, task.projectId)
           .catch(() => { /* non-critical */ });
       }
@@ -295,8 +357,8 @@ export class AgentManager extends EventEmitter {
   }
 
   private async buildTaskPrompt(blueprint: AgentBlueprint, task: Task): Promise<string> {
+    // Identity is already in the system prompt — don't repeat it here.
     const parts = [
-      `You are ${blueprint.name}, the ${blueprint.role}.`,
       this.getLanguageInstruction(),
       ``,
     ];
@@ -332,66 +394,10 @@ export class AgentManager extends EventEmitter {
       } catch { /* non-critical */ }
     }
 
-    // Agency API instructions for management roles
-    if (MANAGEMENT_ROLES.has(blueprint.id)) {
-      const apiUrl = `http://localhost:${this.config.wsPort + 1}`;
-      parts.push(
-        `## Agency Management API`,
-        `You can manage projects, tasks, and repos via the Agency API using curl.`,
-        `Base URL: ${apiUrl}`,
-        ``,
-        `**Project management:**`,
-        `- Create project: curl -X POST ${apiUrl}/api/agency/projects -H 'Content-Type: application/json' -d '{"name":"...","description":"..."}'`,
-        `- List projects: curl ${apiUrl}/api/projects`,
-        `- Get project detail: curl ${apiUrl}/api/projects/{projectId}`,
-        ``,
-        `**Repository management:**`,
-        `- Add repo to project: curl -X POST ${apiUrl}/api/agency/repositories -H 'Content-Type: application/json' -d '{"projectId":"...","repoUrl":"https://github.com/..."}'`,
-        `- Clone repo locally: curl -X POST ${apiUrl}/api/agency/repositories/{repoId}/clone`,
-        `- List repos: curl ${apiUrl}/api/projects/{projectId}/repositories`,
-        ``,
-        `**Task management:**`,
-        `- Create & assign task: curl -X POST ${apiUrl}/api/agency/tasks -H 'Content-Type: application/json' -d '{"projectId":"...","title":"...","description":"...","assignTo":"developer","priority":7}'`,
-        `- Create task with dependency: add "dependsOn":"<taskId>" to make it wait for another task to finish first`,
-        `- List tasks: curl ${apiUrl}/api/tasks?projectId={id}`,
-        `- List agents: curl ${apiUrl}/api/agents`,
-        ``,
-        `**Git operations:**`,
-        `- Push changes (auto feature branch): curl -X POST ${apiUrl}/api/agency/repositories/{repoId}/push -H 'Content-Type: application/json' -d '{"commitMessage":"...","taskId":"..."}'`,
-        `- Merge feature branch to main (after QA passes): curl -X POST ${apiUrl}/api/agency/repositories/{repoId}/merge -H 'Content-Type: application/json' -d '{"featureBranch":"feature/..."}'`,
-        `Note: Push automatically creates a feature branch. Merge to main only after QA approves.`,
-        ``,
-        `When the investor gives you a project idea:`,
-        `1. Create a project via API`,
-        `2. If repos are mentioned, add and clone them via API`,
-        `3. Break down the work into tasks and assign to the right agents via API`,
-        ``,
-      );
-    }
-
-    // Agency Git API instructions for worker roles (limited subset — push & list repos only)
-    if (WORKER_ROLES.has(blueprint.id)) {
-      const apiUrl = `http://localhost:${this.config.wsPort + 1}`;
-      parts.push(
-        `## Git Push API`,
-        `After committing your changes locally, push them via the Agency API (do NOT use git push directly).`,
-        `The API auto-creates a feature branch so you never push to main.`,
-        ``,
-        `**Push changes:**`,
-        `\`\`\``,
-        `curl -X POST ${apiUrl}/api/agency/repositories/{repoId}/push \\`,
-        `  -H 'Content-Type: application/json' \\`,
-        `  -d '{"commitMessage":"describe what you did","taskId":"${task.id}"}'`,
-        `\`\`\``,
-        ``,
-        `**List repos (to find repoId):**`,
-        `\`\`\``,
-        `curl ${apiUrl}/api/projects/{projectId}/repositories`,
-        `\`\`\``,
-        ``,
-        `The repoId is shown in the Project Context above. Use it directly.`,
-        ``,
-      );
+    // API instructions are now in the system prompt (cacheable) via enrichSystemPrompt().
+    // Only inject the task-specific taskId hint for workers so they know their task ID for git push.
+    if (WORKER_ROLES.has(blueprint.id) && task.id) {
+      parts.push(`**Your task ID for git push:** ${task.id}`, '');
     }
 
     // Inject active sibling tasks for context isolation
@@ -504,6 +510,7 @@ export class AgentManager extends EventEmitter {
     const stream = query({
       prompt,
       options: {
+        model: CHAT_MODEL,
         customSystemPrompt: blueprint.systemPrompt,
         cwd: workDir,
         allowedTools: [],
@@ -596,6 +603,15 @@ export class AgentManager extends EventEmitter {
 
     await this.store.createTask(task);
     await this.assignTask(toId, task);
+  }
+
+  /**
+   * Send a notification message from one agent to a channel without invoking Claude.
+   * Use this for status updates that don't need an AI-generated response.
+   * Saves a full model call compared to agentToAgentChat().
+   */
+  notify(fromId: string, channel: string, message: string): void {
+    this.emit('message', fromId, channel, message);
   }
 
   getActiveCount(): number {

@@ -30,6 +30,9 @@ if (!_classifyEnv.PATH?.includes(_nodeDir)) {
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
+/** Lightweight model for utility tasks (intent classification). */
+const UTILITY_MODEL = 'claude-haiku-4-5-20251001';
+
 export class Agency {
   private store: StateStore;
   private permissions: PermissionEngine;
@@ -186,14 +189,9 @@ export class Agency {
       // CEO Alice → reports to investor (if noteworthy)
 
       if (agentId === 'pm') {
-        // PM done → CEO gets status update
-        try {
-          await this.agentManager.agentToAgentChat(
-            agentId, 'ceo',
-            `done with "${cleanTitle}". team delivered, everything's in good shape`,
-            'leadership'
-          );
-        } catch { /* non-critical */ }
+        // PM done → CEO gets a simple notification (no Claude call needed)
+        this.agentManager.notify('pm', 'leadership',
+          `done with "${cleanTitle}". team delivered, everything's in good shape`);
       } else if (agentId === 'ceo') {
         // CEO completed something — no further escalation needed
       } else if (agentId === 'qa') {
@@ -250,14 +248,10 @@ export class Agency {
             console.error(`[QA Fix Loop] Error: ${err.message}`);
           }
         } else {
-          // QA passed → notify PM, mark original task as done
+          // QA passed → simple notification to PM (no Claude call needed), mark original task as done
+          this.agentManager.notify('qa', notifyChannel,
+            `QA passed for "${cleanTitle.replace('QA Review: ', '')}". tested and good to ship`);
           try {
-            await this.agentManager.agentToAgentChat(
-              agentId, 'pm',
-              `QA passed for "${cleanTitle.replace('QA Review: ', '')}". tested and good to ship`,
-              notifyChannel
-            );
-            // Mark the original reviewed task as done
             if (task.dependsOn) {
               await this.store.updateTaskStatus(task.dependsOn, 'done');
             }
@@ -276,6 +270,8 @@ export class Agency {
               ``,
               `Original task description: ${task.description?.slice(0, 500) ?? 'N/A'}`,
               ``,
+              // Include the developer's own summary so QA knows what was actually done
+              resultText ? `## Developer's Summary\n${resultText.slice(0, 800)}\n` : '',
               `Your job:`,
               `1. Check the code that was written/changed`,
               `2. Try to build/run the project — does it start without errors?`,
@@ -286,7 +282,7 @@ export class Agency {
               ``,
               `If you find bugs, be specific: file, line, what's wrong, how to reproduce.`,
               `If everything is good, confirm it's ready to ship.`,
-            ].join('\n'),
+            ].filter(Boolean).join('\n'),
             status: 'assigned' as const,
             projectId: task.projectId,
             assignedTo: 'qa',
@@ -300,42 +296,38 @@ export class Agency {
           await this.store.createTask(qaTask);
           await this.agentManager.assignTask('qa', qaTask);
 
-          // Notify PM that work is done and QA is reviewing
-          await this.agentManager.agentToAgentChat(
-            agentId, 'pm',
-            `finished "${cleanTitle}", sent to Nina for QA review`,
-            notifyChannel
-          );
+          // Simple notification to PM (no Claude call needed for status updates)
+          this.agentManager.notify(agentId, notifyChannel,
+            `finished "${cleanTitle}", sent to Nina for QA review`);
         } catch (err: any) {
           console.error(`[Auto QA] Failed to create QA task: ${err.message}`);
-          // Fallback: just notify PM directly
-          try {
-            await this.agentManager.agentToAgentChat(
-              agentId, 'pm',
-              `finished "${cleanTitle}", ready for review`,
-              notifyChannel
-            );
-          } catch { /* non-critical */ }
+          // Fallback: simple notification
+          const notifChannel = task.projectId ? `project-${task.projectId}` : 'leadership';
+          this.agentManager.notify(agentId, notifChannel,
+            `finished "${cleanTitle}", ready for review`);
         }
       } else {
-        // Any other agent → PM gets notified
+        // Any other agent → simple notification to PM
         const notifyChannel = task.projectId ? `project-${task.projectId}` : 'leadership';
-        try {
-          await this.agentManager.agentToAgentChat(
-            agentId, 'pm',
-            `finished "${cleanTitle}", ready for review`,
-            notifyChannel
-          );
-        } catch { /* non-critical */ }
+        this.agentManager.notify(agentId, notifyChannel,
+          `finished "${cleanTitle}", ready for review`);
       }
 
-      // Unblock dependent tasks now that this one is done
+      // Unblock dependent tasks now that this one is done.
+      // Inject predecessor's result summary so the next agent has context.
       try {
         const unblockedTasks = await this.store.getUnblockedTasks(taskId);
         for (const depTask of unblockedTasks) {
           if (depTask.assignedTo && this.agentManager.getBlueprint(depTask.assignedTo)) {
+            // Enrich dependent task with predecessor context
+            if (resultText) {
+              const predecessorSummary = `\n\n## Predecessor Task Result\n**"${cleanTitle}"** completed by ${this.agentManager.getBlueprint(agentId)?.name ?? agentId}:\n${resultText.slice(0, 800)}`;
+              depTask.description = (depTask.description ?? '') + predecessorSummary;
+              await this.store.updateTaskDescription(depTask.id, depTask.description);
+            }
+
             const depChannel = depTask.projectId ? `project-${depTask.projectId}` : 'general';
-            this.agentManager.emit('message', depTask.assignedTo, depChannel,
+            this.agentManager.notify(depTask.assignedTo, depChannel,
               `dependency "${cleanTitle}" is done, starting on "${depTask.title}"`);
             this.agentManager.assignTask(depTask.assignedTo, depTask).catch(err => {
               console.error(`[Unblock] Failed to assign ${depTask.id}: ${err.message}`);
@@ -458,18 +450,41 @@ export class Agency {
           channel: 'ceo-investor', content: msg.text, timestamp: new Date(),
         });
 
-        // Build conversation history for context
-        const recentMessages = await this.store.getChannelMessages('ceo-investor', 10);
+        // Build conversation history for context (limit to 5 for efficiency)
+        const recentMessages = await this.store.getChannelMessages('ceo-investor', 5);
         const history = recentMessages
           .map(m => `${m.fromAgentId === 'investor' ? 'Investor' : 'Alice'}: ${m.content}`)
           .join('\n');
 
-        // Alice always responds conversationally first
-        const chatContext = history
-          ? `Recent conversation:\n${history}\n\nInvestor says: "${msg.text}"\n\nRespond naturally as Alice the CEO. If they're giving you a task or project idea, acknowledge it and say you'll hand it to Diana (PM) and the team. If it's casual chat, just be friendly. Keep it short — 1-3 sentences, like a real Slack message. Only respond with your message, nothing else.`
-          : undefined;
+        // Combined call: Alice responds AND classifies intent in one query.
+        // Saves a full model call per investor message.
+        const combinedContext = [
+          history ? `Recent conversation:\n${history}\n` : '',
+          `Investor says: "${msg.text}"`,
+          ``,
+          `Respond naturally as Alice the CEO. If they're giving you a task or project idea, acknowledge it and say you'll hand it to Diana (PM) and the team. If it's casual chat, just be friendly. Keep it short — 1-3 sentences, like a real Slack message.`,
+          ``,
+          `IMPORTANT: After your response, add a newline then a JSON line classifying the intent:`,
+          `{"intent":"<project_idea|simple_task|hire_request|question|chat>","summary":"<1 sentence>"}`,
+          `The JSON must be on its own line at the very end.`,
+        ].filter(Boolean).join('\n');
 
-        const response = await this.agentManager.chat('ceo', msg.text, chatContext);
+        const rawResponse = await this.agentManager.chat('ceo', msg.text, combinedContext);
+
+        // Parse combined response: split chat response from intent JSON
+        const jsonMatch = rawResponse.match(/\{[^{}]*"intent"\s*:\s*"[^"]*"[^{}]*\}\s*$/);
+        const response = jsonMatch
+          ? rawResponse.slice(0, rawResponse.lastIndexOf(jsonMatch[0])).trim()
+          : rawResponse.trim();
+
+        let intent: { type: string; summary: string } = { type: 'chat', summary: msg.text.slice(0, 100) };
+        if (jsonMatch) {
+          try {
+            const parsed = JSON.parse(jsonMatch[0]);
+            if (parsed.intent) intent = { type: parsed.intent, summary: parsed.summary ?? msg.text.slice(0, 100) };
+          } catch { /* fallback to default */ }
+        }
+
         const ceoBp = this.agentManager.getBlueprint('ceo');
         await this.slack!.sendAgentMessage('agency-ceo-investor', 'Alice', 'CEO', response, ceoBp?.avatar);
 
@@ -478,8 +493,6 @@ export class Agency {
           channel: 'ceo-investor', content: response, timestamp: new Date(),
         });
 
-        // Classify intent using Claude (replaces keyword matching)
-        const intent = await this.classifyIntent(msg.text);
         console.log(`[Intent] "${msg.text.slice(0, 50)}..." → ${intent.type}`);
 
         switch (intent.type) {
@@ -554,9 +567,9 @@ export class Agency {
         }
       }
 
-      // Build chat history
+      // Build chat history (limit to 5 messages for token efficiency)
       const slackChannel = msg.channelName;
-      const recentMessages = await this.store.getChannelMessages(slackChannel, 10);
+      const recentMessages = await this.store.getChannelMessages(slackChannel, 5);
       const history = recentMessages
         .map(m => {
           const sender = m.fromAgentId === 'investor' ? 'Investor' : (this.agentManager.getBlueprint(m.fromAgentId ?? '')?.name ?? m.fromAgentId);
@@ -649,6 +662,7 @@ export class Agency {
       const stream = query({
         prompt,
         options: {
+          model: UTILITY_MODEL,
           allowedTools: [],
           maxTurns: 1,
           permissionMode: 'bypassPermissions',
