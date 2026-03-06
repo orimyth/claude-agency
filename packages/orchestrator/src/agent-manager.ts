@@ -144,6 +144,7 @@ export class AgentManager extends EventEmitter {
 
       let resultText = '';
       let turnCount = 0;
+      let lastResult: SDKResultMessage | null = null;
 
       for await (const message of stream) {
         // Track turns for progress updates
@@ -158,6 +159,7 @@ export class AgentManager extends EventEmitter {
 
         if (message.type === 'result') {
           const resultMsg = message as SDKResultMessage;
+          lastResult = resultMsg;
           if (resultMsg.subtype === 'success') {
             resultText = resultMsg.result;
           }
@@ -169,6 +171,23 @@ export class AgentManager extends EventEmitter {
       const channel = task.projectId ? `project-${task.projectId}` : 'general';
       this.emit('message', blueprint.id, channel, summary);
       this.emit('taskComplete', blueprint.id, task.id);
+
+      // Record usage from the result message
+      if (lastResult) {
+        await this.store.recordUsage({
+          id: crypto.randomUUID(),
+          agentId: blueprint.id,
+          taskId: task.id,
+          inputTokens: lastResult.usage?.input_tokens ?? 0,
+          outputTokens: lastResult.usage?.output_tokens ?? 0,
+          cacheReadTokens: lastResult.usage?.cache_read_input_tokens ?? 0,
+          cacheCreationTokens: lastResult.usage?.cache_creation_input_tokens ?? 0,
+          costUsd: lastResult.total_cost_usd ?? 0,
+          numTurns: lastResult.num_turns ?? 0,
+          durationMs: lastResult.duration_ms ?? 0,
+          model: Object.keys(lastResult.modelUsage ?? {})[0] ?? null,
+        });
+      }
 
       await this.store.updateTaskStatus(task.id, 'review');
       await this.store.updateAgentStatus(blueprint.id, 'idle');
@@ -297,6 +316,22 @@ export class AgentManager extends EventEmitter {
       if (msg.type === 'result') {
         const r = msg as SDKResultMessage;
         if (r.subtype === 'success') result = r.result;
+        // Track chat usage
+        try {
+          await this.store.recordUsage({
+            id: crypto.randomUUID(),
+            agentId,
+            taskId: null,
+            inputTokens: r.usage?.input_tokens ?? 0,
+            outputTokens: r.usage?.output_tokens ?? 0,
+            cacheReadTokens: r.usage?.cache_read_input_tokens ?? 0,
+            cacheCreationTokens: r.usage?.cache_creation_input_tokens ?? 0,
+            costUsd: r.total_cost_usd ?? 0,
+            numTurns: r.num_turns ?? 0,
+            durationMs: r.duration_ms ?? 0,
+            model: Object.keys(r.modelUsage ?? {})[0] ?? null,
+          });
+        } catch { /* non-critical */ }
       }
     }
 

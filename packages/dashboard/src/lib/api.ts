@@ -32,6 +32,11 @@ export async function submitIdea(title: string, description: string) {
   return res.json();
 }
 
+export async function fetchUsage() {
+  const res = await fetch(`${API_BASE}/api/usage`);
+  return res.json();
+}
+
 export async function resolveApproval(
   id: string,
   status: "approved" | "rejected",

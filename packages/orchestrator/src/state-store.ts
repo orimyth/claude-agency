@@ -129,6 +129,25 @@ export class StateStore {
           updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
         )
       `);
+
+      await conn.query(`
+        CREATE TABLE IF NOT EXISTS usage_log (
+          id VARCHAR(64) PRIMARY KEY,
+          agent_id VARCHAR(64) NOT NULL,
+          task_id VARCHAR(64) NULL,
+          input_tokens INT NOT NULL DEFAULT 0,
+          output_tokens INT NOT NULL DEFAULT 0,
+          cache_read_tokens INT NOT NULL DEFAULT 0,
+          cache_creation_tokens INT NOT NULL DEFAULT 0,
+          cost_usd DECIMAL(10, 6) NOT NULL DEFAULT 0,
+          num_turns INT NOT NULL DEFAULT 0,
+          duration_ms INT NOT NULL DEFAULT 0,
+          model VARCHAR(128) NULL,
+          recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          INDEX idx_agent (agent_id),
+          INDEX idx_recorded (recorded_at)
+        )
+      `);
     } finally {
       conn.release();
     }
@@ -319,6 +338,135 @@ export class StateStore {
       'INSERT INTO kpi_entries (id, agent_id, metric, value) VALUES (?, ?, ?, ?)',
       [id, agentId, metric, value]
     );
+  }
+
+  // Usage tracking
+  async recordUsage(entry: {
+    id: string;
+    agentId: string;
+    taskId: string | null;
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheCreationTokens: number;
+    costUsd: number;
+    numTurns: number;
+    durationMs: number;
+    model: string | null;
+  }): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO usage_log (id, agent_id, task_id, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cost_usd, num_turns, duration_ms, model)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [entry.id, entry.agentId, entry.taskId, entry.inputTokens, entry.outputTokens,
+       entry.cacheReadTokens, entry.cacheCreationTokens, entry.costUsd, entry.numTurns, entry.durationMs, entry.model]
+    );
+  }
+
+  async getUsageSummary(): Promise<{
+    totalCostUsd: number;
+    totalInputTokens: number;
+    totalOutputTokens: number;
+    totalCacheReadTokens: number;
+    totalSessions: number;
+    byAgent: Array<{
+      agentId: string;
+      costUsd: number;
+      inputTokens: number;
+      outputTokens: number;
+      sessions: number;
+    }>;
+    last24h: {
+      costUsd: number;
+      inputTokens: number;
+      outputTokens: number;
+      sessions: number;
+    };
+  }> {
+    // Totals
+    const [totalRows] = await this.pool.query<RowDataPacket[]>(
+      `SELECT
+        COALESCE(SUM(cost_usd), 0) as total_cost,
+        COALESCE(SUM(input_tokens), 0) as total_input,
+        COALESCE(SUM(output_tokens), 0) as total_output,
+        COALESCE(SUM(cache_read_tokens), 0) as total_cache_read,
+        COUNT(*) as total_sessions
+      FROM usage_log`
+    );
+
+    // By agent
+    const [agentRows] = await this.pool.query<RowDataPacket[]>(
+      `SELECT
+        agent_id,
+        COALESCE(SUM(cost_usd), 0) as cost,
+        COALESCE(SUM(input_tokens), 0) as input_tokens,
+        COALESCE(SUM(output_tokens), 0) as output_tokens,
+        COUNT(*) as sessions
+      FROM usage_log
+      GROUP BY agent_id
+      ORDER BY cost DESC`
+    );
+
+    // Last 24 hours
+    const [recentRows] = await this.pool.query<RowDataPacket[]>(
+      `SELECT
+        COALESCE(SUM(cost_usd), 0) as cost,
+        COALESCE(SUM(input_tokens), 0) as input_tokens,
+        COALESCE(SUM(output_tokens), 0) as output_tokens,
+        COUNT(*) as sessions
+      FROM usage_log
+      WHERE recorded_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)`
+    );
+
+    const t = totalRows[0];
+    const r = recentRows[0];
+
+    return {
+      totalCostUsd: Number(t.total_cost),
+      totalInputTokens: Number(t.total_input),
+      totalOutputTokens: Number(t.total_output),
+      totalCacheReadTokens: Number(t.total_cache_read),
+      totalSessions: Number(t.total_sessions),
+      byAgent: agentRows.map(row => ({
+        agentId: row.agent_id,
+        costUsd: Number(row.cost),
+        inputTokens: Number(row.input_tokens),
+        outputTokens: Number(row.output_tokens),
+        sessions: Number(row.sessions),
+      })),
+      last24h: {
+        costUsd: Number(r.cost),
+        inputTokens: Number(r.input_tokens),
+        outputTokens: Number(r.output_tokens),
+        sessions: Number(r.sessions),
+      },
+    };
+  }
+
+  async getRecentUsage(limit = 20): Promise<Array<{
+    agentId: string;
+    taskId: string | null;
+    costUsd: number;
+    inputTokens: number;
+    outputTokens: number;
+    numTurns: number;
+    durationMs: number;
+    model: string | null;
+    recordedAt: Date;
+  }>> {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      'SELECT * FROM usage_log ORDER BY recorded_at DESC LIMIT ?', [limit]
+    );
+    return rows.map(r => ({
+      agentId: r.agent_id,
+      taskId: r.task_id,
+      costUsd: Number(r.cost_usd),
+      inputTokens: Number(r.input_tokens),
+      outputTokens: Number(r.output_tokens),
+      numTurns: r.num_turns,
+      durationMs: r.duration_ms,
+      model: r.model,
+      recordedAt: new Date(r.recorded_at),
+    }));
   }
 
   // Settings

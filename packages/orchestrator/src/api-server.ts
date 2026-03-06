@@ -129,6 +129,13 @@ export class APIServer {
       return;
     }
 
+    if (req.method === 'GET' && path === '/api/usage') {
+      const summary = await this.store.getUsageSummary();
+      const recent = await this.store.getRecentUsage(30);
+      this.json(res, { ...summary, recent });
+      return;
+    }
+
     if (req.method === 'POST' && path === '/api/settings') {
       const body = await this.readBody(req);
       const entries = JSON.parse(body) as Record<string, string>;
