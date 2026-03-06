@@ -428,11 +428,14 @@ export class Agency {
     const topicMap: Record<string, string[]> = {
       'architect|architecture|system design|tech stack|database|infrastructure|architektur': ['architect'],
       'design|ui|ux|layout|component|css|style|figma|gestaltung': ['designer'],
-      'code|bug|fix|implement|function|api|backend|frontend|test|programmier|entwickl': ['developer'],
+      'code|bug|fix|implement|function|api|backend|frontend|programmier|entwickl': ['developer'],
       'research|compare|analyze|benchmark|evaluate|docs|documentation|forschung|recherche': ['researcher'],
       'sprint|task|deadline|progress|assign|priority|timeline|aufgabe|planung': ['pm'],
       'hire|new role|new agent|team|onboard|einstell|rekrutier': ['hr'],
       'plan|strategy|budget|kpi|status|report|strategie|bericht': ['ceo'],
+      'security|vulnerability|penetration|owasp|xss|injection|auth|sicherheit|pentest|cve|exploit': ['security'],
+      'deploy|docker|ci|cd|pipeline|server|infra|devops|kubernetes|nginx|monitoring': ['devops'],
+      'test|qa|quality|regression|coverage|e2e|integration test|testen|qualität': ['qa'],
     };
 
     const matched: string[] = [];
