@@ -45,15 +45,40 @@ export const defaultBlacklist: BlacklistConfig = {
     ],
   },
   roles: {
+    ceo: {
+      blockedCommands: [],
+      blockedPaths: [],
+      allowedPaths: ['**/*'],
+    },
+    hr: {
+      blockedCommands: ['git push', 'npm install', 'pip install'],
+      blockedPaths: ['**/src/**', '**/packages/**'],
+      allowedPaths: ['**/data/blueprints/**', '**/config/blueprints/**'],
+    },
+    architect: {
+      blockedCommands: [],
+      blockedPaths: [],
+      allowedPaths: ['**/*'],
+    },
+    pm: {
+      blockedCommands: ['git push --force', 'git reset --hard'],
+      blockedPaths: [],
+      allowedPaths: ['**/*'],
+    },
+    developer: {
+      blockedCommands: [],
+      blockedPaths: [],
+      allowedPaths: ['**/*'],
+    },
     designer: {
       blockedCommands: [],
-      blockedPaths: ['**/backend/**', '**/api/**', '**/server/**', '**/database/**'],
-      allowedPaths: ['**/frontend/**', '**/ui/**', '**/components/**', '**/styles/**', '**/public/**'],
+      blockedPaths: ['**/backend/**', '**/api/**', '**/server/**', '**/database/**', '**/migrations/**'],
+      allowedPaths: ['**/frontend/**', '**/ui/**', '**/components/**', '**/styles/**', '**/public/**', '**/app/**'],
     },
     researcher: {
       blockedCommands: ['git push', 'git commit'],
       blockedPaths: ['**/src/**'],
-      allowedPaths: ['**/docs/**', '**/research/**'],
+      allowedPaths: ['**/docs/**', '**/research/**', '**/*.md'],
     },
   },
   overrides: [],

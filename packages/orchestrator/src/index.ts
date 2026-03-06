@@ -6,6 +6,9 @@ import { PermissionEngine } from './permission-engine.js';
 import { AgentManager } from './agent-manager.js';
 import { Scheduler } from './scheduler.js';
 import { TaskRouter } from './task-router.js';
+import { TaskBoard } from './task-board.js';
+import { HRManager } from './hr-manager.js';
+import { WorkflowEngine } from './workflow-engine.js';
 import { DashboardWSServer } from './ws-server.js';
 import { SlackBridge, type InvestorMessage } from 'slack-bridge';
 
@@ -15,6 +18,9 @@ export class Agency {
   private agentManager: AgentManager;
   private scheduler: Scheduler;
   private taskRouter: TaskRouter;
+  private taskBoard: TaskBoard;
+  private hrManager!: HRManager;
+  private workflowEngine!: WorkflowEngine;
   private wsServer: DashboardWSServer;
   private slack: SlackBridge | null = null;
 
@@ -24,6 +30,7 @@ export class Agency {
     this.agentManager = new AgentManager(this.store, this.permissions, agencyConfig);
     this.scheduler = new Scheduler(this.store, this.agentManager);
     this.taskRouter = new TaskRouter(this.store, this.agentManager);
+    this.taskBoard = new TaskBoard(this.store);
     this.wsServer = new DashboardWSServer(agencyConfig.wsPort);
   }
 
@@ -40,6 +47,19 @@ export class Agency {
       await this.agentManager.initializeAgent(blueprint);
       console.log(`  Agent registered: ${blueprint.name} (${blueprint.role})`);
     }
+
+    // Initialize HR manager (loads custom blueprints from disk)
+    this.hrManager = new HRManager(this.agentManager, this.store);
+    const customAgents = this.hrManager.getCustomBlueprints();
+    if (customAgents.length > 0) {
+      console.log(`  Loaded ${customAgents.length} custom agent(s) from HR`);
+    }
+
+    // Initialize workflow engine
+    this.workflowEngine = new WorkflowEngine(
+      this.agentManager, this.store, this.taskBoard, this.hrManager, agencyConfig,
+    );
+    this.setupWorkflowEvents();
 
     // Initialize Slack if configured
     if (agencyConfig.slack.botToken && agencyConfig.slack.appToken) {
@@ -68,15 +88,13 @@ export class Agency {
     console.log('Scheduler started');
 
     console.log(`WebSocket server running on port ${agencyConfig.wsPort}`);
-    console.log('Claude Agency is running. Waiting for tasks...');
+    console.log('Claude Agency is running. Waiting for tasks...\n');
   }
 
   private setupAgentEvents(): void {
     this.agentManager.on('message', async (agentId: string, channel: string, content: string) => {
-      // Broadcast to dashboard
       this.wsServer.broadcast('message:new', { agentId, channel, content });
 
-      // Save to DB
       await this.store.saveMessage({
         id: crypto.randomUUID(),
         fromAgentId: agentId,
@@ -94,10 +112,23 @@ export class Agency {
           await this.slack.sendAgentMessage(slackChannel, blueprint.name, blueprint.role, content);
         }
       }
+
+      // Check if HR agent output contains a new blueprint
+      if (agentId === 'hr') {
+        await this.workflowEngine.processHROutput(content);
+      }
     });
 
-    this.agentManager.on('taskComplete', (agentId: string, taskId: string) => {
+    this.agentManager.on('taskComplete', async (agentId: string, taskId: string) => {
       this.wsServer.broadcast('task:update', { agentId, taskId, status: 'review' });
+
+      // If CEO completed an evaluation, run the workflow
+      if (agentId === 'ceo') {
+        const task = await this.store.getTask(taskId);
+        if (task && task.title.startsWith('[Investor Idea]')) {
+          await this.workflowEngine.evaluateIdea(task);
+        }
+      }
     });
 
     this.agentManager.on('taskFailed', (agentId: string, taskId: string, error: string) => {
@@ -112,67 +143,65 @@ export class Agency {
       this.wsServer.broadcast('break:end', { agentId });
     });
 
-    this.agentManager.on('needsApproval', async (agentId: string, title: string, description: string) => {
-      this.wsServer.broadcast('approval:new', { agentId, title, description });
-
-      // Create approval in DB
-      const approvalId = crypto.randomUUID();
-      await this.store.createApproval({
-        id: approvalId,
-        title,
-        description,
-        requestedBy: agentId,
-        status: 'pending',
-        projectId: null,
-        response: null,
-        createdAt: new Date(),
-        resolvedAt: null,
-      });
-
-      // Send to Slack
-      if (this.slack) {
-        const blueprint = this.agentManager.getBlueprint(agentId);
-        await this.slack.sendApprovalRequest(approvalId, title, description, blueprint?.name ?? agentId);
-      }
-    });
-
     this.agentManager.on('error', (agentId: string, error: Error) => {
       console.error(`[Agent ${agentId}] Error:`, error.message);
       this.wsServer.broadcast('agent:status', { agentId, status: 'error', error: error.message });
     });
   }
 
-  private setupSlackBridge(): void {
-    if (!this.slack) return;
+  private setupWorkflowEvents(): void {
+    this.workflowEngine.on('message', async (agentId: string, channel: string, content: string) => {
+      this.wsServer.broadcast('message:new', { agentId, channel, content });
 
-    // Investor messages in #agency-ceo-investor → route to CEO
-    this.slack.on('investor:message', async (msg: InvestorMessage) => {
-      console.log(`[Slack] Investor: ${msg.text}`);
-      const { projectId, taskId } = await this.taskRouter.submitIdea(
-        msg.text.slice(0, 100),
-        msg.text,
-      );
-      // Acknowledge in Slack
-      await this.slack!.sendAgentMessage('agency-ceo-investor', 'Alice', 'CEO', `got it, I'm on it`);
-    });
+      await this.store.saveMessage({
+        id: crypto.randomUUID(),
+        fromAgentId: agentId,
+        toAgentId: null,
+        channel,
+        content,
+        timestamp: new Date(),
+      });
 
-    // Approval responses
-    this.slack.on('approval:resolve', async (data: { approvalId: string; status: string; userId: string }) => {
-      if (data.approvalId) {
-        await this.store.resolveApproval(
-          data.approvalId,
-          data.status as 'approved' | 'rejected',
-        );
-        this.wsServer.broadcast('approval:resolved', {
-          approvalId: data.approvalId,
-          status: data.status,
-        });
+      if (this.slack) {
+        const blueprint = this.agentManager.getBlueprint(agentId);
+        if (blueprint) {
+          const slackChannel = this.mapToSlackChannel(channel);
+          await this.slack.sendAgentMessage(slackChannel, blueprint.name, blueprint.role, content);
+        }
       }
     });
 
-    // Messages in project channels → context for working agents
+    this.workflowEngine.on('approval:request', async (data: { taskId: string; title: string; description: string }) => {
+      this.wsServer.broadcast('approval:new', data);
+      if (this.slack) {
+        await this.slack.sendApprovalRequest(data.taskId, data.title, data.description, 'Alice');
+      }
+    });
+
+    this.workflowEngine.on('error', (agentId: string, error: Error) => {
+      console.error(`[Workflow ${agentId}] Error:`, error.message);
+    });
+  }
+
+  private setupSlackBridge(): void {
+    if (!this.slack) return;
+
+    this.slack.on('investor:message', async (msg: InvestorMessage) => {
+      console.log(`[Slack] Investor: ${msg.text}`);
+      await this.taskRouter.submitIdea(msg.text.slice(0, 100), msg.text);
+      await this.slack!.sendAgentMessage('agency-ceo-investor', 'Alice', 'CEO', `got it, I'm on it`);
+    });
+
+    this.slack.on('approval:resolve', async (data: { approvalId: string; status: string }) => {
+      if (data.approvalId) {
+        const status = data.status as 'approved' | 'rejected';
+        await this.store.resolveApproval(data.approvalId, status);
+        await this.workflowEngine.handleApprovalResponse(data.approvalId, status);
+        this.wsServer.broadcast('approval:resolved', { approvalId: data.approvalId, status });
+      }
+    });
+
     this.slack.on('channel:message', async (msg: InvestorMessage) => {
-      // Save as a message in the system for context
       await this.store.saveMessage({
         id: crypto.randomUUID(),
         fromAgentId: 'investor',
@@ -198,17 +227,12 @@ export class Agency {
     return this.taskRouter.submitIdea(title, description);
   }
 
-  getStore(): StateStore {
-    return this.store;
-  }
-
-  getAgentManager(): AgentManager {
-    return this.agentManager;
-  }
-
-  getSlack(): SlackBridge | null {
-    return this.slack;
-  }
+  getStore(): StateStore { return this.store; }
+  getAgentManager(): AgentManager { return this.agentManager; }
+  getTaskBoard(): TaskBoard { return this.taskBoard; }
+  getHRManager(): HRManager { return this.hrManager; }
+  getWorkflowEngine(): WorkflowEngine { return this.workflowEngine; }
+  getSlack(): SlackBridge | null { return this.slack; }
 
   async shutdown(): Promise<void> {
     console.log('Shutting down...');
