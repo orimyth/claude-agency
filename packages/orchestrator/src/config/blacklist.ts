@@ -1,0 +1,60 @@
+import type { BlacklistConfig } from '../types.js';
+
+export const defaultBlacklist: BlacklistConfig = {
+  global: {
+    blockedCommands: [
+      'rm -rf /',
+      'rm -rf ~',
+      'rm -rf *',
+      'mkfs',
+      'dd if=',
+      ':(){:|:&};:',
+      'chmod -R 777',
+      'git push --force origin main',
+      'git push --force origin master',
+      'git push -f origin main',
+      'git push -f origin master',
+      'DROP DATABASE',
+      'DROP TABLE',
+      'TRUNCATE TABLE',
+      'shutdown',
+      'reboot',
+      'halt',
+      'poweroff',
+    ],
+    blockedPatterns: [
+      'rm\\s+-rf\\s+/',
+      'chmod\\s+777',
+      '>(\\s+)/dev/sd',
+      'curl.*\\|.*sh',
+      'wget.*\\|.*sh',
+      'npm\\s+publish',
+      'curl.*\\|.*bash',
+    ],
+    blockedPaths: [
+      '/etc',
+      '/usr',
+      '/var',
+      '/sys',
+      '/proc',
+      '/boot',
+      '~/.ssh',
+      '~/.aws',
+      '~/.gnupg',
+      '~/.env',
+    ],
+  },
+  roles: {
+    designer: {
+      blockedCommands: [],
+      blockedPaths: ['**/backend/**', '**/api/**', '**/server/**', '**/database/**'],
+      allowedPaths: ['**/frontend/**', '**/ui/**', '**/components/**', '**/styles/**', '**/public/**'],
+    },
+    researcher: {
+      blockedCommands: ['git push', 'git commit'],
+      blockedPaths: ['**/src/**'],
+      allowedPaths: ['**/docs/**', '**/research/**'],
+    },
+  },
+  overrides: [],
+};

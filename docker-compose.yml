@@ -1,0 +1,47 @@
+services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpassword}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-claude_agency}
+      MYSQL_USER: ${MYSQL_USER:-claude_agency}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-agencypass}
+    ports:
+      - "${MYSQL_PORT:-3306}:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_USER: ${MYSQL_USER:-claude_agency}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-agencypass}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-claude_agency}
+      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN}
+      SLACK_SIGNING_SECRET: ${SLACK_SIGNING_SECRET}
+      SLACK_APP_TOKEN: ${SLACK_APP_TOKEN}
+      CLAUDE_API_KEY: ${CLAUDE_API_KEY}
+      WORKSPACE_DIR: /workspace
+      MAX_CONCURRENCY: ${MAX_CONCURRENCY:-5}
+      DASHBOARD_PORT: 3000
+      WS_PORT: 3001
+    ports:
+      - "${DASHBOARD_PORT:-3000}:3000"
+      - "${WS_PORT:-3001}:3001"
+    volumes:
+      - ./workspace:/workspace
+
+volumes:
+  mysql_data:

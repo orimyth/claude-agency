@@ -1,0 +1,20 @@
+{
+  "name": "claude-agency",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Autonomous AI agency powered by Claude Code agents",
+  "scripts": {
+    "build": "pnpm -r build",
+    "dev": "pnpm --filter orchestrator dev",
+    "setup": "pnpm --filter orchestrator setup",
+    "setup:slack": "pnpm --filter slack-bridge setup",
+    "start": "pnpm --filter orchestrator start",
+    "submit": "pnpm --filter orchestrator submit"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild"]
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
