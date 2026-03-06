@@ -28,6 +28,9 @@ importers:
       ora:
         specifier: ^8.1.0
         version: 8.2.0
+      slack-bridge:
+        specifier: workspace:*
+        version: link:../slack-bridge
       ws:
         specifier: ^8.18.0
         version: 8.19.0
