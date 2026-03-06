@@ -4,7 +4,7 @@ import { fileURLToPath } from 'url';
 import type { AgencyConfig } from '../types.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-dotenvConfig({ path: resolve(__dirname, '../../../.env') });
+dotenvConfig({ path: resolve(__dirname, '../../../../.env') });
 
 function env(key: string, fallback?: string): string {
   const val = process.env[key] ?? fallback;

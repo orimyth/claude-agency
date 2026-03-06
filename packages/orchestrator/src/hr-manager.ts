@@ -1,4 +1,4 @@
-import { writeFileSync, readFileSync, existsSync, mkdirSync } from 'fs';
+import { writeFileSync, readFileSync, existsSync, mkdirSync, readdirSync, unlinkSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import type { AgentBlueprint } from './types.js';
@@ -25,8 +25,7 @@ export class HRManager {
       return;
     }
 
-    const { readdirSync } = require('fs') as typeof import('fs');
-    const files = readdirSync(CUSTOM_BLUEPRINTS_DIR).filter((f: string) => f.endsWith('.json'));
+    const files = readdirSync(CUSTOM_BLUEPRINTS_DIR).filter(f => f.endsWith('.json'));
     for (const file of files) {
       try {
         const content = readFileSync(resolve(CUSTOM_BLUEPRINTS_DIR, file), 'utf-8');
@@ -102,7 +101,6 @@ export class HRManager {
     // Remove custom blueprint file if it exists
     const filePath = resolve(CUSTOM_BLUEPRINTS_DIR, `${agentId}.json`);
     if (existsSync(filePath)) {
-      const { unlinkSync } = require('fs') as typeof import('fs');
       unlinkSync(filePath);
     }
     this.customBlueprints.delete(agentId);
