@@ -1,7 +1,7 @@
 import { App } from '@slack/bolt';
 import { EventEmitter } from 'events';
 import { ChannelManager } from './channels.js';
-import { formatAgentMessage, formatApprovalRequest, formatStatusUpdate } from './message-formatter.js';
+import { formatAgentMessage, formatApprovalRequest, formatStatusUpdate, avatarToPublicUrl } from './message-formatter.js';
 
 export interface SlackBridgeConfig {
   botToken: string;
@@ -146,20 +146,29 @@ export class SlackBridge extends EventEmitter {
 
   // --- Sending messages ---
 
-  async sendAgentMessage(channelName: string, agentName: string, role: string, content: string): Promise<void> {
+  async sendAgentMessage(channelName: string, agentName: string, role: string, content: string, avatar?: string | null): Promise<void> {
     const channelId = this.channelManager.getChannelId(channelName);
     if (!channelId) {
       console.warn(`[Slack] Channel '${channelName}' not found, skipping message`);
       return;
     }
 
-    const formatted = formatAgentMessage(agentName, role, content);
-    await this.app.client.chat.postMessage({
+    const publicAvatarUrl = avatarToPublicUrl(avatar);
+    const formatted = formatAgentMessage(agentName, role, content, publicAvatarUrl);
+
+    const msgPayload: Record<string, unknown> = {
       channel: channelId,
       text: formatted.text,
       username: formatted.username,
-      icon_emoji: formatted.icon_emoji,
-    });
+    };
+
+    if (formatted.icon_url) {
+      msgPayload.icon_url = formatted.icon_url;
+    } else if (formatted.icon_emoji) {
+      msgPayload.icon_emoji = formatted.icon_emoji;
+    }
+
+    await this.app.client.chat.postMessage(msgPayload as any);
   }
 
   async sendApprovalRequest(approvalId: string, title: string, description: string, agentName: string): Promise<void> {

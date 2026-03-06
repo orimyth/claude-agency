@@ -132,7 +132,7 @@ export class Agency {
         const blueprint = this.agentManager.getBlueprint(agentId);
         if (blueprint) {
           const slackChannel = this.mapToSlackChannel(channel);
-          await this.slack.sendAgentMessage(slackChannel, blueprint.name, blueprint.role, content);
+          await this.slack.sendAgentMessage(slackChannel, blueprint.name, blueprint.role, content, blueprint.avatar);
         }
       }
 
@@ -220,7 +220,7 @@ export class Agency {
         const blueprint = this.agentManager.getBlueprint(agentId);
         if (blueprint) {
           const slackChannel = this.mapToSlackChannel(channel);
-          await this.slack.sendAgentMessage(slackChannel, blueprint.name, blueprint.role, content);
+          await this.slack.sendAgentMessage(slackChannel, blueprint.name, blueprint.role, content, blueprint.avatar);
         }
       }
     });
@@ -258,7 +258,8 @@ export class Agency {
 
         const report = await this.agentManager.chat('ceo', '', context);
         if (this.slack) {
-          await this.slack.sendAgentMessage('agency-general', 'Alice', 'CEO', report);
+          const ceoBp = this.agentManager.getBlueprint('ceo');
+          await this.slack.sendAgentMessage('agency-general', 'Alice', 'CEO', report, ceoBp?.avatar);
         }
 
         await this.store.saveMessage({
@@ -291,7 +292,8 @@ export class Agency {
           : undefined;
 
         const response = await this.agentManager.chat('ceo', msg.text, context);
-        await this.slack!.sendAgentMessage('agency-ceo-investor', 'Alice', 'CEO', response);
+        const ceoBp = this.agentManager.getBlueprint('ceo');
+        await this.slack!.sendAgentMessage('agency-ceo-investor', 'Alice', 'CEO', response, ceoBp?.avatar);
 
         // Save both messages to history
         await this.store.saveMessage({
@@ -317,7 +319,8 @@ export class Agency {
               `You are Bob (HR Manager). The investor asked in #ceo-investor: "${msg.text}"\n\nAlice (CEO) responded: "${response}"\n\nIf this is a hiring request, create the blueprint JSON immediately. Include all required fields: id, role, name, gender, systemPrompt. Respond with your message and the JSON blueprint if applicable.`
             );
             if (this.slack) {
-              await this.slack.sendAgentMessage('agency-ceo-investor', 'Bob', 'HR Manager', hrResponse);
+              const hrBp = this.agentManager.getBlueprint('hr');
+              await this.slack.sendAgentMessage('agency-ceo-investor', 'Bob', 'HR Manager', hrResponse, hrBp?.avatar);
             }
             await this.store.saveMessage({
               id: crypto.randomUUID(), fromAgentId: 'hr', toAgentId: 'investor',
@@ -331,7 +334,8 @@ export class Agency {
         }
       } catch (err: any) {
         console.error('[CEO chat error]', err.message);
-        await this.slack!.sendAgentMessage('agency-ceo-investor', 'Alice', 'CEO', `hey, give me a sec — something glitched on my end`);
+        const ceoBpFallback = this.agentManager.getBlueprint('ceo');
+        await this.slack!.sendAgentMessage('agency-ceo-investor', 'Alice', 'CEO', `hey, give me a sec — something glitched on my end`, ceoBpFallback?.avatar);
       }
     });
 
@@ -386,7 +390,7 @@ export class Agency {
           const context = `You are ${blueprint.name} (${blueprint.role}) in the #${slackChannel} Slack channel.\n\nRecent messages:\n${history}\n\nInvestor says: "${msg.text}"\n\nRespond naturally as ${blueprint.name}. Keep it short — 1-2 sentences, like a real Slack message. Only respond with your message, nothing else.`;
 
           const response = await this.agentManager.chat(agentId, msg.text, context);
-          await this.slack!.sendAgentMessage(slackChannel, blueprint.name, blueprint.role, response);
+          await this.slack!.sendAgentMessage(slackChannel, blueprint.name, blueprint.role, response, blueprint.avatar);
 
           await this.store.saveMessage({
             id: crypto.randomUUID(), fromAgentId: agentId, toAgentId: 'investor',
@@ -487,8 +491,9 @@ export class Agency {
 
       // Announce in Slack
       if (this.slack) {
+        const hrBp2 = this.agentManager.getBlueprint('hr');
         await this.slack.sendAgentMessage('agency-hr-hiring', 'Bob', 'HR Manager',
-          `hired ${hired.name} as ${hired.role}. they're ready to go`);
+          `hired ${hired.name} as ${hired.role}. they're ready to go`, hrBp2?.avatar);
 
         // Create Slack channels from the blueprint
         for (const ch of hired.slackChannels) {
@@ -521,8 +526,9 @@ export class Agency {
     } catch (err: any) {
       console.error(`[HR] Hire failed: ${err.message}`);
       if (this.slack) {
+        const hrBp3 = this.agentManager.getBlueprint('hr');
         await this.slack.sendAgentMessage('agency-hr-hiring', 'Bob', 'HR Manager',
-          `couldn't hire: ${err.message}`);
+          `couldn't hire: ${err.message}`, hrBp3?.avatar);
       }
     }
   }

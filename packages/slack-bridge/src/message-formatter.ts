@@ -17,22 +17,62 @@ const AGENT_EMOJIS: Record<string, string> = {
   developer: ':computer:',
   designer: ':art:',
   researcher: ':mag:',
+  security: ':lock:',
+  devops: ':gear:',
+  qa: ':white_check_mark:',
 };
 
 export function getAgentEmoji(role: string): string {
   return AGENT_EMOJIS[role.toLowerCase()] ?? ':robot_face:';
 }
 
-export function formatAgentMessage(agentName: string, role: string, content: string): {
+/**
+ * Convert a local avatar path to a public URL.
+ * Local: /avatars/female/f1.jpg → https://randomuser.me/api/portraits/women/1.jpg
+ * Local: /avatars/male/m3.jpg   → https://randomuser.me/api/portraits/men/3.jpg
+ */
+export function avatarToPublicUrl(avatarPath: string | null | undefined): string | null {
+  if (!avatarPath) return null;
+
+  const femaleMatch = avatarPath.match(/\/avatars\/female\/f(\d+)\.jpg/);
+  if (femaleMatch) {
+    return `https://randomuser.me/api/portraits/women/${femaleMatch[1]}.jpg`;
+  }
+
+  const maleMatch = avatarPath.match(/\/avatars\/male\/m(\d+)\.jpg/);
+  if (maleMatch) {
+    return `https://randomuser.me/api/portraits/men/${maleMatch[1]}.jpg`;
+  }
+
+  // If it's already a full URL, use it directly
+  if (avatarPath.startsWith('http')) return avatarPath;
+
+  return null;
+}
+
+export function formatAgentMessage(agentName: string, role: string, content: string, avatarUrl?: string | null): {
   text: string;
   username: string;
-  icon_emoji: string;
+  icon_emoji?: string;
+  icon_url?: string;
 } {
-  return {
+  const result: {
+    text: string;
+    username: string;
+    icon_emoji?: string;
+    icon_url?: string;
+  } = {
     text: content,
     username: `${agentName} (${role})`,
-    icon_emoji: getAgentEmoji(role),
   };
+
+  if (avatarUrl) {
+    result.icon_url = avatarUrl;
+  } else {
+    result.icon_emoji = getAgentEmoji(role);
+  }
+
+  return result;
 }
 
 export function formatApprovalRequest(title: string, description: string, agentName: string): object[] {
