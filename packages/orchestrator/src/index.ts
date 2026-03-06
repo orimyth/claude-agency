@@ -124,6 +124,14 @@ export class Agency {
     this.setupSchedulerEvents();
     console.log('Scheduler started');
 
+    // Wire project creation → Slack channel creation
+    this.toolHandler.setOnProjectCreated(async (projectId: string, projectName: string) => {
+      if (this.slack) {
+        await this.slack.createProjectChannel(projectName);
+        console.log(`Created Slack channel for project: ${projectName}`);
+      }
+    });
+
     // Start API server
     this.apiServer.setMemoryManager(this.memoryManager);
     this.apiServer.setToolHandler(this.toolHandler);
@@ -163,16 +171,17 @@ export class Agency {
       }
     });
 
-    this.agentManager.on('taskComplete', async (agentId: string, taskId: string) => {
+    this.agentManager.on('taskComplete', async (agentId: string, taskId: string, resultText?: string) => {
       this.wsServer.broadcast('task:update', { agentId, taskId, status: 'review' });
 
       const task = await this.store.getTask(taskId);
       if (!task) return;
 
       const cleanTitle = task.title.replace('[Investor Idea] ', '');
+      const WORKER_ROLES = new Set(['developer', 'frontend-developer', 'backend-developer', 'designer', 'researcher', 'devops', 'security']);
 
       // Chain of command for task completion:
-      // Worker (dev/designer/etc.) → reports to PM Diana
+      // Worker (dev/designer/etc.) → auto QA review → PM Diana
       // PM Diana → reports to CEO Alice
       // CEO Alice → reports to investor (if noteworthy)
 
@@ -187,15 +196,154 @@ export class Agency {
         } catch { /* non-critical */ }
       } else if (agentId === 'ceo') {
         // CEO completed something — no further escalation needed
+      } else if (agentId === 'qa') {
+        // QA finished review → check if bugs were found
+        const notifyChannel = task.projectId ? `project-${task.projectId}` : 'leadership';
+        const qaResult = (resultText ?? '').toLowerCase();
+        const hasBugs = qaResult.includes('bug') || qaResult.includes('fail') || qaResult.includes('error') ||
+          qaResult.includes('broken') || qaResult.includes('crash') || qaResult.includes('not work') ||
+          qaResult.includes('critical') || qaResult.includes('needs fix');
+        const isPass = qaResult.includes('good to ship') || qaResult.includes('all tests pass') ||
+          qaResult.includes('ready to ship') || qaResult.includes('works as expected');
+
+        if (hasBugs && !isPass) {
+          // QA found bugs → auto-create fix task for the original developer
+          try {
+            // Find the original task this QA was reviewing (via dependsOn)
+            const originalTaskId = task.dependsOn;
+            const originalTask = originalTaskId ? await this.store.getTask(originalTaskId) : null;
+            const originalDev = originalTask?.assignedTo ?? 'developer';
+
+            const fixTaskId = crypto.randomUUID();
+            const fixTask = {
+              id: fixTaskId,
+              title: `Fix bugs: ${cleanTitle.replace('QA Review: ', '')}`,
+              description: [
+                `QA (Nina) found issues in your previous work. Fix the bugs listed below.`,
+                ``,
+                `QA Report:`,
+                resultText?.slice(0, 1000) ?? 'See QA review for details',
+                ``,
+                `Fix all reported issues, then verify: build, run, test.`,
+              ].join('\n'),
+              status: 'assigned' as const,
+              projectId: task.projectId,
+              assignedTo: originalDev,
+              createdBy: 'qa',
+              parentTaskId: task.parentTaskId,
+              dependsOn: null as string | null,
+              priority: Math.min(task.priority + 1, 10), // bump priority for fixes
+              createdAt: new Date(),
+              updatedAt: new Date(),
+            };
+            await this.store.createTask(fixTask);
+            if (this.agentManager.getBlueprint(originalDev)) {
+              this.agentManager.assignTask(originalDev, fixTask).catch(err => {
+                console.error(`[QA Fix] Failed to assign fix task: ${err.message}`);
+              });
+            }
+
+            const devName = this.agentManager.getBlueprint(originalDev)?.name ?? originalDev;
+            this.agentManager.emit('message', 'qa', notifyChannel,
+              `found bugs, created fix task for ${devName}`);
+          } catch (err: any) {
+            console.error(`[QA Fix Loop] Error: ${err.message}`);
+          }
+        } else {
+          // QA passed → notify PM, mark original task as done
+          try {
+            await this.agentManager.agentToAgentChat(
+              agentId, 'pm',
+              `QA passed for "${cleanTitle.replace('QA Review: ', '')}". tested and good to ship`,
+              notifyChannel
+            );
+            // Mark the original reviewed task as done
+            if (task.dependsOn) {
+              await this.store.updateTaskStatus(task.dependsOn, 'done');
+            }
+          } catch { /* non-critical */ }
+        }
+      } else if (WORKER_ROLES.has(agentId) || WORKER_ROLES.has(agentId.replace(/-\d+$/, ''))) {
+        // Worker done → auto-create QA review task
+        const notifyChannel = task.projectId ? `project-${task.projectId}` : 'leadership';
+        try {
+          const qaTaskId = crypto.randomUUID();
+          const qaTask = {
+            id: qaTaskId,
+            title: `QA Review: ${cleanTitle}`,
+            description: [
+              `Review and verify the work done by ${this.agentManager.getBlueprint(agentId)?.name ?? agentId} on "${cleanTitle}".`,
+              ``,
+              `Original task description: ${task.description?.slice(0, 500) ?? 'N/A'}`,
+              ``,
+              `Your job:`,
+              `1. Check the code that was written/changed`,
+              `2. Try to build/run the project — does it start without errors?`,
+              `3. Test the feature — does it actually work?`,
+              `4. Check for obvious bugs, missing error handling, security issues`,
+              `5. If there are tests, run them`,
+              `6. Report your findings clearly: what works, what doesn't, what needs fixing`,
+              ``,
+              `If you find bugs, be specific: file, line, what's wrong, how to reproduce.`,
+              `If everything is good, confirm it's ready to ship.`,
+            ].join('\n'),
+            status: 'assigned' as const,
+            projectId: task.projectId,
+            assignedTo: 'qa',
+            createdBy: 'system',
+            parentTaskId: task.parentTaskId,
+            dependsOn: taskId,
+            priority: task.priority,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          };
+          await this.store.createTask(qaTask);
+          await this.agentManager.assignTask('qa', qaTask);
+
+          // Notify PM that work is done and QA is reviewing
+          await this.agentManager.agentToAgentChat(
+            agentId, 'pm',
+            `finished "${cleanTitle}", sent to Nina for QA review`,
+            notifyChannel
+          );
+        } catch (err: any) {
+          console.error(`[Auto QA] Failed to create QA task: ${err.message}`);
+          // Fallback: just notify PM directly
+          try {
+            await this.agentManager.agentToAgentChat(
+              agentId, 'pm',
+              `finished "${cleanTitle}", ready for review`,
+              notifyChannel
+            );
+          } catch { /* non-critical */ }
+        }
       } else {
-        // Any worker done → PM gets notified
+        // Any other agent → PM gets notified
+        const notifyChannel = task.projectId ? `project-${task.projectId}` : 'leadership';
         try {
           await this.agentManager.agentToAgentChat(
             agentId, 'pm',
             `finished "${cleanTitle}", ready for review`,
-            'leadership'
+            notifyChannel
           );
         } catch { /* non-critical */ }
+      }
+
+      // Unblock dependent tasks now that this one is done
+      try {
+        const unblockedTasks = await this.store.getUnblockedTasks(taskId);
+        for (const depTask of unblockedTasks) {
+          if (depTask.assignedTo && this.agentManager.getBlueprint(depTask.assignedTo)) {
+            const depChannel = depTask.projectId ? `project-${depTask.projectId}` : 'general';
+            this.agentManager.emit('message', depTask.assignedTo, depChannel,
+              `dependency "${cleanTitle}" is done, starting on "${depTask.title}"`);
+            this.agentManager.assignTask(depTask.assignedTo, depTask).catch(err => {
+              console.error(`[Unblock] Failed to assign ${depTask.id}: ${err.message}`);
+            });
+          }
+        }
+      } catch (err: any) {
+        console.error(`[Unblock] Error checking dependent tasks: ${err.message}`);
       }
     });
 
@@ -382,12 +530,28 @@ export class Agency {
         channel: msg.channelName, content: msg.text, timestamp: new Date(),
       });
 
-      // Determine who should respond
+      // Determine who should respond:
+      // 1. If someone is explicitly @mentioned, only they respond
+      // 2. Check recent conversation context to see if the user is talking to a specific agent
+      // 3. Otherwise, pick at most 1 relevant agent (not everyone)
       let respondingAgents: string[] = [];
       if (msg.mentionedAgents && msg.mentionedAgents.length > 0) {
         respondingAgents = msg.mentionedAgents;
       } else {
-        respondingAgents = this.pickRelevantAgents(msg.text);
+        // Check recent messages: if the investor was just talking to one agent, continue that conversation
+        const recentMsgs = await this.store.getChannelMessages(msg.channelName, 5);
+        const recentAgentReplies = recentMsgs
+          .filter(m => m.fromAgentId && m.fromAgentId !== 'investor')
+          .map(m => m.fromAgentId!);
+
+        if (recentAgentReplies.length > 0) {
+          // Continue conversation with the most recent agent
+          respondingAgents = [recentAgentReplies[0]];
+        } else {
+          // No recent context — pick the single most relevant agent
+          const relevant = this.pickRelevantAgents(msg.text);
+          respondingAgents = relevant.slice(0, 1); // max 1 agent
+        }
       }
 
       // Build chat history
@@ -400,13 +564,24 @@ export class Agency {
         })
         .join('\n');
 
-      // All responding agents chat (in parallel)
+      // Responding agent(s) chat
       const chatPromises = respondingAgents.map(async (agentId) => {
         const blueprint = this.agentManager.getBlueprint(agentId);
         if (!blueprint) return;
 
         try {
-          const context = `You are ${blueprint.name} (${blueprint.role}) in the #${slackChannel} Slack channel.\n\nRecent messages:\n${history}\n\nInvestor says: "${msg.text}"\n\nRespond naturally as ${blueprint.name}. Keep it short — 1-2 sentences, like a real Slack message. Only respond with your message, nothing else.`;
+          const context = [
+            `You are ${blueprint.name} (${blueprint.role}) in the #${slackChannel} Slack channel.`,
+            ``,
+            `Recent messages:`,
+            history,
+            ``,
+            `Investor says: "${msg.text}"`,
+            ``,
+            `Respond naturally as ${blueprint.name}. Keep it short — 1-2 sentences, like a real Slack message.`,
+            `If this message isn't relevant to your role, say nothing useful — just a brief acknowledgment if directly addressed.`,
+            `Only respond with your message, nothing else. No markdown, no bold, plain text only.`,
+          ].join('\n');
 
           const chatResponse = await this.agentManager.chat(agentId, msg.text, context);
           await this.slack!.sendAgentMessage(slackChannel, blueprint.name, blueprint.role, chatResponse, blueprint.avatar);
@@ -425,6 +600,13 @@ export class Agency {
       });
 
       await Promise.allSettled(chatPromises);
+
+      // Only classify intent for messages in CEO-related or general channels
+      // Don't create tasks from casual conversations with specific agents
+      if (respondingAgents.length <= 1 && respondingAgents[0] !== 'ceo') {
+        // Likely a conversation with a specific agent — don't auto-delegate
+        return;
+      }
 
       // Classify intent — if actionable, delegate through proper chain
       const intent = await this.classifyIntent(msg.text);
@@ -540,18 +722,41 @@ export class Agency {
         `- Add repo: curl -s -X POST ${apiUrl}/api/agency/repositories -H 'Content-Type: application/json' -d '{"projectId":"...","repoUrl":"..."}'`,
         `- Clone repo: curl -s -X POST ${apiUrl}/api/agency/repositories/{repoId}/clone`,
         `- Create & assign task: curl -s -X POST ${apiUrl}/api/agency/tasks -H 'Content-Type: application/json' -d '{"projectId":"...","title":"...","description":"...","assignTo":"developer","priority":7}'`,
+        `- Create task with dependency: curl -s -X POST ${apiUrl}/api/agency/tasks -H 'Content-Type: application/json' -d '{"projectId":"...","title":"...","description":"...","assignTo":"frontend-developer","priority":7,"dependsOn":"<taskId>"}'`,
         `- List agents: curl -s ${apiUrl}/api/agents`,
         `- List projects: curl -s ${apiUrl}/api/projects`,
         ``,
+        `## IMPORTANT RULES`,
+        `- Each task is assigned to EXACTLY ONE agent. Never give the same task to two people.`,
+        `- Frontend work → "frontend-developer" (Maya). Backend → "developer" (Eve) or "backend-developer". NEVER mix.`,
+        `- If a feature needs design + frontend: create design task for "designer" FIRST, get its taskId, then create frontend task with "dependsOn" set to that taskId. The frontend task auto-starts when design is done.`,
+        `- QA review is automatic — when any worker finishes, Nina (QA) gets a review task. You don't create QA tasks.`,
+        `- Use "dependsOn" to enforce correct order. Tasks with dependencies wait automatically.`,
+        ``,
         `## Decision Guide`,
         `- Need architecture review? → Create a task for "architect" first`,
-        `- Need UI/design? → Create a task for "designer"`,
+        `- Need UI/design? → Create a task for "designer", then chain dependent frontend tasks`,
         `- Need research? → Create a task for "researcher"`,
-        `- Pure code work? → Create tasks for "developer", "frontend-developer", or "backend-developer"`,
-        `- Simple enough for one person? → Create just one task`,
-        `- Complex? → Create multiple subtasks and assign to different agents`,
-        `- Need MORE people of the same role? → You can assign the same task type to multiple agents, or ask Alice to have Bob (HR) hire more (e.g. "frontend-developer-2", "frontend-developer-3")`,
-        `- Multiple agents CAN work on different tasks in parallel — assign different subtasks to different agents`,
+        `- Pure frontend? → "frontend-developer"`,
+        `- Pure backend? → "developer" or "backend-developer"`,
+        `- Full-stack feature? → Separate backend + frontend tasks, with frontend depending on backend`,
+        `- Simple enough for one person? → Create just one task for the right specialist`,
+        `- Complex? → Create multiple subtasks with correct dependencies and assign to different specialists`,
+        ``,
+        `## TASK DESCRIPTION TEMPLATE — every task MUST follow this format:`,
+        `Each task description you create must be specific and actionable. Include:`,
+        `1. WHAT to build/change (specific components, files, endpoints)`,
+        `2. HOW it should work (exact behavior, inputs/outputs, edge cases)`,
+        `3. WHERE in the codebase (which directory, which files to modify/create)`,
+        `4. ACCEPTANCE CRITERIA (how to know it's done — what should work when tested)`,
+        ``,
+        `BAD: "Build the frontend for the recipe app"`,
+        `GOOD: "Create the recipe list page at /recipes using React + Tailwind. Show recipes as cards in a responsive grid (3 cols desktop, 1 col mobile). Each card shows: title, image, cooking time, difficulty badge. Data comes from GET /api/recipes. Include loading skeleton and empty state. Acceptance: page renders with mock data, responsive layout works, no console errors."`,
+        ``,
+        `## Git workflow`,
+        `- Agents push to feature branches automatically (never directly to main)`,
+        `- After QA passes, use merge API to merge feature branch to main`,
+        `- Merge endpoint: curl -s -X POST ${apiUrl}/api/agency/repositories/{repoId}/merge -H 'Content-Type: application/json' -d '{"featureBranch":"feature/..."}'`,
         ``,
         `Take action now. Use curl to create the project and tasks via the API.`,
       ].join('\n'),
@@ -560,6 +765,7 @@ export class Agency {
       assignedTo: 'pm',
       createdBy: 'ceo',
       parentTaskId: null,
+      dependsOn: null,
       priority: 8,
       createdAt: new Date(),
       updatedAt: new Date(),
@@ -593,15 +799,18 @@ export class Agency {
         ``,
         `## API`,
         `- Create & assign task: curl -s -X POST ${apiUrl}/api/agency/tasks -H 'Content-Type: application/json' -d '{"title":"...","description":"...","assignTo":"developer","priority":7}'`,
+        `- With dependency: add "dependsOn":"<taskId>" to chain tasks`,
         `- List agents: curl -s ${apiUrl}/api/agents`,
         ``,
-        `Assign to the most appropriate agent. If unclear, assign to "developer".`,
+        `Assign to the right specialist. Frontend → "frontend-developer", backend → "developer" or "backend-developer", design → "designer".`,
+        `Each task goes to exactly one agent. QA review happens automatically.`,
       ].join('\n'),
       status: 'assigned' as const,
       projectId: null,
       assignedTo: 'pm',
       createdBy: 'ceo',
       parentTaskId: null,
+      dependsOn: null,
       priority: 7,
       createdAt: new Date(),
       updatedAt: new Date(),

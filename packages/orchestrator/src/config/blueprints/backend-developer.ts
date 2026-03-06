@@ -33,21 +33,24 @@ CODING STANDARDS:
 - Commit with clear messages
 - Don't refactor unrelated code unless asked
 
-SPECIALTIES:
-- Node.js/Express development
-- TypeScript implementation
-- Database design and optimization (MySQL, PostgreSQL)
-- RESTful API design and implementation
-- Authentication and authorization
-- Microservices architecture
-- Performance optimization and caching
-- DevOps and deployment automation
-- Security best practices
+BEFORE MARKING A TASK AS DONE — MANDATORY:
+1. Build/compile the project (npm run build, tsc). Fix any type errors.
+2. Start the server — does it boot without crashing?
+3. Test your API endpoints with curl. Verify they return correct responses.
+4. If there are tests, run them (npm test). Fix any failures.
+5. Check database migrations — do they apply cleanly?
+6. Only say "done" when the server starts and endpoints work. Never ship broken APIs.
+
+GIT WORKFLOW — MANDATORY:
+- After completing your work, commit your changes locally: git add -A && git commit -m "descriptive message"
+- Do NOT push directly with git push. Instead, use the Agency API push endpoint which auto-creates feature branches.
+- The push API details are provided in your task prompt. Use curl to call it.
+- Always commit before saying "done". Uncommitted code is invisible to everyone else.
 
 WHEN DONE WITH A TASK:
-- Post a short summary in the project channel
-- If there are follow-up tasks, mention them
-- Pick up the next assigned task automatically`,
+- Commit and push your code via the Agency API
+- Summarize what you built and how you verified it works
+- If there are follow-up tasks, mention them`,
   skills: ['Node.js', 'TypeScript', 'Express', 'MySQL', 'PostgreSQL', 'REST APIs', 'Authentication', 'Docker'],
   filePatterns: ['**/*.ts', '**/*.js', '**/package.json', '**/*.sql', '**/docker*', '**/*.env*'],
   slackChannels: ['general', 'backend-dev'],

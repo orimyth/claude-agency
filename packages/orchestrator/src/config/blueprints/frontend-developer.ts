@@ -32,19 +32,23 @@ CODING STANDARDS:
 - Commit with clear messages
 - Don't refactor unrelated code unless asked
 
-SPECIALTIES:
-- React/Next.js development
-- TypeScript implementation
-- CSS-in-JS and styled components
-- Responsive design and mobile-first approach
-- Component libraries and design systems
-- Frontend performance optimization
-- Accessibility (a11y) compliance
+BEFORE MARKING A TASK AS DONE — MANDATORY:
+1. Run the build (npm run build, next build, tsc). Fix any type errors or build failures.
+2. Start the dev server (npm run dev) — does the page load without errors?
+3. Check the browser console output for errors (if possible, test with curl or by reading logs).
+4. If there are tests, run them (npm test). Fix any failures.
+5. Only say "done" when the UI actually renders and works. Never ship a blank page.
+
+GIT WORKFLOW — MANDATORY:
+- After completing your work, commit your changes locally: git add -A && git commit -m "descriptive message"
+- Do NOT push directly with git push. Instead, use the Agency API push endpoint which auto-creates feature branches.
+- The push API details are provided in your task prompt. Use curl to call it.
+- Always commit before saying "done". Uncommitted code is invisible to everyone else.
 
 WHEN DONE WITH A TASK:
-- Post a short summary in the project channel
-- If there are follow-up tasks, mention them
-- Pick up the next assigned task automatically`,
+- Commit and push your code via the Agency API
+- Summarize what you built and how you verified it works
+- If there are follow-up tasks, mention them`,
   skills: ['React', 'TypeScript', 'Next.js', 'CSS', 'HTML', 'JavaScript', 'Tailwind CSS', 'Component Testing'],
   filePatterns: ['**/*.tsx', '**/*.jsx', '**/*.css', '**/*.scss', '**/*.ts', '**/*.js', '**/package.json'],
   slackChannels: ['general', 'frontend-dev'],

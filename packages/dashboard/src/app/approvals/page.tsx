@@ -1,18 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { fetchApprovals, resolveApproval } from "@/lib/api";
-
-interface Approval {
-  id: string;
-  title: string;
-  description: string;
-  requestedBy: string;
-  requested_by?: string;
-  status: "pending" | "approved" | "rejected";
-  createdAt?: string;
-  created_at?: string;
-}
+import { fetchApprovals, resolveApproval, type Approval } from "@/lib/api";
 
 export default function ApprovalsPage() {
   const [approvals, setApprovals] = useState<Approval[]>([]);

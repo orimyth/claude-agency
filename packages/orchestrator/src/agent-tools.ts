@@ -22,11 +22,16 @@ export class AgentToolHandler {
   private store: StateStore;
   private agentManager: AgentManager;
   private workspaceRoot: string;
+  private onProjectCreated: ((projectId: string, projectName: string) => Promise<void>) | null = null;
 
   constructor(store: StateStore, agentManager: AgentManager, workspaceRoot: string) {
     this.store = store;
     this.agentManager = agentManager;
     this.workspaceRoot = workspaceRoot;
+  }
+
+  setOnProjectCreated(cb: (projectId: string, projectName: string) => Promise<void>): void {
+    this.onProjectCreated = cb;
   }
 
   /**
@@ -57,6 +62,8 @@ export class AgentToolHandler {
           return await this.updateTaskStatus(input);
         case 'agency_git_push':
           return await this.gitPush(input);
+        case 'agency_git_merge':
+          return await this.gitMerge(input);
         case 'agency_list_agents':
           return await this.listAgents();
         default:
@@ -81,6 +88,15 @@ export class AgentToolHandler {
       slackChannel,
       status: 'active',
     });
+
+    // Create actual Slack channel if callback is set
+    if (this.onProjectCreated) {
+      try {
+        await this.onProjectCreated(id, name);
+      } catch (err: any) {
+        console.warn(`Failed to create Slack channel for project ${id}: ${err.message}`);
+      }
+    }
 
     return {
       success: true,
@@ -204,7 +220,7 @@ export class AgentToolHandler {
   }
 
   private async createTask(agentId: string, input: Record<string, any>): Promise<AgentToolResult> {
-    const { projectId, title, description, assignTo, priority } = input;
+    const { projectId, title, description, assignTo, priority, dependsOn } = input;
     if (!title) return { success: false, error: 'title is required' };
 
     const id = crypto.randomUUID();
@@ -217,6 +233,7 @@ export class AgentToolHandler {
       assignedTo: assignTo ?? null,
       createdBy: agentId,
       parentTaskId: input.parentTaskId ?? null,
+      dependsOn: dependsOn ?? null,
       priority: priority ?? 5,
       createdAt: new Date(),
       updatedAt: new Date(),
@@ -224,17 +241,27 @@ export class AgentToolHandler {
 
     await this.store.createTask(task);
 
-    // If assigned, kick off the agent
+    // If assigned and no unfinished dependency, kick off the agent
     if (assignTo && this.agentManager.getBlueprint(assignTo)) {
-      // Don't await — let it run in the background
-      this.agentManager.assignTask(assignTo, task).catch(err => {
-        console.error(`[AgentTools] Failed to assign task to ${assignTo}: ${err.message}`);
-      });
+      if (dependsOn) {
+        // Check if dependency is already done
+        const depTask = await this.store.getTask(dependsOn);
+        if (depTask && (depTask.status === 'done' || depTask.status === 'review')) {
+          this.agentManager.assignTask(assignTo, task).catch(err => {
+            console.error(`[AgentTools] Failed to assign task to ${assignTo}: ${err.message}`);
+          });
+        }
+        // Otherwise task stays 'assigned' and will be picked up when dependency completes
+      } else {
+        this.agentManager.assignTask(assignTo, task).catch(err => {
+          console.error(`[AgentTools] Failed to assign task to ${assignTo}: ${err.message}`);
+        });
+      }
     }
 
     return {
       success: true,
-      data: { taskId: id, title, status: task.status, assignedTo: assignTo ?? null },
+      data: { taskId: id, title, status: task.status, assignedTo: assignTo ?? null, dependsOn: dependsOn ?? null },
     };
   }
 
@@ -295,7 +322,7 @@ export class AgentToolHandler {
   }
 
   private async gitPush(input: Record<string, any>): Promise<AgentToolResult> {
-    const { repositoryId, branch, commitMessage } = input;
+    const { repositoryId, branch, commitMessage, taskId } = input;
     if (!repositoryId) return { success: false, error: 'repositoryId is required' };
 
     const repo = await this.store.getRepository(repositoryId);
@@ -307,28 +334,91 @@ export class AgentToolHandler {
 
     try {
       const cwd = repo.localPath;
+
+      // Determine target branch: use feature branch unless explicitly specified
+      let targetBranch = branch ?? repo.currentBranch;
+      if (!targetBranch || targetBranch === repo.defaultBranch) {
+        // Create a feature branch — don't push directly to main
+        const branchSuffix = taskId ?? Date.now().toString(36);
+        const safeSuffix = String(branchSuffix).slice(0, 20).replace(/[^a-zA-Z0-9-]/g, '-');
+        targetBranch = `feature/${safeSuffix}`;
+      }
+
+      // Create & checkout the feature branch if it doesn't exist
+      const currentBranch = execSync(`git -C "${cwd}" branch --show-current`, { timeout: 10000 }).toString().trim();
+      if (currentBranch !== targetBranch) {
+        try {
+          execSync(`git -C "${cwd}" checkout -b ${targetBranch}`, { timeout: 10000 });
+        } catch {
+          // Branch may already exist locally
+          execSync(`git -C "${cwd}" checkout ${targetBranch}`, { timeout: 10000 });
+        }
+      }
+
       // Stage all changes
       execSync(`git -C "${cwd}" add -A`, { timeout: 30000 });
 
       // Check if there are changes to commit
       const status = execSync(`git -C "${cwd}" status --porcelain`, { timeout: 10000 }).toString().trim();
       if (!status) {
-        return { success: true, data: { message: 'No changes to push' } };
+        return { success: true, data: { branch: targetBranch, message: 'No changes to push' } };
       }
 
       // Commit
       const msg = commitMessage ?? 'Agent update';
       execSync(`git -C "${cwd}" commit -m "${msg.replace(/"/g, '\\"')}"`, { timeout: 30000 });
 
-      // Push
-      const targetBranch = branch ?? repo.currentBranch ?? repo.defaultBranch;
-      execSync(`git -C "${cwd}" push origin ${targetBranch}`, { timeout: 60000 });
+      // Push feature branch
+      execSync(`git -C "${cwd}" push -u origin ${targetBranch}`, { timeout: 60000 });
 
       await this.store.updateRepositorySync(repo.id, targetBranch);
 
-      return { success: true, data: { branch: targetBranch, message: 'Pushed successfully' } };
+      return {
+        success: true,
+        data: {
+          branch: targetBranch,
+          defaultBranch: repo.defaultBranch,
+          message: `Pushed to feature branch '${targetBranch}'. Merge to '${repo.defaultBranch}' after QA passes.`,
+        },
+      };
     } catch (err: any) {
       return { success: false, error: `Git push failed: ${err.message}` };
+    }
+  }
+
+  /**
+   * Merge a feature branch into the default branch.
+   * Only called after QA passes.
+   */
+  private async gitMerge(input: Record<string, any>): Promise<AgentToolResult> {
+    const { repositoryId, featureBranch } = input;
+    if (!repositoryId || !featureBranch) return { success: false, error: 'repositoryId and featureBranch are required' };
+
+    const repo = await this.store.getRepository(repositoryId);
+    if (!repo) return { success: false, error: `Repository '${repositoryId}' not found` };
+
+    if (!existsSync(repo.localPath)) {
+      return { success: false, error: `Repository not cloned at ${repo.localPath}` };
+    }
+
+    try {
+      const cwd = repo.localPath;
+      const mainBranch = repo.defaultBranch;
+
+      // Switch to main, pull latest, merge feature branch
+      execSync(`git -C "${cwd}" checkout ${mainBranch}`, { timeout: 10000 });
+      execSync(`git -C "${cwd}" pull origin ${mainBranch}`, { timeout: 30000 });
+      execSync(`git -C "${cwd}" merge ${featureBranch} --no-ff -m "Merge ${featureBranch} into ${mainBranch}"`, { timeout: 30000 });
+      execSync(`git -C "${cwd}" push origin ${mainBranch}`, { timeout: 60000 });
+
+      await this.store.updateRepositorySync(repo.id, mainBranch);
+
+      return {
+        success: true,
+        data: { branch: mainBranch, merged: featureBranch, message: `Merged '${featureBranch}' into '${mainBranch}' and pushed.` },
+      };
+    } catch (err: any) {
+      return { success: false, error: `Git merge failed: ${err.message}` };
     }
   }
 

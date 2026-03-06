@@ -49,6 +49,7 @@ export class TaskBoard {
         assignedTo: sub.assignedTo ?? null,
         createdBy: parent.assignedTo ?? 'system',
         parentTaskId,
+        dependsOn: null,
         priority: sub.priority ?? parent.priority,
         createdAt: new Date(),
         updatedAt: new Date(),

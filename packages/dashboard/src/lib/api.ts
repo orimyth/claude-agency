@@ -1,16 +1,107 @@
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3002";
 
-export async function fetchAgents() {
+// --- Types ---
+
+export type TaskStatus = "backlog" | "assigned" | "in_progress" | "review" | "done" | "blocked";
+export type ProjectStatus = "active" | "paused" | "completed" | "archived";
+
+export interface Task {
+  id: string;
+  title: string;
+  description: string;
+  status: TaskStatus;
+  projectId: string | null;
+  assignedTo: string | null;
+  createdBy: string;
+  parentTaskId: string | null;
+  dependsOn: string | null;
+  priority: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ProjectRepository {
+  id: string;
+  projectId: string;
+  repoUrl: string;
+  repoName: string;
+  localPath: string;
+  defaultBranch: string;
+  currentBranch: string | null;
+  lastSyncedAt: string | null;
+  createdAt: string;
+}
+
+export interface Project {
+  id: string;
+  name: string;
+  description: string;
+  slackChannel: string | null;
+  status: ProjectStatus;
+  createdAt: string;
+  updatedAt: string;
+  repositories?: ProjectRepository[];
+  tasks?: Task[];
+  taskCount?: number;
+  taskCounts?: {
+    backlog: number;
+    assigned: number;
+    in_progress: number;
+    review: number;
+    done: number;
+    blocked: number;
+  };
+}
+
+export interface Agent {
+  id: string;
+  blueprintId: string;
+  name: string;
+  role: string;
+  status: string;
+  avatar?: string | null;
+  gender?: string | null;
+  currentTaskId?: string | null;
+  channels?: string[];
+  reportsTo?: string | null;
+  lastActiveAt?: string;
+}
+
+export interface Approval {
+  id: string;
+  title: string;
+  description: string;
+  requestedBy: string;
+  requested_by?: string;
+  status: "pending" | "approved" | "rejected" | "modified";
+  projectId: string | null;
+  createdAt?: string;
+  created_at?: string;
+}
+
+// --- API functions ---
+
+export async function fetchAgents(): Promise<Agent[]> {
   const res = await fetch(`${API_BASE}/api/agents`);
   return res.json();
 }
 
-export async function fetchProjects() {
+export async function fetchProjects(): Promise<Project[]> {
   const res = await fetch(`${API_BASE}/api/projects`);
   return res.json();
 }
 
-export async function fetchTasks(projectId?: string) {
+export async function fetchProject(id: string): Promise<Project> {
+  const res = await fetch(`${API_BASE}/api/projects/${id}`);
+  return res.json();
+}
+
+export async function fetchProjectRepositories(projectId: string): Promise<ProjectRepository[]> {
+  const res = await fetch(`${API_BASE}/api/projects/${projectId}/repositories`);
+  return res.json();
+}
+
+export async function fetchTasks(projectId?: string): Promise<Task[]> {
   const url = projectId
     ? `${API_BASE}/api/tasks?projectId=${projectId}`
     : `${API_BASE}/api/tasks`;
@@ -18,7 +109,7 @@ export async function fetchTasks(projectId?: string) {
   return res.json();
 }
 
-export async function fetchApprovals() {
+export async function fetchApprovals(): Promise<Approval[]> {
   const res = await fetch(`${API_BASE}/api/approvals`);
   return res.json();
 }
@@ -47,5 +138,18 @@ export async function resolveApproval(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ status, feedback }),
   });
+  return res.json();
+}
+
+export async function fetchSettings(): Promise<Record<string, string>> {
+  const res = await fetch(`${API_BASE}/api/settings`);
+  return res.json();
+}
+
+export async function fetchMemories(scope?: string) {
+  const url = scope
+    ? `${API_BASE}/api/memories?scope=${scope}`
+    : `${API_BASE}/api/memories`;
+  const res = await fetch(url);
   return res.json();
 }

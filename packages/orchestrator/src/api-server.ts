@@ -259,6 +259,14 @@ export class APIServer {
       return;
     }
 
+    if (req.method === 'POST' && path.match(/^\/api\/agency\/repositories\/[^/]+\/merge$/) && this.toolHandler) {
+      const repositoryId = path.split('/')[4];
+      const body = JSON.parse(await this.readBody(req));
+      const result = await this.toolHandler.handleToolCall('system', 'agency_git_merge', { repositoryId, ...body });
+      this.json(res, result);
+      return;
+    }
+
     if (req.method === 'POST' && path === '/api/agency/hire' && this.toolHandler) {
       // Quick hire by forking an existing blueprint
       const body = JSON.parse(await this.readBody(req));

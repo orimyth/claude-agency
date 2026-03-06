@@ -41,6 +41,7 @@ export class TaskRouter {
       assignedTo: 'ceo',
       createdBy: 'investor',
       parentTaskId: null,
+      dependsOn: null,
       priority: 10,
       createdAt: new Date(),
       updatedAt: new Date(),

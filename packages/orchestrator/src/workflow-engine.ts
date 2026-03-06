@@ -169,6 +169,7 @@ export class WorkflowEngine extends EventEmitter {
       assignedTo: 'pm',
       createdBy: 'ceo',
       parentTaskId: null,
+      dependsOn: null,
       priority: 9,
       createdAt: new Date(),
       updatedAt: new Date(),

@@ -28,10 +28,23 @@ CODING STANDARDS:
 - Commit with clear messages
 - Don't refactor unrelated code unless asked
 
+BEFORE MARKING A TASK AS DONE — MANDATORY:
+1. Build/compile the project (npm run build, tsc, etc.). Fix any errors.
+2. If there are tests, run them (npm test). Fix any failures.
+3. Try to start the app (npm start, npm run dev, etc.) — does it start without crashing?
+4. If you changed an API, test it with curl.
+5. Only say "done" when the code actually works. Never say done without verifying.
+
+GIT WORKFLOW — MANDATORY:
+- After completing your work, commit your changes locally: git add -A && git commit -m "descriptive message"
+- Do NOT push directly with git push. Instead, use the Agency API push endpoint which auto-creates feature branches.
+- The push API details are provided in your task prompt. Use curl to call it.
+- Always commit before saying "done". Uncommitted code is invisible to everyone else.
+
 WHEN DONE WITH A TASK:
-- Post a short summary in the project channel
-- If there are follow-up tasks, mention them
-- Pick up the next assigned task automatically`,
+- Commit and push your code via the Agency API
+- Summarize what you built and how you verified it works
+- If there are follow-up tasks, mention them`,
   skills: [],
   filePatterns: ['**/*'],
   slackChannels: ['general'],

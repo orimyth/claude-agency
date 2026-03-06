@@ -6,6 +6,8 @@ interface AgentCardProps {
   status: string;
   avatar?: string | null;
   currentTask?: string;
+  projectId?: string;
+  taskCount?: number;
   onClick?: () => void;
 }
 
@@ -31,6 +33,8 @@ export function AgentCard({
   status,
   avatar,
   currentTask,
+  projectId,
+  taskCount,
   onClick,
 }: AgentCardProps) {
   return (
@@ -59,15 +63,23 @@ export function AgentCard({
           </div>
         </div>
         <div className="flex items-center gap-2">
-          <div className={`w-2.5 h-2.5 rounded-full ${STATUS_COLORS[status]}`} />
+          {taskCount !== undefined && taskCount > 0 && (
+            <span className="px-1.5 py-0.5 bg-blue-50 text-blue-600 rounded text-xs font-medium">
+              {taskCount} task{taskCount !== 1 ? "s" : ""}
+            </span>
+          )}
+          <div className={`w-2.5 h-2.5 rounded-full ${STATUS_COLORS[status] ?? "bg-gray-400"}`} />
           <span className="text-sm text-gray-500">
             {STATUS_LABELS[status] ?? status}
           </span>
         </div>
       </div>
       {currentTask && (
-        <div className="bg-gray-50 rounded-lg px-3 py-2 text-sm text-gray-600 truncate">
-          {currentTask}
+        <div className="bg-gray-50 rounded-lg px-3 py-2">
+          <p className="text-sm text-gray-600 truncate">{currentTask}</p>
+          {projectId && (
+            <p className="text-xs text-gray-400 mt-0.5">in {projectId}</p>
+          )}
         </div>
       )}
     </div>

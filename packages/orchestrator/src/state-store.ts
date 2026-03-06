@@ -99,6 +99,7 @@ export class StateStore {
           assigned_to VARCHAR(64) NULL,
           created_by VARCHAR(64) NOT NULL,
           parent_task_id VARCHAR(64) NULL,
+          depends_on VARCHAR(64) NULL,
           priority INT NOT NULL DEFAULT 0,
           created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
           updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
@@ -110,6 +111,8 @@ export class StateStore {
       try { await conn.query(`ALTER TABLE tasks DROP FOREIGN KEY tasks_ibfk_2`); } catch { /* may not exist */ }
       try { await conn.query(`ALTER TABLE tasks DROP FOREIGN KEY tasks_ibfk_3`); } catch { /* may not exist */ }
       try { await conn.query(`ALTER TABLE tasks MODIFY project_id VARCHAR(64) NULL`); } catch { /* already nullable */ }
+      // Migration: add depends_on column
+      try { await conn.query(`ALTER TABLE tasks ADD COLUMN depends_on VARCHAR(64) NULL`); } catch { /* already exists */ }
 
       await conn.query(`
         CREATE TABLE IF NOT EXISTS messages (
@@ -257,9 +260,9 @@ export class StateStore {
   // Task operations
   async createTask(task: Task): Promise<void> {
     await this.pool.query(
-      `INSERT INTO tasks (id, title, description, status, project_id, assigned_to, created_by, parent_task_id, priority)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [task.id, task.title, task.description, task.status, task.projectId, task.assignedTo, task.createdBy, task.parentTaskId, task.priority]
+      `INSERT INTO tasks (id, title, description, status, project_id, assigned_to, created_by, parent_task_id, depends_on, priority)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [task.id, task.title, task.description, task.status, task.projectId, task.assignedTo, task.createdBy, task.parentTaskId, task.dependsOn, task.priority]
     );
   }
 
@@ -293,13 +296,30 @@ export class StateStore {
   }
 
   async getNextAvailableTask(agentId: string): Promise<Task | null> {
+    // Only pick up tasks whose dependencies are done (or have no dependency)
     const [rows] = await this.pool.query<RowDataPacket[]>(
-      `SELECT * FROM tasks WHERE assigned_to = ? AND status = 'assigned'
-       ORDER BY priority DESC, created_at ASC LIMIT 1`,
+      `SELECT t.* FROM tasks t
+       LEFT JOIN tasks dep ON t.depends_on = dep.id
+       WHERE t.assigned_to = ? AND t.status = 'assigned'
+         AND (t.depends_on IS NULL OR dep.status IN ('done', 'review'))
+       ORDER BY t.priority DESC, t.created_at ASC LIMIT 1`,
       [agentId]
     );
     if (rows.length === 0) return null;
     return this.mapTask(rows[0]);
+  }
+
+  /**
+   * Unblock tasks that were waiting on a now-completed dependency.
+   * Returns tasks that are ready to be assigned/started.
+   */
+  async getUnblockedTasks(completedTaskId: string): Promise<Task[]> {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      `SELECT * FROM tasks WHERE depends_on = ? AND status = 'assigned'
+       ORDER BY priority DESC`,
+      [completedTaskId]
+    );
+    return rows.map(r => this.mapTask(r));
   }
 
   async updateTaskStatus(id: string, status: Task['status'], assignedTo?: string): Promise<void> {
@@ -841,6 +861,7 @@ export class StateStore {
       assignedTo: row.assigned_to,
       createdBy: row.created_by,
       parentTaskId: row.parent_task_id,
+      dependsOn: row.depends_on ?? null,
       priority: row.priority,
       createdAt: new Date(row.created_at),
       updatedAt: new Date(row.updated_at),

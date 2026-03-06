@@ -21,6 +21,9 @@ if (!sdkEnv.PATH?.includes(nodeDir)) {
 /** Roles that get agency management tools (can create projects, tasks, etc.) */
 const MANAGEMENT_ROLES = new Set(['ceo', 'pm', 'architect', 'hr']);
 
+/** Worker roles that only get git push/repo listing APIs */
+const WORKER_ROLES = new Set(['developer', 'frontend-developer', 'backend-developer', 'designer']);
+
 export interface AgentEvents {
   message: (agentId: string, channel: string, content: string) => void;
   taskComplete: (agentId: string, taskId: string) => void;
@@ -128,7 +131,8 @@ export class AgentManager extends EventEmitter {
     await this.store.updateAgentStatus(agentId, 'active');
     await this.store.upsertAgent({ ...agent, status: 'active', currentTaskId: task.id });
 
-    this.emit('message', agentId, 'general', `picking up "${task.title.replace('[Investor Idea] ', '')}"`);
+    const announceChannel = task.projectId ? `project-${task.projectId}` : 'general';
+    this.emit('message', agentId, announceChannel, `picking up "${task.title.replace('[Investor Idea] ', '')}"`);
 
     this.runAgent(blueprint, task).catch(err => {
       this.emit('error', agentId, err);
@@ -181,15 +185,21 @@ export class AgentManager extends EventEmitter {
       });
 
       let resultText = '';
-      let turnCount = 0;
       let lastResult: SDKResultMessage | null = null;
+      const startTime = Date.now();
+      let lastProgressAt = startTime;
 
       for await (const message of stream) {
+        // Only emit progress if agent has been working for 15+ min since last update
         if (message.type === 'assistant') {
-          turnCount++;
-          if (turnCount % 5 === 0) {
-            this.emit('message', blueprint.id, 'general',
-              `still working on "${task.title.replace('[Investor Idea] ', '')}"...`);
+          const now = Date.now();
+          const minsSinceLastProgress = (now - lastProgressAt) / 60_000;
+          if (minsSinceLastProgress >= 15) {
+            lastProgressAt = now;
+            const totalMins = Math.round((now - startTime) / 60_000);
+            const channel = task.projectId ? `project-${task.projectId}` : 'general';
+            this.emit('message', blueprint.id, channel,
+              `still on it (${totalMins} min in)`);
           }
         }
 
@@ -202,11 +212,41 @@ export class AgentManager extends EventEmitter {
         }
       }
 
-      // Announce task completion
-      const summary = resultText ? resultText.slice(0, 200) : 'done';
+      // Auto-push safety net: if worker has uncommitted changes, push them
+      if (WORKER_ROLES.has(blueprint.id) && this.toolHandler && task.projectId) {
+        try {
+          const repos = await this.store.getProjectRepositories(task.projectId);
+          if (repos.length > 0 && repos[0].localPath) {
+            const { existsSync } = await import('fs');
+            const { execSync } = await import('child_process');
+            if (existsSync(repos[0].localPath)) {
+              const status = execSync(`git -C "${repos[0].localPath}" status --porcelain`, { timeout: 10000 }).toString().trim();
+              if (status) {
+                const pushResult = await this.toolHandler.handleToolCall(blueprint.id, 'agency_git_push', {
+                  repositoryId: repos[0].id,
+                  commitMessage: `Auto-push: ${task.title}`,
+                  taskId: task.id,
+                });
+                if (pushResult.success) {
+                  const channel = task.projectId ? `project-${task.projectId}` : 'general';
+                  this.emit('message', blueprint.id, channel, `auto-pushed uncommitted changes to ${pushResult.data?.branch ?? 'feature branch'}`);
+                }
+              }
+            }
+          }
+        } catch { /* non-critical — best effort push */ }
+      }
+
+      // Announce task completion — strip markdown formatting
+      const rawSummary = resultText ? resultText.slice(0, 200) : 'done';
+      const summary = rawSummary
+        .replace(/\*\*(.*?)\*\*/g, '$1')  // strip bold
+        .replace(/__(.*?)__/g, '$1')       // strip underline
+        .replace(/^#+\s*/gm, '')           // strip headers
+        .replace(/`([^`]+)`/g, '$1');      // strip inline code
       const channel = task.projectId ? `project-${task.projectId}` : 'general';
       this.emit('message', blueprint.id, channel, summary);
-      this.emit('taskComplete', blueprint.id, task.id);
+      this.emit('taskComplete', blueprint.id, task.id, resultText);
 
       // Record usage
       if (lastResult) {
@@ -284,7 +324,7 @@ export class AgentManager extends EventEmitter {
           if (repos.length > 0) {
             parts.push(`**Repositories:**`);
             for (const repo of repos) {
-              parts.push(`- ${repo.repoName} (${repo.repoUrl}) → ${repo.localPath}`);
+              parts.push(`- ${repo.repoName} [repoId: ${repo.id}] (${repo.repoUrl}) → ${repo.localPath}`);
             }
           }
           parts.push('');
@@ -312,11 +352,14 @@ export class AgentManager extends EventEmitter {
         ``,
         `**Task management:**`,
         `- Create & assign task: curl -X POST ${apiUrl}/api/agency/tasks -H 'Content-Type: application/json' -d '{"projectId":"...","title":"...","description":"...","assignTo":"developer","priority":7}'`,
+        `- Create task with dependency: add "dependsOn":"<taskId>" to make it wait for another task to finish first`,
         `- List tasks: curl ${apiUrl}/api/tasks?projectId={id}`,
         `- List agents: curl ${apiUrl}/api/agents`,
         ``,
         `**Git operations:**`,
-        `- Push changes: curl -X POST ${apiUrl}/api/agency/repositories/{repoId}/push -H 'Content-Type: application/json' -d '{"commitMessage":"..."}'`,
+        `- Push changes (auto feature branch): curl -X POST ${apiUrl}/api/agency/repositories/{repoId}/push -H 'Content-Type: application/json' -d '{"commitMessage":"...","taskId":"..."}'`,
+        `- Merge feature branch to main (after QA passes): curl -X POST ${apiUrl}/api/agency/repositories/{repoId}/merge -H 'Content-Type: application/json' -d '{"featureBranch":"feature/..."}'`,
+        `Note: Push automatically creates a feature branch. Merge to main only after QA approves.`,
         ``,
         `When the investor gives you a project idea:`,
         `1. Create a project via API`,
@@ -326,6 +369,52 @@ export class AgentManager extends EventEmitter {
       );
     }
 
+    // Agency Git API instructions for worker roles (limited subset — push & list repos only)
+    if (WORKER_ROLES.has(blueprint.id)) {
+      const apiUrl = `http://localhost:${this.config.wsPort + 1}`;
+      parts.push(
+        `## Git Push API`,
+        `After committing your changes locally, push them via the Agency API (do NOT use git push directly).`,
+        `The API auto-creates a feature branch so you never push to main.`,
+        ``,
+        `**Push changes:**`,
+        `\`\`\``,
+        `curl -X POST ${apiUrl}/api/agency/repositories/{repoId}/push \\`,
+        `  -H 'Content-Type: application/json' \\`,
+        `  -d '{"commitMessage":"describe what you did","taskId":"${task.id}"}'`,
+        `\`\`\``,
+        ``,
+        `**List repos (to find repoId):**`,
+        `\`\`\``,
+        `curl ${apiUrl}/api/projects/{projectId}/repositories`,
+        `\`\`\``,
+        ``,
+        `The repoId is shown in the Project Context above. Use it directly.`,
+        ``,
+      );
+    }
+
+    // Inject active sibling tasks for context isolation
+    if (task.projectId) {
+      try {
+        const projectTasks = await this.store.getTasksByProject(task.projectId);
+        const siblingTasks = projectTasks.filter(t =>
+          t.id !== task.id && t.assignedTo && t.assignedTo !== blueprint.id &&
+          ['assigned', 'in_progress'].includes(t.status)
+        );
+        if (siblingTasks.length > 0) {
+          parts.push(`## Other Active Tasks (DO NOT work on these — other agents handle them)`);
+          for (const st of siblingTasks) {
+            const assigneeBp = this.blueprints.get(st.assignedTo!);
+            const assigneeName = assigneeBp ? `${assigneeBp.name} (${assigneeBp.role})` : st.assignedTo;
+            parts.push(`- "${st.title}" → assigned to ${assigneeName}`);
+          }
+          parts.push(`Only work on YOUR task below. Do not duplicate work from the tasks above.`);
+          parts.push('');
+        }
+      } catch { /* non-critical */ }
+    }
+
     parts.push(
       `## Current Task`,
       `**${task.title}**`,
@@ -333,7 +422,8 @@ export class AgentManager extends EventEmitter {
       ``,
       `## Instructions`,
       `- Complete this task autonomously`,
-      `- When done, summarize what you did in 1-2 short sentences`,
+      `- BEFORE saying done: build the project, run tests, verify it actually works`,
+      `- When done, summarize what you did and how you verified it. Plain text only, no markdown, no bold, no headers — write like a Slack message`,
       `- If you're blocked, say exactly what you need`,
     );
 
@@ -498,6 +588,7 @@ export class AgentManager extends EventEmitter {
       assignedTo: toId,
       createdBy: fromId,
       parentTaskId: null,
+      dependsOn: null,
       priority: 5,
       createdAt: new Date(),
       updatedAt: new Date(),
