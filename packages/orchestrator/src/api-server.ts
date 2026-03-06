@@ -14,12 +14,17 @@ export class APIServer {
   private taskRouter: TaskRouter;
   private taskBoard: TaskBoard;
   private server: ReturnType<typeof createServer> | null = null;
+  private onSettingsChanged: (() => Promise<void>) | null = null;
 
   constructor(store: StateStore, agentManager: AgentManager, taskRouter: TaskRouter, taskBoard: TaskBoard) {
     this.store = store;
     this.agentManager = agentManager;
     this.taskRouter = taskRouter;
     this.taskBoard = taskBoard;
+  }
+
+  setOnSettingsChanged(cb: () => Promise<void>): void {
+    this.onSettingsChanged = cb;
   }
 
   start(port: number): void {
@@ -113,6 +118,23 @@ export class APIServer {
       const { title, description } = JSON.parse(body);
       const result = await this.taskRouter.submitIdea(title, description);
       this.json(res, result);
+      return;
+    }
+
+    if (req.method === 'GET' && path === '/api/settings') {
+      const settings = await this.store.getAllSettings();
+      this.json(res, settings);
+      return;
+    }
+
+    if (req.method === 'POST' && path === '/api/settings') {
+      const body = await this.readBody(req);
+      const entries = JSON.parse(body) as Record<string, string>;
+      for (const [key, value] of Object.entries(entries)) {
+        await this.store.setSetting(key, value);
+      }
+      if (this.onSettingsChanged) await this.onSettingsChanged();
+      this.json(res, { ok: true });
       return;
     }
 

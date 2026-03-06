@@ -34,12 +34,28 @@ export class AgentManager extends EventEmitter {
   private blueprints: Map<string, AgentBlueprint> = new Map();
   private activeSessions: Map<string, AbortController> = new Map();
   private activeCount = 0;
+  private languageOverride: string | null = null;
 
   constructor(store: StateStore, permissions: PermissionEngine, config: AgencyConfig) {
     super();
     this.store = store;
     this.permissions = permissions;
     this.config = config;
+  }
+
+  setLanguage(lang: string | null): void {
+    this.languageOverride = lang;
+  }
+
+  getLanguage(): string | null {
+    return this.languageOverride;
+  }
+
+  private getLanguageInstruction(): string {
+    if (this.languageOverride && this.languageOverride !== 'auto') {
+      return `IMPORTANT: Always respond in ${this.languageOverride}. Every message must be in ${this.languageOverride}, regardless of what language the user writes in.`;
+    }
+    return `IMPORTANT: Always respond in the same language the user is writing in. If they write in German, respond in German. If English, respond in English. Match their language exactly.`;
   }
 
   registerBlueprint(blueprint: AgentBlueprint): void {
@@ -180,6 +196,7 @@ export class AgentManager extends EventEmitter {
   private buildTaskPrompt(blueprint: AgentBlueprint, task: Task): string {
     return [
       `You are ${blueprint.name}, the ${blueprint.role}.`,
+      this.getLanguageInstruction(),
       ``,
       `## Current Task`,
       `**${task.title}**`,
@@ -257,7 +274,7 @@ export class AgentManager extends EventEmitter {
       workDir = resolve(dirname(fileURLToPath(import.meta.url)), '../../..', workDir);
     }
 
-    const langRule = `IMPORTANT: Always respond in the same language the investor is writing in. If they write in German, respond in German. If English, respond in English. Match their language exactly.`;
+    const langRule = this.getLanguageInstruction();
 
     const prompt = context
       ? `${langRule}\n\n${context}`

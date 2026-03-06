@@ -121,6 +121,14 @@ export class StateStore {
           FOREIGN KEY (agent_id) REFERENCES agents(id)
         )
       `);
+
+      await conn.query(`
+        CREATE TABLE IF NOT EXISTS settings (
+          \`key\` VARCHAR(128) PRIMARY KEY,
+          value TEXT NOT NULL,
+          updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        )
+      `);
     } finally {
       conn.release();
     }
@@ -311,6 +319,30 @@ export class StateStore {
       'INSERT INTO kpi_entries (id, agent_id, metric, value) VALUES (?, ?, ?, ?)',
       [id, agentId, metric, value]
     );
+  }
+
+  // Settings
+  async getSetting(key: string): Promise<string | null> {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      'SELECT value FROM settings WHERE `key` = ?', [key]
+    );
+    return rows.length > 0 ? rows[0].value : null;
+  }
+
+  async setSetting(key: string, value: string): Promise<void> {
+    await this.pool.query(
+      'INSERT INTO settings (`key`, value) VALUES (?, ?) ON DUPLICATE KEY UPDATE value = VALUES(value)',
+      [key, value]
+    );
+  }
+
+  async getAllSettings(): Promise<Record<string, string>> {
+    const [rows] = await this.pool.query<RowDataPacket[]>('SELECT `key`, value FROM settings');
+    const result: Record<string, string> = {};
+    for (const row of rows) {
+      result[row.key] = row.value;
+    }
+    return result;
   }
 
   // Cleanup

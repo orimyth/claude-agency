@@ -94,6 +94,9 @@ export class Agency {
       console.log('Slack not configured. Run `pnpm setup:slack` to enable.');
     }
 
+    // Load saved settings
+    await this.loadSettings();
+
     // Wire up agent events
     this.setupAgentEvents();
 
@@ -103,6 +106,7 @@ export class Agency {
     console.log('Scheduler started');
 
     // Start API server
+    this.apiServer.setOnSettingsChanged(() => this.loadSettings());
     this.apiServer.start(agencyConfig.wsPort + 1);
 
     console.log(`WebSocket server running on port ${agencyConfig.wsPort}`);
@@ -439,6 +443,19 @@ export class Agency {
     if (internalChannel === 'ceo-investor') return 'agency-ceo-investor';
     if (internalChannel.startsWith('project-')) return `agency-${internalChannel}`;
     return `agency-${internalChannel}`;
+  }
+
+  private async loadSettings(): Promise<void> {
+    try {
+      const lang = await this.store.getSetting('language');
+      if (lang) this.agentManager.setLanguage(lang);
+
+      const concurrency = await this.store.getSetting('maxConcurrency');
+      if (concurrency) {
+        const val = parseInt(concurrency, 10);
+        if (val > 0) agencyConfig.maxConcurrency = val;
+      }
+    } catch { /* settings table may not exist yet on first run */ }
   }
 
   async submitIdea(title: string, description: string) {
