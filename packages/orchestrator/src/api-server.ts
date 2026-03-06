@@ -71,24 +71,33 @@ export class APIServer {
 
     if (req.method === 'GET' && path === '/api/projects') {
       const projects = await this.store.getAllProjects();
-      this.json(res, projects);
+      const enriched = await Promise.all(projects.map(async p => {
+        const tasks = await this.store.getTasksByProject(p.id);
+        return {
+          ...p,
+          taskCount: tasks.length,
+          taskCounts: {
+            backlog: tasks.filter(t => t.status === 'backlog').length,
+            assigned: tasks.filter(t => t.status === 'assigned').length,
+            in_progress: tasks.filter(t => t.status === 'in_progress').length,
+            review: tasks.filter(t => t.status === 'review').length,
+            done: tasks.filter(t => t.status === 'done').length,
+            blocked: tasks.filter(t => t.status === 'blocked').length,
+          },
+        };
+      }));
+      this.json(res, enriched);
       return;
     }
 
     if (req.method === 'GET' && path === '/api/tasks') {
       const projectId = url.searchParams.get('projectId');
       if (projectId) {
-        const board = await this.taskBoard.getProjectBoard(projectId);
-        this.json(res, board);
+        const tasks = await this.store.getTasksByProject(projectId);
+        this.json(res, tasks);
       } else {
-        // Return all tasks across all projects (limited)
-        const projects = await this.store.getAllProjects();
-        const allTasks = [];
-        for (const p of projects.slice(0, 10)) {
-          const tasks = await this.store.getTasksByProject(p.id);
-          allTasks.push(...tasks);
-        }
-        this.json(res, allTasks);
+        const tasks = await this.store.getAllTasks();
+        this.json(res, tasks);
       }
       return;
     }

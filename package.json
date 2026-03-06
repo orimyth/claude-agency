@@ -5,16 +5,23 @@
   "description": "Autonomous AI agency powered by Claude Code agents",
   "scripts": {
     "build": "pnpm -r run build",
-    "dev": "pnpm --filter orchestrator run dev",
+    "dev": "run-p dev:*",
+    "dev:orchestrator": "pnpm --filter orchestrator run dev",
+    "dev:dashboard": "pnpm --filter dashboard run dev",
     "setup": "pnpm --filter orchestrator run setup",
     "setup:slack": "pnpm --filter slack-bridge run setup",
     "start": "pnpm --filter orchestrator run start",
     "submit": "pnpm --filter orchestrator run submit"
   },
   "pnpm": {
-    "onlyBuiltDependencies": ["esbuild"]
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
   },
   "engines": {
     "node": ">=20.0.0"
+  },
+  "devDependencies": {
+    "npm-run-all2": "^8.0.4"
   }
 }

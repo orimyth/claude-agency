@@ -31,7 +31,7 @@ export interface Task {
   title: string;
   description: string;
   status: TaskStatus;
-  projectId: string;
+  projectId: string | null;
   assignedTo: string | null;
   createdBy: string;
   parentTaskId: string | null;

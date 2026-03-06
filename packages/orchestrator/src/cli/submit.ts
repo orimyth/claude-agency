@@ -44,7 +44,6 @@ async function submit(title: string, description: string) {
   const result = await router.submitIdea(title, description);
 
   console.log(`\n  Idea submitted!`);
-  console.log(`  Project: ${result.projectId}`);
   console.log(`  Task:    ${result.taskId}`);
   console.log(`  Status:  Assigned to CEO (Alice)\n`);
 

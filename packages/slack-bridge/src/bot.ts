@@ -15,6 +15,7 @@ export interface InvestorMessage {
   userId: string;
   text: string;
   threadTs?: string;
+  mentionedAgents?: string[];
 }
 
 export class SlackBridge extends EventEmitter {
@@ -43,6 +44,28 @@ export class SlackBridge extends EventEmitter {
     console.log('[Slack] Connected and channels ready');
   }
 
+  // Agent name → id mapping for mention detection
+  private agentNames: Map<string, string> = new Map();
+
+  setAgentNames(agents: { id: string; name: string }[]): void {
+    this.agentNames.clear();
+    for (const a of agents) {
+      this.agentNames.set(a.name.toLowerCase(), a.id);
+    }
+  }
+
+  private parseMentionedAgents(text: string): string[] {
+    const mentioned: string[] = [];
+    const lower = text.toLowerCase();
+    for (const [name, id] of this.agentNames) {
+      // Match @name or just the name when clearly addressing them
+      if (lower.includes(`@${name}`) || new RegExp(`\\b${name}\\b`).test(lower)) {
+        mentioned.push(id);
+      }
+    }
+    return mentioned;
+  }
+
   private setupListeners(): void {
     // Listen for messages in all channels
     this.app.message(async ({ message, say }) => {
@@ -51,13 +74,15 @@ export class SlackBridge extends EventEmitter {
 
       const msg = message as any;
       const channelName = this.channelManager.getChannelName(msg.channel);
+      const text = msg.text ?? '';
 
       const investorMsg: InvestorMessage = {
         channel: msg.channel,
         channelName: channelName ?? msg.channel,
         userId: msg.user,
-        text: msg.text ?? '',
+        text,
         threadTs: msg.thread_ts,
+        mentionedAgents: this.parseMentionedAgents(text),
       };
 
       // Route based on channel
@@ -65,7 +90,7 @@ export class SlackBridge extends EventEmitter {
         this.emit('investor:message', investorMsg);
       } else if (channelName === 'agency-approvals') {
         this.emit('investor:approval_response', investorMsg);
-      } else {
+      } else if (channelName?.startsWith('agency-')) {
         this.emit('channel:message', investorMsg);
       }
     });

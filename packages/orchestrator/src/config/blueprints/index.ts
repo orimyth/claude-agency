@@ -3,6 +3,8 @@ export { hrBlueprint } from './hr.js';
 export { architectBlueprint } from './architect.js';
 export { pmBlueprint } from './pm.js';
 export { developerBlueprint } from './developer.js';
+export { frontendDeveloperBlueprint } from './frontend-developer.js';
+export { backendDeveloperBlueprint } from './backend-developer.js';
 export { designerBlueprint } from './designer.js';
 export { researcherBlueprint } from './researcher.js';
 

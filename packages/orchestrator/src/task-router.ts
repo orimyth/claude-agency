@@ -19,22 +19,10 @@ export class TaskRouter {
    * Submit a new idea/task from the investor.
    * Creates a project and routes the initial task to the CEO.
    */
-  async submitIdea(title: string, description: string): Promise<{ projectId: string; taskId: string }> {
-    const projectId = crypto.randomUUID();
+  async submitIdea(title: string, description: string): Promise<{ taskId: string }> {
     const taskId = crypto.randomUUID();
 
-    // Create the project
-    await this.store.createProject({
-      id: projectId,
-      name: title,
-      description,
-      workspacePath: '', // CEO will set this up
-      slackChannel: null,
-      createdAt: new Date(),
-      status: 'active',
-    });
-
-    // Create the initial task for the CEO
+    // Create a task for the CEO (no project yet — CEO decides if it needs one)
     const task: Task = {
       id: taskId,
       title: `[Investor Idea] ${title}`,
@@ -49,7 +37,7 @@ export class TaskRouter {
         `3. Create subtasks and assign them to the right agents`,
       ].join('\n'),
       status: 'assigned',
-      projectId,
+      projectId: null,
       assignedTo: 'ceo',
       createdBy: 'investor',
       parentTaskId: null,
@@ -61,6 +49,6 @@ export class TaskRouter {
     await this.store.createTask(task);
     await this.agentManager.assignTask('ceo', task);
 
-    return { projectId, taskId };
+    return { taskId };
   }
 }

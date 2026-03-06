@@ -49,30 +49,40 @@ export class StateStore {
           title VARCHAR(512) NOT NULL,
           description TEXT,
           status ENUM('backlog','assigned','in_progress','review','done','blocked') NOT NULL DEFAULT 'backlog',
-          project_id VARCHAR(64) NOT NULL,
+          project_id VARCHAR(64) NULL,
           assigned_to VARCHAR(64) NULL,
           created_by VARCHAR(64) NOT NULL,
           parent_task_id VARCHAR(64) NULL,
           priority INT NOT NULL DEFAULT 0,
           created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-          updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-          FOREIGN KEY (project_id) REFERENCES projects(id),
-          FOREIGN KEY (assigned_to) REFERENCES agents(id),
-          FOREIGN KEY (parent_task_id) REFERENCES tasks(id)
+          updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
         )
       `);
+
+      // Migration: make project_id nullable and drop FKs if table already existed
+      try { await conn.query(`ALTER TABLE tasks DROP FOREIGN KEY tasks_ibfk_1`); } catch { /* may not exist */ }
+      try { await conn.query(`ALTER TABLE tasks DROP FOREIGN KEY tasks_ibfk_2`); } catch { /* may not exist */ }
+      try { await conn.query(`ALTER TABLE tasks DROP FOREIGN KEY tasks_ibfk_3`); } catch { /* may not exist */ }
+      try { await conn.query(`ALTER TABLE tasks MODIFY project_id VARCHAR(64) NULL`); } catch { /* already nullable */ }
 
       await conn.query(`
         CREATE TABLE IF NOT EXISTS messages (
           id VARCHAR(64) PRIMARY KEY,
-          from_agent_id VARCHAR(64) NOT NULL,
+          from_agent_id VARCHAR(64) NULL,
           to_agent_id VARCHAR(64) NULL,
           channel VARCHAR(128) NOT NULL,
           content TEXT NOT NULL,
-          timestamp DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-          FOREIGN KEY (from_agent_id) REFERENCES agents(id)
+          timestamp DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
       `);
+
+      // Migration: drop FK and make from_agent_id nullable if table already existed
+      try {
+        await conn.query(`ALTER TABLE messages DROP FOREIGN KEY messages_ibfk_1`);
+      } catch { /* FK may not exist */ }
+      try {
+        await conn.query(`ALTER TABLE messages MODIFY from_agent_id VARCHAR(64) NULL`);
+      } catch { /* already nullable */ }
 
       await conn.query(`
         CREATE TABLE IF NOT EXISTS approvals (
@@ -166,6 +176,13 @@ export class StateStore {
     );
     if (rows.length === 0) return null;
     return this.mapTask(rows[0]);
+  }
+
+  async getAllTasks(limit = 100): Promise<Task[]> {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      'SELECT * FROM tasks ORDER BY priority DESC, created_at DESC LIMIT ?', [limit]
+    );
+    return rows.map(r => this.mapTask(r));
   }
 
   async getTasksByProject(projectId: string): Promise<Task[]> {

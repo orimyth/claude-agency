@@ -1,23 +1,39 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
+import { fetchApprovals, resolveApproval } from "@/lib/api";
 
 interface Approval {
   id: string;
   title: string;
   description: string;
   requestedBy: string;
+  requested_by?: string;
   status: "pending" | "approved" | "rejected";
-  createdAt: string;
+  createdAt?: string;
+  created_at?: string;
 }
 
 export default function ApprovalsPage() {
   const [approvals, setApprovals] = useState<Approval[]>([]);
 
-  function handleResolve(id: string, status: "approved" | "rejected") {
-    setApprovals((prev) =>
-      prev.map((a) => (a.id === id ? { ...a, status } : a))
-    );
+  useEffect(() => {
+    fetchApprovals()
+      .then((data) => setApprovals(Array.isArray(data) ? data : []))
+      .catch(() => {});
+  }, []);
+
+  async function handleResolve(id: string, status: "approved" | "rejected") {
+    try {
+      await resolveApproval(id, status);
+      setApprovals((prev) =>
+        prev.map((a) => (a.id === id ? { ...a, status } : a))
+      );
+    } catch {
+      setApprovals((prev) =>
+        prev.map((a) => (a.id === id ? { ...a, status } : a))
+      );
+    }
   }
 
   const pending = approvals.filter((a) => a.status === "pending");
@@ -53,7 +69,7 @@ export default function ApprovalsPage() {
                     </p>
                     <div className="flex items-center justify-between mt-4">
                       <p className="text-xs text-gray-400">
-                        By {approval.requestedBy} — {new Date(approval.createdAt).toLocaleString()}
+                        By {approval.requestedBy || approval.requested_by} — {new Date(approval.createdAt || approval.created_at || "").toLocaleString()}
                       </p>
                       <div className="flex gap-2">
                         <button

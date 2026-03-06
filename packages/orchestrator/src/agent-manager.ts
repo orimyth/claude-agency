@@ -1,8 +1,21 @@
 import { query, type SDKMessage, type SDKResultMessage } from '@anthropic-ai/claude-code';
 import { EventEmitter } from 'events';
+import { dirname, resolve } from 'path';
+import { fileURLToPath } from 'url';
 import type { AgentBlueprint, AgentState, Task, AgencyConfig } from './types.js';
 import type { StateStore } from './state-store.js';
 import type { PermissionEngine } from './permission-engine.js';
+
+// Build an env with node's directory in PATH for the Claude Code SDK.
+// pnpm replaces PATH with only node_modules/.bin dirs, so nvm's node isn't found.
+const nodeDir = dirname(process.execPath);
+const sdkEnv: Record<string, string> = {};
+for (const [k, v] of Object.entries(process.env)) {
+  if (v !== undefined) sdkEnv[k] = v;
+}
+if (!sdkEnv.PATH?.includes(nodeDir)) {
+  sdkEnv.PATH = `${nodeDir}:${sdkEnv.PATH || ''}`;
+}
 
 export interface AgentEvents {
   message: (agentId: string, channel: string, content: string) => void;
@@ -87,8 +100,12 @@ export class AgentManager extends EventEmitter {
     this.activeSessions.set(blueprint.id, abortController);
     this.activeCount++;
 
-    const project = await this.store.getProject(task.projectId);
-    const workDir = project?.workspacePath || this.config.workspace;
+    const project = task.projectId ? await this.store.getProject(task.projectId) : null;
+    let workDir = project?.workspacePath || this.config.workspace;
+    // Resolve relative workspace paths against project root
+    if (!workDir.startsWith('/')) {
+      workDir = resolve(dirname(fileURLToPath(import.meta.url)), '../../..', workDir);
+    }
 
     const prompt = this.buildTaskPrompt(blueprint, task);
 
@@ -102,6 +119,7 @@ export class AgentManager extends EventEmitter {
           abortController,
           permissionMode: 'bypassPermissions',
           maxTurns: 50,
+          env: sdkEnv,
         },
       });
 
@@ -208,6 +226,48 @@ export class AgentManager extends EventEmitter {
   async resumeAgent(agentId: string): Promise<void> {
     await this.store.updateAgentStatus(agentId, 'idle');
     await this.pickUpNextTask(agentId);
+  }
+
+  /**
+   * Send a conversational message to an agent and get a response.
+   * Unlike assignTask, this doesn't create tasks — it's for direct chat.
+   */
+  async chat(agentId: string, message: string, context?: string): Promise<string> {
+    const blueprint = this.blueprints.get(agentId);
+    if (!blueprint) throw new Error(`No blueprint for agent ${agentId}`);
+
+    let workDir = this.config.workspace;
+    if (!workDir.startsWith('/')) {
+      workDir = resolve(dirname(fileURLToPath(import.meta.url)), '../../..', workDir);
+    }
+
+    const langRule = `IMPORTANT: Always respond in the same language the investor is writing in. If they write in German, respond in German. If English, respond in English. Match their language exactly.`;
+
+    const prompt = context
+      ? `${langRule}\n\n${context}`
+      : `${langRule}\n\nThe investor (your boss) just sent you this message on Slack:\n\n"${message}"\n\nRespond naturally. If they're asking you to build or do something, say you'll get the team on it. If it's casual chat, just be friendly and human. Keep it short — 1-3 sentences max, like a real Slack message.`;
+
+    const stream = query({
+      prompt,
+      options: {
+        customSystemPrompt: blueprint.systemPrompt,
+        cwd: workDir,
+        allowedTools: [],
+        maxTurns: 1,
+        permissionMode: 'bypassPermissions',
+        env: sdkEnv,
+      },
+    });
+
+    let result = '';
+    for await (const msg of stream) {
+      if (msg.type === 'result') {
+        const r = msg as SDKResultMessage;
+        if (r.subtype === 'success') result = r.result;
+      }
+    }
+
+    return result || "hey, give me a sec";
   }
 
   getActiveCount(): number {

@@ -5,26 +5,59 @@ import { KPICard } from "@/components/kpi-card";
 import { AgentCard } from "@/components/agent-card";
 import { ActivityFeed } from "@/components/activity-feed";
 import { SubmitIdea } from "@/components/submit-idea";
-import { useState, useEffect } from "react";
+import { fetchAgents, fetchTasks, fetchApprovals, submitIdea } from "@/lib/api";
+import { useState, useEffect, useCallback } from "react";
 
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:3001";
 
-const DEFAULT_AGENTS = [
-  { id: "ceo", name: "Alice", role: "CEO", status: "idle", currentTask: undefined },
-  { id: "hr", name: "Bob", role: "HR Manager", status: "idle", currentTask: undefined },
-  { id: "architect", name: "Charlie", role: "Software Architect", status: "idle", currentTask: undefined },
-  { id: "pm", name: "Diana", role: "Tech Lead / PM", status: "idle", currentTask: undefined },
-  { id: "developer", name: "Eve", role: "Senior Developer", status: "idle", currentTask: undefined },
-  { id: "designer", name: "Frank", role: "UI/UX Designer", status: "idle", currentTask: undefined },
-  { id: "researcher", name: "Grace", role: "Researcher", status: "idle", currentTask: undefined },
-];
+interface Agent {
+  id: string;
+  name: string;
+  role: string;
+  status: string;
+  currentTaskId?: string;
+}
+
+interface Task {
+  id: string;
+  title: string;
+  status: string;
+  assignedTo?: string;
+  projectId: string;
+}
 
 export default function Dashboard() {
   const { connected, events, on } = useWebSocket(WS_URL);
-  const [agents, setAgents] = useState(DEFAULT_AGENTS);
-  const [taskCount, setTaskCount] = useState({ active: 0, completed: 0, blocked: 0 });
+  const [agents, setAgents] = useState<Agent[]>([]);
+  const [tasks, setTasks] = useState<Task[]>([]);
   const [approvalCount, setApprovalCount] = useState(0);
 
+  // Load initial data from API
+  useEffect(() => {
+    fetchAgents()
+      .then((data) => setAgents(data))
+      .catch(() => {});
+    fetchTasks()
+      .then((data) => setTasks(data))
+      .catch(() => {});
+    fetchApprovals()
+      .then((data) => setApprovalCount(Array.isArray(data) ? data.length : 0))
+      .catch(() => {});
+  }, []);
+
+  // Refresh data periodically
+  useEffect(() => {
+    const interval = setInterval(() => {
+      fetchAgents().then(setAgents).catch(() => {});
+      fetchTasks().then(setTasks).catch(() => {});
+      fetchApprovals()
+        .then((data) => setApprovalCount(Array.isArray(data) ? data.length : 0))
+        .catch(() => {});
+    }, 10000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Real-time updates via WebSocket
   useEffect(() => {
     const unsub1 = on("agent:status", (data) => {
       setAgents((prev) =>
@@ -35,11 +68,14 @@ export default function Dashboard() {
     });
 
     const unsub2 = on("task:update", (data) => {
-      setTaskCount((prev) => {
-        if (data.status === "in_progress") return { ...prev, active: prev.active + 1 };
-        if (data.status === "done") return { ...prev, active: Math.max(0, prev.active - 1), completed: prev.completed + 1 };
-        if (data.status === "blocked") return { ...prev, blocked: prev.blocked + 1 };
-        return prev;
+      setTasks((prev) => {
+        const existing = prev.find((t) => t.id === data.taskId);
+        if (existing) {
+          return prev.map((t) =>
+            t.id === data.taskId ? { ...t, status: data.status } : t
+          );
+        }
+        return [...prev, { id: data.taskId, title: "", status: data.status, projectId: "" }];
       });
     });
 
@@ -59,33 +95,25 @@ export default function Dashboard() {
       );
     });
 
-    const unsub5 = on("approval:new", () => {
-      setApprovalCount((prev) => prev + 1);
-    });
-
-    const unsub6 = on("approval:resolved", () => {
-      setApprovalCount((prev) => Math.max(0, prev - 1));
-    });
+    const unsub5 = on("approval:new", () => setApprovalCount((p) => p + 1));
+    const unsub6 = on("approval:resolved", () => setApprovalCount((p) => Math.max(0, p - 1)));
 
     return () => { unsub1(); unsub2(); unsub3(); unsub4(); unsub5(); unsub6(); };
   }, [on]);
 
   const activeAgents = agents.filter((a) => a.status === "active").length;
   const onBreak = agents.filter((a) => a.status === "on_break").length;
+  const activeTasks = tasks.filter((t) => t.status === "in_progress" || t.status === "assigned").length;
+  const completedTasks = tasks.filter((t) => t.status === "done" || t.status === "review").length;
+  const blockedTasks = tasks.filter((t) => t.status === "blocked").length;
 
-  async function handleSubmitIdea(title: string, description: string) {
-    const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3002";
+  const handleSubmitIdea = useCallback(async (title: string, description: string) => {
     try {
-      const res = await fetch(`${API_BASE}/api/submit`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title, description }),
-      });
-      if (!res.ok) throw new Error("Failed to submit");
+      await submitIdea(title, description);
     } catch {
       console.log("Idea submitted (orchestrator offline):", title, description);
     }
-  }
+  }, []);
 
   return (
     <div className="max-w-7xl mx-auto space-y-8">
@@ -107,27 +135,60 @@ export default function Dashboard() {
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
         <KPICard title="Active Agents" value={activeAgents} subtitle={`of ${agents.length}`} color="blue" />
         <KPICard title="On Break" value={onBreak} color="yellow" />
-        <KPICard title="Active Tasks" value={taskCount.active} color="green" />
-        <KPICard title="Completed" value={taskCount.completed} color="purple" />
+        <KPICard title="Active Tasks" value={activeTasks} color="green" />
+        <KPICard title="Completed" value={completedTasks} color="purple" />
         <KPICard title="Pending Approvals" value={approvalCount} color={approvalCount > 0 ? "red" : "green"} />
       </div>
 
       {/* Main content */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        {/* Agents */}
-        <div className="lg:col-span-2 space-y-4">
-          <h2 className="text-lg font-semibold text-gray-900">Team</h2>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            {agents.map((agent) => (
-              <AgentCard
-                key={agent.id}
-                name={agent.name}
-                role={agent.role}
-                status={agent.status}
-                currentTask={agent.currentTask}
-              />
-            ))}
+        {/* Agents + Tasks */}
+        <div className="lg:col-span-2 space-y-6">
+          <div>
+            <h2 className="text-lg font-semibold text-gray-900 mb-4">Team</h2>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              {agents.map((agent) => (
+                <AgentCard
+                  key={agent.id}
+                  name={agent.name}
+                  role={agent.role}
+                  status={agent.status}
+                  currentTask={tasks.find((t) => t.assignedTo === agent.id && t.status === "in_progress")?.title}
+                />
+              ))}
+            </div>
           </div>
+
+          {/* Tasks */}
+          {tasks.length > 0 && (
+            <div>
+              <h2 className="text-lg font-semibold text-gray-900 mb-4">Tasks ({tasks.length})</h2>
+              <div className="bg-white rounded-xl shadow-sm border border-gray-100 divide-y divide-gray-50">
+                {tasks.slice(0, 20).map((task) => (
+                  <div key={task.id} className="px-4 py-3 flex items-center justify-between">
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm font-medium text-gray-900 truncate">{task.title || task.id}</p>
+                      {task.assignedTo && (
+                        <p className="text-xs text-gray-400 mt-0.5">
+                          Assigned to {agents.find((a) => a.id === task.assignedTo)?.name ?? task.assignedTo}
+                        </p>
+                      )}
+                    </div>
+                    <span className={`ml-3 px-2 py-0.5 rounded text-xs font-medium whitespace-nowrap ${
+                      task.status === "in_progress" ? "bg-blue-100 text-blue-700" :
+                      task.status === "done" ? "bg-green-100 text-green-700" :
+                      task.status === "review" ? "bg-purple-100 text-purple-700" :
+                      task.status === "blocked" ? "bg-red-100 text-red-700" :
+                      task.status === "assigned" ? "bg-yellow-100 text-yellow-700" :
+                      "bg-gray-100 text-gray-600"
+                    }`}>
+                      {task.status}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Right column */}
