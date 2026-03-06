@@ -4,12 +4,12 @@
   "private": true,
   "description": "Autonomous AI agency powered by Claude Code agents",
   "scripts": {
-    "build": "pnpm -r build",
-    "dev": "pnpm --filter orchestrator dev",
-    "setup": "pnpm --filter orchestrator setup",
-    "setup:slack": "pnpm --filter slack-bridge setup",
-    "start": "pnpm --filter orchestrator start",
-    "submit": "pnpm --filter orchestrator submit"
+    "build": "pnpm -r run build",
+    "dev": "pnpm --filter orchestrator run dev",
+    "setup": "pnpm --filter orchestrator run setup",
+    "setup:slack": "pnpm --filter slack-bridge run setup",
+    "start": "pnpm --filter orchestrator run start",
+    "submit": "pnpm --filter orchestrator run submit"
   },
   "pnpm": {
     "onlyBuiltDependencies": ["esbuild"]
