@@ -308,7 +308,29 @@ export class Agency {
         // Check if the message is an actionable task/idea (not just casual chat)
         const isTask = this.looksLikeTask(msg.text);
         if (isTask) {
-          await this.taskRouter.submitIdea(msg.text.slice(0, 100), msg.text);
+          // Check if this is a direct instruction to Alice (simple) or a bigger project idea
+          const isDirect = this.isDirectInstruction(msg.text);
+          if (isDirect) {
+            // Direct instruction → Alice does it herself immediately
+            const task = {
+              id: crypto.randomUUID(),
+              title: msg.text.slice(0, 120),
+              description: `Direct request from investor:\n\n${msg.text}`,
+              status: 'assigned' as const,
+              projectId: null,
+              assignedTo: 'ceo',
+              createdBy: 'investor',
+              parentTaskId: null,
+              priority: 8,
+              createdAt: new Date(),
+              updatedAt: new Date(),
+            };
+            await this.store.createTask(task);
+            await this.agentManager.assignTask('ceo', task);
+          } else {
+            // Bigger idea → full workflow (CEO evaluates → architect → approval)
+            await this.taskRouter.submitIdea(msg.text.slice(0, 100), msg.text);
+          }
         }
 
         // If investor asks CEO about HR stuff, route to Bob too
@@ -401,12 +423,36 @@ export class Agency {
           if (agentId === 'hr') {
             await this.tryHireFromOutput(response);
           }
+
         } catch (err: any) {
           console.error(`[${blueprint.name} chat error]`, err.message);
         }
       });
 
       await Promise.allSettled(chatPromises);
+
+      // If the message is an actionable request, create a real task for the primary agent
+      if (this.looksLikeTask(msg.text) && respondingAgents.length > 0) {
+        const primaryAgent = respondingAgents[0];
+        const blueprint = this.agentManager.getBlueprint(primaryAgent);
+        if (blueprint) {
+          const task = {
+            id: crypto.randomUUID(),
+            title: msg.text.slice(0, 120),
+            description: `Investor request in #${slackChannel}:\n\n${msg.text}`,
+            status: 'assigned' as const,
+            projectId: null,
+            assignedTo: primaryAgent,
+            createdBy: 'investor',
+            parentTaskId: null,
+            priority: 7,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          };
+          await this.store.createTask(task);
+          await this.agentManager.assignTask(primaryAgent, task);
+        }
+      }
     });
   }
 
@@ -455,6 +501,37 @@ export class Agency {
     return unique.length > 0 ? unique : ['ceo'];
   }
 
+  /**
+   * Direct instruction = investor tells an agent to do something specific right now.
+   * vs. a bigger project idea that needs planning.
+   */
+  private isDirectInstruction(text: string): boolean {
+    const lower = text.toLowerCase();
+    // Direct: "mach das", "do it", "create a file", "set up X", "write X", short and specific
+    const directPatterns = [
+      'mach das', 'mach es', 'dann mach', 'fang an', 'leg los', 'erledige',
+      'do it', 'go ahead', 'just do', 'start on', 'get on it',
+      'hört sich gut an', 'sounds good', 'yes do', 'ja mach', 'okay mach',
+      'create a', 'erstell', 'anlegen', 'set up', 'write a', 'schreib',
+      'kannst du', 'can you', 'könntest du', 'could you',
+      'überlegen', 'vorschlag', 'list', 'zusammenfass', 'summarize',
+    ];
+    // Big project: "app bauen", "build a platform", "develop a system"
+    const bigPatterns = [
+      'app bauen', 'platform', 'build a', 'develop a system', 'new product',
+      'saas', 'startup', 'launch a', 'marketplace',
+    ];
+    const isBig = bigPatterns.some(p => lower.includes(p));
+    const isDirect = directPatterns.some(p => lower.includes(p));
+
+    // If it matches big patterns, it's not direct (needs planning)
+    if (isBig && !isDirect) return false;
+    // If it matches direct patterns, it's direct
+    if (isDirect) return true;
+    // Short messages are more likely direct instructions
+    return text.length < 150;
+  }
+
   private looksLikeHrRequest(text: string): boolean {
     const lower = text.toLowerCase();
     const hrIndicators = [
@@ -468,14 +545,21 @@ export class Agency {
   private looksLikeTask(text: string): boolean {
     const lower = text.toLowerCase();
     const taskIndicators = [
+      // English
       'build', 'create', 'make', 'implement', 'add', 'fix', 'deploy',
       'set up', 'setup', 'design', 'develop', 'write', 'refactor',
       'update', 'change', 'remove', 'delete', 'migrate', 'integrate',
       'i want', 'i need', 'can you', 'could you', 'please',
-      'we need', 'we should', 'let\'s',
+      'we need', 'we should', 'let\'s', 'go ahead', 'do it',
+      // German
+      'erstell', 'mach', 'bau', 'implementier', 'schreib', 'entwickl',
+      'änder', 'aktualisier', 'entfern', 'lösch', 'richte ein',
+      'kannst du', 'könntest du', 'bitte', 'wir brauchen', 'fang an',
+      'leg los', 'überlegen', 'vorschlag', 'anlegen', 'einrichten',
+      'hört sich gut an', 'sounds good', 'dann mach',
     ];
     // Must be more than just a greeting and contain an action word
-    return text.length > 20 && taskIndicators.some(ind => lower.includes(ind));
+    return text.length > 15 && taskIndicators.some(ind => lower.includes(ind));
   }
 
   /**
