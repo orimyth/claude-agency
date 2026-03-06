@@ -8,7 +8,8 @@ export type WSEventType =
   | 'approval:resolved'
   | 'break:start'
   | 'break:end'
-  | 'kpi:update';
+  | 'kpi:update'
+  | 'agent:new';
 
 export interface WSEvent {
   type: WSEventType;

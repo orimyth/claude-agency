@@ -47,6 +47,11 @@ export class HRManager {
    * Called by the HR agent when it outputs a blueprint JSON.
    */
   async hire(blueprint: AgentBlueprint): Promise<AgentBlueprint> {
+    // Set role from name if missing
+    if (!blueprint.role && blueprint.name) {
+      blueprint.role = blueprint.name;
+    }
+
     // Validate required fields
     if (!blueprint.id || !blueprint.role || !blueprint.name || !blueprint.systemPrompt) {
       throw new Error('Blueprint missing required fields: id, role, name, systemPrompt');
@@ -163,13 +168,31 @@ IMPORTANT — COMMUNICATION STYLE:
    * The HR agent outputs JSON when creating new roles.
    */
   static parseBlueprint(agentOutput: string): AgentBlueprint | null {
-    // Try to find JSON in the output
-    const jsonMatch = agentOutput.match(/\{[\s\S]*"id"[\s\S]*"role"[\s\S]*"name"[\s\S]*"systemPrompt"[\s\S]*\}/);
-    if (!jsonMatch) return null;
+    // Try to extract the largest JSON object from the output
+    // Look for JSON blocks (possibly wrapped in ```json ... ```)
+    const codeBlockMatch = agentOutput.match(/```(?:json)?\s*(\{[\s\S]*?\})\s*```/);
+    const rawJsonMatch = agentOutput.match(/(\{[\s\S]*"id"[\s\S]*"systemPrompt"[\s\S]*\})/);
+    const rawJsonMatch2 = agentOutput.match(/(\{[\s\S]*"systemPrompt"[\s\S]*"id"[\s\S]*\})/);
+
+    const jsonStr = codeBlockMatch?.[1] ?? rawJsonMatch?.[0] ?? rawJsonMatch2?.[0];
+    if (!jsonStr) return null;
 
     try {
-      return JSON.parse(jsonMatch[0]) as AgentBlueprint;
+      const parsed = JSON.parse(jsonStr);
+      // Validate minimum fields
+      if (parsed.id && parsed.name && parsed.systemPrompt) {
+        return parsed as AgentBlueprint;
+      }
+      return null;
     } catch {
+      // Try to fix common JSON issues (trailing commas, etc.)
+      try {
+        const cleaned = jsonStr.replace(/,\s*([\]}])/g, '$1');
+        const parsed = JSON.parse(cleaned);
+        if (parsed.id && parsed.name && parsed.systemPrompt) {
+          return parsed as AgentBlueprint;
+        }
+      } catch { /* give up */ }
       return null;
     }
   }

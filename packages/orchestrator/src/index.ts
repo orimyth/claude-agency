@@ -138,7 +138,7 @@ export class Agency {
 
       // Check if HR agent output contains a new blueprint
       if (agentId === 'hr') {
-        await this.workflowEngine.processHROutput(content);
+        await this.tryHireFromOutput(content);
       }
     });
 
@@ -308,6 +308,27 @@ export class Agency {
         if (isTask) {
           await this.taskRouter.submitIdea(msg.text.slice(0, 100), msg.text);
         }
+
+        // If investor asks CEO about HR stuff, route to Bob too
+        const isHrRequest = this.looksLikeHrRequest(msg.text);
+        if (isHrRequest) {
+          try {
+            const hrResponse = await this.agentManager.chat('hr', msg.text,
+              `You are Bob (HR Manager). The investor asked in #ceo-investor: "${msg.text}"\n\nAlice (CEO) responded: "${response}"\n\nIf this is a hiring request, create the blueprint JSON immediately. Include all required fields: id, role, name, gender, systemPrompt. Respond with your message and the JSON blueprint if applicable.`
+            );
+            if (this.slack) {
+              await this.slack.sendAgentMessage('agency-ceo-investor', 'Bob', 'HR Manager', hrResponse);
+            }
+            await this.store.saveMessage({
+              id: crypto.randomUUID(), fromAgentId: 'hr', toAgentId: 'investor',
+              channel: 'ceo-investor', content: hrResponse, timestamp: new Date(),
+            });
+            // Try to parse and hire from Bob's response
+            await this.tryHireFromOutput(hrResponse);
+          } catch (err: any) {
+            console.error('[HR routing error]', err.message);
+          }
+        }
       } catch (err: any) {
         console.error('[CEO chat error]', err.message);
         await this.slack!.sendAgentMessage('agency-ceo-investor', 'Alice', 'CEO', `hey, give me a sec — something glitched on my end`);
@@ -371,6 +392,11 @@ export class Agency {
             id: crypto.randomUUID(), fromAgentId: agentId, toAgentId: 'investor',
             channel: slackChannel, content: response, timestamp: new Date(),
           });
+
+          // Check if HR agent output contains a new blueprint (for hire requests via chat)
+          if (agentId === 'hr') {
+            await this.tryHireFromOutput(response);
+          }
         } catch (err: any) {
           console.error(`[${blueprint.name} chat error]`, err.message);
         }
@@ -422,6 +448,16 @@ export class Agency {
     return unique.length > 0 ? unique : ['ceo'];
   }
 
+  private looksLikeHrRequest(text: string): boolean {
+    const lower = text.toLowerCase();
+    const hrIndicators = [
+      'hire', 'einstell', 'rekrutier', 'blueprint', 'neuen agent', 'new agent',
+      'new role', 'neue rolle', 'security expert', 'experte', 'brauchen einen',
+      'need a new', 'onboard', 'team member', 'mitarbeiter',
+    ];
+    return hrIndicators.some(ind => lower.includes(ind));
+  }
+
   private looksLikeTask(text: string): boolean {
     const lower = text.toLowerCase();
     const taskIndicators = [
@@ -433,6 +469,59 @@ export class Agency {
     ];
     // Must be more than just a greeting and contain an action word
     return text.length > 20 && taskIndicators.some(ind => lower.includes(ind));
+  }
+
+  /**
+   * Try to parse and hire a new agent from HR output (works from both task and chat flows).
+   */
+  private async tryHireFromOutput(output: string): Promise<void> {
+    const blueprint = HRManager.parseBlueprint(output);
+    if (!blueprint) return;
+
+    try {
+      const hired = await this.hrManager.hire(blueprint);
+      console.log(`[HR] Hired new agent: ${hired.name} (${hired.role})`);
+
+      // Announce in Slack
+      if (this.slack) {
+        await this.slack.sendAgentMessage('agency-hr-hiring', 'Bob', 'HR Manager',
+          `hired ${hired.name} as ${hired.role}. they're ready to go`);
+
+        // Create Slack channels from the blueprint
+        for (const ch of hired.slackChannels) {
+          const channelName = ch.startsWith('#') ? ch.slice(1) : ch;
+          // Skip wildcard patterns like project-*
+          if (channelName.includes('*')) continue;
+          const slackName = channelName.startsWith('agency-') ? channelName : `agency-${channelName}`;
+          try {
+            await this.slack.getChannelManager().ensureChannel(slackName, `${hired.role} channel`);
+            console.log(`[HR] Created/verified Slack channel: ${slackName}`);
+          } catch (err: any) {
+            console.warn(`[HR] Failed to create channel ${slackName}: ${err.message}`);
+          }
+        }
+
+        // Re-register agent names for mention detection
+        this.slack.setAgentNames(
+          this.agentManager.getAllBlueprints().map(b => ({ id: b.id, name: b.name }))
+        );
+      }
+
+      // Broadcast to dashboard
+      this.wsServer.broadcast('agent:new', {
+        id: hired.id,
+        name: hired.name,
+        role: hired.role,
+        avatar: hired.avatar,
+        status: 'idle',
+      });
+    } catch (err: any) {
+      console.error(`[HR] Hire failed: ${err.message}`);
+      if (this.slack) {
+        await this.slack.sendAgentMessage('agency-hr-hiring', 'Bob', 'HR Manager',
+          `couldn't hire: ${err.message}`);
+      }
+    }
   }
 
   private mapToSlackChannel(internalChannel: string): string {

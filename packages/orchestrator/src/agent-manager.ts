@@ -293,6 +293,9 @@ export class AgentManager extends EventEmitter {
       workDir = resolve(dirname(fileURLToPath(import.meta.url)), '../../..', workDir);
     }
 
+    // Mark agent as active while chatting
+    await this.store.updateAgentStatus(agentId, 'active');
+
     const langRule = this.getLanguageInstruction();
 
     const prompt = context
@@ -334,6 +337,9 @@ export class AgentManager extends EventEmitter {
         } catch { /* non-critical */ }
       }
     }
+
+    // Return to idle after chat
+    await this.store.updateAgentStatus(agentId, 'idle');
 
     return result || "hey, give me a sec";
   }
