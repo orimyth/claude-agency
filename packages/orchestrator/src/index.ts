@@ -97,8 +97,9 @@ export class Agency {
     // Wire up agent events
     this.setupAgentEvents();
 
-    // Start the scheduler
+    // Start the scheduler and wire up status reports
     this.scheduler.start();
+    this.setupSchedulerEvents();
     console.log('Scheduler started');
 
     // Start API server
@@ -140,17 +141,48 @@ export class Agency {
     this.agentManager.on('taskComplete', async (agentId: string, taskId: string) => {
       this.wsServer.broadcast('task:update', { agentId, taskId, status: 'review' });
 
+      const task = await this.store.getTask(taskId);
+      if (!task) return;
+
       // If CEO completed an evaluation, run the workflow
-      if (agentId === 'ceo') {
-        const task = await this.store.getTask(taskId);
-        if (task && task.title.startsWith('[Investor Idea]')) {
-          await this.workflowEngine.evaluateIdea(task);
-        }
+      if (agentId === 'ceo' && task.title.startsWith('[Investor Idea]')) {
+        await this.workflowEngine.evaluateIdea(task);
+        return;
+      }
+
+      // Auto-handoff: developer done → PM reviews
+      if (agentId === 'developer' || agentId === 'designer') {
+        try {
+          await this.agentManager.agentToAgentChat(
+            agentId, 'pm',
+            `finished "${task.title.replace('[Investor Idea] ', '')}", ready for review`,
+            'leadership'
+          );
+        } catch { /* non-critical */ }
+      }
+
+      // Auto-handoff: PM done → CEO gets status
+      if (agentId === 'pm') {
+        try {
+          await this.agentManager.agentToAgentChat(
+            agentId, 'ceo',
+            `sprint update: "${task.title.replace('[Investor Idea] ', '')}" is done`,
+            'leadership'
+          );
+        } catch { /* non-critical */ }
       }
     });
 
-    this.agentManager.on('taskFailed', (agentId: string, taskId: string, error: string) => {
+    this.agentManager.on('taskFailed', async (agentId: string, taskId: string, error: string) => {
       this.wsServer.broadcast('task:update', { agentId, taskId, status: 'blocked', error });
+
+      // Notify PM and CEO when a task is blocked
+      const task = await this.store.getTask(taskId);
+      const blueprint = this.agentManager.getBlueprint(agentId);
+      if (task && blueprint) {
+        const blockMsg = `blocked on "${task.title.replace('[Investor Idea] ', '')}": ${error.slice(0, 100)}`;
+        this.agentManager.emit('message', agentId, 'general', blockMsg);
+      }
     });
 
     this.agentManager.on('breakStarted', (agentId: string, reason: string, until: Date) => {
@@ -198,6 +230,42 @@ export class Agency {
 
     this.workflowEngine.on('error', (agentId: string, error: Error) => {
       console.error(`[Workflow ${agentId}] Error:`, error.message);
+    });
+  }
+
+  private setupSchedulerEvents(): void {
+    this.scheduler.on('statusReport', async (data: any) => {
+      const { summary, activeDetails, blockedTasks } = data;
+
+      // Have the CEO generate a natural status report
+      try {
+        const context = [
+          `You are Alice, the CEO. Generate a brief team status update for the #agency-general Slack channel.`,
+          ``,
+          `Current status:`,
+          `- ${summary.activeAgents} agents working, ${summary.idleAgents} idle, ${summary.onBreakAgents} on break`,
+          `- ${summary.tasksInProgress} tasks in progress, ${summary.tasksCompleted} completed, ${summary.tasksPending} pending`,
+          summary.tasksBlocked > 0 ? `- ${summary.tasksBlocked} BLOCKED tasks that need attention` : '',
+          activeDetails.length > 0 ? `- Currently working: ${activeDetails.map((a: any) => a.name).join(', ')}` : '- Nobody working right now',
+          blockedTasks.length > 0 ? `- Blocked: ${blockedTasks.map((t: any) => t.title).join(', ')}` : '',
+          ``,
+          `Write a casual 2-4 sentence Slack update. Be like a real CEO checking in. If everything is quiet, keep it very short. If there are blocked tasks, flag them. Only output the message itself, nothing else.`,
+        ].filter(Boolean).join('\n');
+
+        const report = await this.agentManager.chat('ceo', '', context);
+        if (this.slack) {
+          await this.slack.sendAgentMessage('agency-general', 'Alice', 'CEO', report);
+        }
+
+        await this.store.saveMessage({
+          id: crypto.randomUUID(), fromAgentId: 'ceo', toAgentId: null,
+          channel: 'general', content: report, timestamp: new Date(),
+        });
+
+        this.wsServer.broadcast('message:new', { agentId: 'ceo', channel: 'general', content: report });
+      } catch (err: any) {
+        console.error('[Status report error]', err.message);
+      }
     });
   }
 

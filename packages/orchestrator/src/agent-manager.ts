@@ -90,6 +90,9 @@ export class AgentManager extends EventEmitter {
     await this.store.updateAgentStatus(agentId, 'active');
     await this.store.upsertAgent({ ...agent, status: 'active', currentTaskId: task.id });
 
+    // Announce task pickup
+    this.emit('message', agentId, 'general', `picking up "${task.title.replace('[Investor Idea] ', '')}"`);
+
     this.runAgent(blueprint, task).catch(err => {
       this.emit('error', agentId, err);
     });
@@ -124,8 +127,19 @@ export class AgentManager extends EventEmitter {
       });
 
       let resultText = '';
+      let turnCount = 0;
 
       for await (const message of stream) {
+        // Track turns for progress updates
+        if (message.type === 'assistant') {
+          turnCount++;
+          // Emit periodic progress (every 5 turns)
+          if (turnCount % 5 === 0) {
+            this.emit('message', blueprint.id, 'general',
+              `still working on "${task.title.replace('[Investor Idea] ', '')}"...`);
+          }
+        }
+
         if (message.type === 'result') {
           const resultMsg = message as SDKResultMessage;
           if (resultMsg.subtype === 'success') {
@@ -134,8 +148,10 @@ export class AgentManager extends EventEmitter {
         }
       }
 
-      // Task completed
-      this.emit('message', blueprint.id, `project-${task.projectId}`, resultText || 'task done');
+      // Announce task completion
+      const summary = resultText ? resultText.slice(0, 200) : 'done';
+      const channel = task.projectId ? `project-${task.projectId}` : 'general';
+      this.emit('message', blueprint.id, channel, summary);
       this.emit('taskComplete', blueprint.id, task.id);
 
       await this.store.updateTaskStatus(task.id, 'review');
@@ -268,6 +284,68 @@ export class AgentManager extends EventEmitter {
     }
 
     return result || "hey, give me a sec";
+  }
+
+  /**
+   * One agent asks another agent a question and gets a response.
+   * Both sides are posted to the specified channel.
+   */
+  async agentToAgentChat(
+    fromId: string, toId: string, message: string, channel = 'leadership'
+  ): Promise<string> {
+    const from = this.blueprints.get(fromId);
+    const to = this.blueprints.get(toId);
+    if (!from || !to) throw new Error(`Blueprint not found`);
+
+    // Post the question
+    this.emit('message', fromId, channel, message);
+
+    // Get the response
+    const context = [
+      `You are ${to.name} (${to.role}).`,
+      `${from.name} (${from.role}) just said to you in #${channel}:`,
+      `"${message}"`,
+      ``,
+      `Respond naturally as ${to.name}. Keep it short — 1-3 sentences, like a real Slack message. Only respond with your message.`,
+    ].join('\n');
+
+    const response = await this.chat(toId, message, context);
+    this.emit('message', toId, channel, response);
+    return response;
+  }
+
+  /**
+   * Hand off work from one agent to another with context.
+   * Creates a task assigned to the target agent.
+   */
+  async requestHandoff(
+    fromId: string, toId: string, title: string, description: string, channel = 'general'
+  ): Promise<void> {
+    const from = this.blueprints.get(fromId);
+    const to = this.blueprints.get(toId);
+    if (!from || !to) return;
+
+    // Announce the handoff
+    this.emit('message', fromId, channel,
+      `hey ${to.name.toLowerCase()}, handing this off to you: ${title}`);
+
+    // Create and assign the task
+    const task = {
+      id: crypto.randomUUID(),
+      title,
+      description: `${from.name} (${from.role}) handed this off:\n\n${description}`,
+      status: 'assigned' as const,
+      projectId: null,
+      assignedTo: toId,
+      createdBy: fromId,
+      parentTaskId: null,
+      priority: 5,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    await this.store.createTask(task);
+    await this.assignTask(toId, task);
   }
 
   getActiveCount(): number {

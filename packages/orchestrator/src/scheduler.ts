@@ -1,28 +1,38 @@
+import { EventEmitter } from 'events';
 import type { AgentManager } from './agent-manager.js';
 import type { StateStore } from './state-store.js';
 
-export class Scheduler {
+export class Scheduler extends EventEmitter {
   private store: StateStore;
   private agentManager: AgentManager;
   private tickInterval: ReturnType<typeof setInterval> | null = null;
   private breakCheckInterval: ReturnType<typeof setInterval> | null = null;
+  private statusReportInterval: ReturnType<typeof setInterval> | null = null;
 
   constructor(store: StateStore, agentManager: AgentManager) {
+    super();
     this.store = store;
     this.agentManager = agentManager;
   }
 
-  start(tickMs = 10_000, breakCheckMs = 30_000): void {
+  start(tickMs = 10_000, breakCheckMs = 30_000, statusReportMs = 15 * 60_000): void {
     // Main loop: check for idle agents with pending tasks
     this.tickInterval = setInterval(() => this.tick(), tickMs);
 
     // Break recovery: check if agents should come back from break
     this.breakCheckInterval = setInterval(() => this.checkBreaks(), breakCheckMs);
+
+    // Periodic CEO status report
+    this.statusReportInterval = setInterval(() => this.triggerStatusReport(), statusReportMs);
+
+    // First status report after 2 minutes of startup
+    setTimeout(() => this.triggerStatusReport(), 2 * 60_000);
   }
 
   stop(): void {
     if (this.tickInterval) clearInterval(this.tickInterval);
     if (this.breakCheckInterval) clearInterval(this.breakCheckInterval);
+    if (this.statusReportInterval) clearInterval(this.statusReportInterval);
   }
 
   private async tick(): Promise<void> {
@@ -57,6 +67,42 @@ export class Scheduler {
       }
     } catch (err) {
       console.error('[Scheduler] break check error:', err);
+    }
+  }
+
+  private async triggerStatusReport(): Promise<void> {
+    try {
+      const agents = await this.store.getAllAgents();
+      const tasks = await this.store.getAllTasks(200);
+
+      const active = agents.filter(a => a.status === 'active');
+      const onBreak = agents.filter(a => a.status === 'on_break');
+      const idle = agents.filter(a => a.status === 'idle');
+      const inProgress = tasks.filter(t => t.status === 'in_progress');
+      const completed = tasks.filter(t => t.status === 'done' || t.status === 'review');
+      const blocked = tasks.filter(t => t.status === 'blocked');
+      const pending = tasks.filter(t => t.status === 'backlog' || t.status === 'assigned');
+
+      this.emit('statusReport', {
+        agents,
+        summary: {
+          activeAgents: active.length,
+          idleAgents: idle.length,
+          onBreakAgents: onBreak.length,
+          tasksInProgress: inProgress.length,
+          tasksCompleted: completed.length,
+          tasksBlocked: blocked.length,
+          tasksPending: pending.length,
+        },
+        activeDetails: active.map(a => ({
+          id: a.id,
+          name: this.agentManager.getBlueprint(a.id)?.name ?? a.id,
+          taskId: a.currentTaskId,
+        })),
+        blockedTasks: blocked.map(t => ({ id: t.id, title: t.title })),
+      });
+    } catch (err) {
+      console.error('[Scheduler] status report error:', err);
     }
   }
 }

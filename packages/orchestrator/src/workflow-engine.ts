@@ -5,6 +5,17 @@ import type { TaskBoard } from './task-board.js';
 import { HRManager } from './hr-manager.js';
 import type { AgentBlueprint, Task, AgencyConfig } from './types.js';
 import { EventEmitter } from 'events';
+import { dirname } from 'path';
+
+// Same PATH fix as agent-manager
+const nodeDir = dirname(process.execPath);
+const wfEnv: Record<string, string> = {};
+for (const [k, v] of Object.entries(process.env)) {
+  if (v !== undefined) wfEnv[k] = v;
+}
+if (!wfEnv.PATH?.includes(nodeDir)) {
+  wfEnv.PATH = `${nodeDir}:${wfEnv.PATH || ''}`;
+}
 
 /**
  * Handles complex multi-agent workflows:
@@ -73,6 +84,7 @@ export class WorkflowEngine extends EventEmitter {
           cwd: this.config.workspace,
           maxTurns: 3,
           permissionMode: 'bypassPermissions',
+          env: wfEnv,
         },
       });
 
@@ -112,7 +124,8 @@ export class WorkflowEngine extends EventEmitter {
       return;
     }
 
-    this.emit('message', 'ceo', 'leadership', `hey charlie, need your input on this one — "${task.title}"`);
+    this.emit('message', 'ceo', 'leadership', `hey charlie, need your input on this one — "${task.title.replace('[Investor Idea] ', '')}"`);
+    this.emit('message', 'ceo', 'general', `consulting with charlie on the architecture for "${task.title.replace('[Investor Idea] ', '')}"`);
 
     const consultPrompt = [
       `You are ${architectBlueprint.name}, the ${architectBlueprint.role}.`,
@@ -140,6 +153,7 @@ export class WorkflowEngine extends EventEmitter {
           cwd: this.config.workspace,
           maxTurns: 3,
           permissionMode: 'bypassPermissions',
+          env: wfEnv,
         },
       });
 
@@ -212,20 +226,26 @@ export class WorkflowEngine extends EventEmitter {
   async handleApprovalResponse(approvalId: string, status: 'approved' | 'rejected' | 'modified', feedback?: string): Promise<void> {
     if (status === 'rejected') {
       this.emit('message', 'ceo', 'ceo-investor', 'understood, shelving this one');
+      this.emit('message', 'ceo', 'leadership', 'investor rejected the plan, standing down');
       return;
     }
 
     if (status === 'modified') {
       this.emit('message', 'ceo', 'ceo-investor', `got the feedback, adjusting the plan`);
-      // TODO: re-run with modifications
       return;
     }
 
-    // Approved — find the pending approvals and create tasks
-    const pending = await this.store.getPendingApprovals();
-    // In a real implementation, we'd match by approvalId
-    // For now, process the most recent pending approval
-    this.emit('message', 'ceo', 'agency-general', `plan approved, spinning up the team`);
+    // Approved — announce and mobilize
+    this.emit('message', 'ceo', 'general', `plan approved by the investor, let's go team`);
+
+    // CEO tells PM to start
+    try {
+      await this.agentManager.agentToAgentChat(
+        'ceo', 'pm',
+        `we got the green light. start breaking this down into sprint tasks and assign to the team`,
+        'leadership'
+      );
+    } catch { /* non-critical */ }
   }
 
   /**
