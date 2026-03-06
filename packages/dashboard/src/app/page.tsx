@@ -74,16 +74,16 @@ export default function Dashboard() {
   const onBreak = agents.filter((a) => a.status === "on_break").length;
 
   async function handleSubmitIdea(title: string, description: string) {
+    const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3002";
     try {
-      const res = await fetch("/api/submit", {
+      const res = await fetch(`${API_BASE}/api/submit`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title, description }),
       });
       if (!res.ok) throw new Error("Failed to submit");
     } catch {
-      // For now, just log — API routes will be added when orchestrator exposes HTTP
-      console.log("Idea submitted:", title, description);
+      console.log("Idea submitted (orchestrator offline):", title, description);
     }
   }
 

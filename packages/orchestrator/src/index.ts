@@ -10,7 +10,13 @@ import { TaskBoard } from './task-board.js';
 import { HRManager } from './hr-manager.js';
 import { WorkflowEngine } from './workflow-engine.js';
 import { DashboardWSServer } from './ws-server.js';
+import { MemoryManager } from './memory-manager.js';
+import { APIServer } from './api-server.js';
 import { SlackBridge, type InvestorMessage } from 'slack-bridge';
+import { dirname, resolve } from 'path';
+import { fileURLToPath } from 'url';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 export class Agency {
   private store: StateStore;
@@ -22,16 +28,20 @@ export class Agency {
   private hrManager!: HRManager;
   private workflowEngine!: WorkflowEngine;
   private wsServer: DashboardWSServer;
+  private memoryManager: MemoryManager;
+  private apiServer: APIServer;
   private slack: SlackBridge | null = null;
 
   constructor() {
     this.store = new StateStore(agencyConfig.mysql);
     this.permissions = new PermissionEngine(defaultBlacklist);
     this.agentManager = new AgentManager(this.store, this.permissions, agencyConfig);
+    this.memoryManager = new MemoryManager(resolve(__dirname, '../../..'));
     this.scheduler = new Scheduler(this.store, this.agentManager);
     this.taskRouter = new TaskRouter(this.store, this.agentManager);
     this.taskBoard = new TaskBoard(this.store);
     this.wsServer = new DashboardWSServer(agencyConfig.wsPort);
+    this.apiServer = new APIServer(this.store, this.agentManager, this.taskRouter, this.taskBoard);
   }
 
   async start(): Promise<void> {
@@ -87,7 +97,11 @@ export class Agency {
     this.scheduler.start();
     console.log('Scheduler started');
 
+    // Start API server
+    this.apiServer.start(agencyConfig.wsPort + 1);
+
     console.log(`WebSocket server running on port ${agencyConfig.wsPort}`);
+    console.log(`API server running on port ${agencyConfig.wsPort + 1}`);
     console.log('Claude Agency is running. Waiting for tasks...\n');
   }
 
@@ -232,11 +246,13 @@ export class Agency {
   getTaskBoard(): TaskBoard { return this.taskBoard; }
   getHRManager(): HRManager { return this.hrManager; }
   getWorkflowEngine(): WorkflowEngine { return this.workflowEngine; }
+  getMemoryManager(): MemoryManager { return this.memoryManager; }
   getSlack(): SlackBridge | null { return this.slack; }
 
   async shutdown(): Promise<void> {
     console.log('Shutting down...');
     this.scheduler.stop();
+    this.apiServer.close();
     this.wsServer.close();
     if (this.slack) await this.slack.stop();
     await this.store.close();
