@@ -202,7 +202,8 @@ export class APIServer {
     if (req.method === 'GET' && path === '/api/usage') {
       const summary = await this.store.getUsageSummary();
       const recent = await this.store.getRecentUsage(30);
-      this.json(res, { ...summary, recent });
+      const byProject = await this.store.getCostByProject();
+      this.json(res, { ...summary, recent, byProject });
       return;
     }
 
@@ -292,6 +293,16 @@ export class APIServer {
 
     if (req.method === 'POST' && path === '/api/agency/tasks' && this.toolHandler) {
       const body = JSON.parse(await this.readBody(req));
+      // Support batch task creation: { tasks: [...] }
+      if (Array.isArray(body.tasks)) {
+        const results = [];
+        for (const taskInput of body.tasks) {
+          const result = await this.toolHandler.handleToolCall(taskInput.agentId ?? body.agentId ?? 'system', 'agency_create_task', taskInput);
+          results.push(result);
+        }
+        this.json(res, { success: true, data: results });
+        return;
+      }
       const result = await this.toolHandler.handleToolCall(body.agentId ?? 'system', 'agency_create_task', body);
       this.json(res, result);
       return;

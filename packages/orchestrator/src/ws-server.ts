@@ -9,7 +9,8 @@ export type WSEventType =
   | 'break:start'
   | 'break:end'
   | 'kpi:update'
-  | 'agent:new';
+  | 'agent:new'
+  | 'usage:update';
 
 export interface WSEvent {
   type: WSEventType;

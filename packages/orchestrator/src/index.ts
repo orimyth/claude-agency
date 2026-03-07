@@ -37,6 +37,8 @@ export class Agency {
   private toolHandler: AgentToolHandler;
   private apiServer: APIServer;
   private slack: SlackBridge | null = null;
+  /** Maps "channel:taskTitle" → Slack thread_ts for threaded replies */
+  private taskThreads: Map<string, string> = new Map();
 
   constructor() {
     this.store = new StateStore(agencyConfig.mysql);
@@ -117,6 +119,13 @@ export class Agency {
     this.setupSchedulerEvents();
     console.log('Scheduler started');
 
+    // Prune stale memories every 6 hours
+    setInterval(() => {
+      this.memoryManager.prune().catch(err => {
+        console.error('[Memory prune error]', err.message);
+      });
+    }, 6 * 60 * 60_000);
+
     // Wire project creation → Slack channel creation
     this.toolHandler.setOnProjectCreated(async (projectId: string, projectName: string) => {
       if (this.slack) {
@@ -149,12 +158,19 @@ export class Agency {
         timestamp: new Date(),
       });
 
-      // Forward to Slack
+      // Forward to Slack with threading support
       if (this.slack) {
         const blueprint = this.agentManager.getBlueprint(agentId);
         if (blueprint) {
           const slackChannel = this.mapToSlackChannel(channel);
-          await this.slack.sendAgentMessage(slackChannel, blueprint.name, blueprint.role, content, blueprint.avatar);
+          // Check if there's an existing thread for this channel+agent combo
+          const threadKey = `${channel}:${agentId}`;
+          const threadTs = this.taskThreads.get(threadKey);
+          const messageTs = await this.slack.sendAgentMessage(slackChannel, blueprint.name, blueprint.role, content, blueprint.avatar, threadTs);
+          // If this is a new message (no thread yet), start a thread for follow-ups
+          if (!threadTs && messageTs && content.includes('picking up')) {
+            this.taskThreads.set(threadKey, messageTs);
+          }
         }
       }
 
@@ -195,12 +211,22 @@ export class Agency {
           qaResult.includes('ready to ship') || qaResult.includes('works as expected');
 
         if (hasBugs && !isPass) {
-          // QA found bugs → auto-create fix task for the original developer
+          // QA found bugs → auto-create fix task, but cap the loop
           try {
-            // Find the original task this QA was reviewing (via dependsOn)
             const originalTaskId = task.dependsOn;
             const originalTask = originalTaskId ? await this.store.getTask(originalTaskId) : null;
             const originalDev = originalTask?.assignedTo ?? 'developer';
+
+            // Cap QA→fix cycles at 3 to prevent infinite loops
+            const fixCycles = await this.store.countFixCycles(taskId);
+            if (fixCycles >= 3) {
+              const notifyChannel2 = task.projectId ? `project-${task.projectId}` : 'leadership';
+              this.agentManager.notify('qa', notifyChannel2,
+                `3 fix cycles on "${cleanTitle.replace('QA Review: ', '')}" — escalating to Diana for manual review`);
+              this.agentManager.notify('qa', 'leadership',
+                `repeated QA failures on "${cleanTitle.replace('QA Review: ', '')}". needs human or PM intervention`);
+              return;
+            }
 
             const fixTaskId = crypto.randomUUID();
             const fixTask = {
@@ -352,6 +378,11 @@ export class Agency {
     this.agentManager.on('error', (agentId: string, error: Error) => {
       console.error(`[Agent ${agentId}] Error:`, error.message);
       this.wsServer.broadcast('agent:status', { agentId, status: 'error', error: error.message });
+    });
+
+    // Real-time cost broadcasting to dashboard
+    this.agentManager.on('usageUpdate', (snapshot: any) => {
+      this.wsServer.broadcast('usage:update', snapshot);
     });
   }
 

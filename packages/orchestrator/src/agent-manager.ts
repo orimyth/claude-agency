@@ -37,13 +37,27 @@ function selectTaskModel(agentId: string, task: { title: string; description: st
   return MODEL_SONNET;
 }
 
-function selectChatModel(agentId: string, context?: string): string {
-  // CEO investor chats need nuance — Sonnet
+/** Baseline chat model selection (before adaptive promotion) */
+function baselineChatModel(agentId: string): string {
   if (agentId === 'ceo') return MODEL_SONNET;
-  // HR chat (may need to generate blueprints) — Sonnet
   if (agentId === 'hr') return MODEL_SONNET;
-  // All other chat (status updates, acknowledgments) — Haiku
   return MODEL_HAIKU;
+}
+
+/** Promote a model one tier up */
+function promoteModel(model: string): string {
+  if (model === MODEL_HAIKU) return MODEL_SONNET;
+  if (model === MODEL_SONNET) return MODEL_OPUS;
+  return MODEL_OPUS;
+}
+
+export interface UsageSnapshot {
+  agentId: string;
+  taskId: string | null;
+  costUsd: number;
+  inputTokens: number;
+  outputTokens: number;
+  model: string | null;
 }
 
 export interface AgentEvents {
@@ -54,6 +68,7 @@ export interface AgentEvents {
   breakEnded: (agentId: string) => void;
   error: (agentId: string, error: Error) => void;
   needsApproval: (agentId: string, title: string, description: string) => void;
+  usageUpdate: (snapshot: UsageSnapshot) => void;
 }
 
 export class AgentManager extends EventEmitter {
@@ -70,12 +85,45 @@ export class AgentManager extends EventEmitter {
   private languageOverride: string | null = null;
   private memoryManager: MemoryManager | null = null;
   private toolHandler: AgentToolHandler | null = null;
+  /** Track consecutive chat failures per agent for adaptive model promotion */
+  private chatFailures: Map<string, number> = new Map();
+  /** Track last activity time per agent for idle session recycling */
+  private lastActivityAt: Map<string, number> = new Map();
+  /** Idle session recycling interval */
+  private idleRecycleTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(store: StateStore, permissions: PermissionEngine, config: AgencyConfig) {
     super();
     this.store = store;
     this.permissions = permissions;
     this.config = config;
+
+    // Recycle idle agent sessions every 10 min to free resources
+    this.idleRecycleTimer = setInterval(() => this.recycleIdleSessions(), 10 * 60_000);
+  }
+
+  /**
+   * Drop SDK sessions for agents idle >30 min to free server-side resources.
+   */
+  private recycleIdleSessions(): void {
+    const now = Date.now();
+    const IDLE_THRESHOLD_MS = 30 * 60_000;
+
+    for (const [agentId, lastActive] of this.lastActivityAt.entries()) {
+      if (now - lastActive > IDLE_THRESHOLD_MS && !this.activeSessions.has(agentId)) {
+        // Drop both task and chat sessions
+        if (this.agentSessionIds.has(agentId)) {
+          this.agentSessionIds.delete(agentId);
+          console.log(`[IdleRecycle] Dropped task session for ${agentId} (idle ${Math.round((now - lastActive) / 60_000)} min)`);
+        }
+        // Drop all chat sessions for this agent
+        for (const key of this.chatSessionIds.keys()) {
+          if (key.startsWith(`${agentId}:`)) {
+            this.chatSessionIds.delete(key);
+          }
+        }
+      }
+    }
   }
 
   setMemoryManager(mm: MemoryManager): void {
@@ -344,8 +392,9 @@ export class AgentManager extends EventEmitter {
       this.emit('message', blueprint.id, channel, summary);
       this.emit('taskComplete', blueprint.id, task.id, resultText);
 
-      // Record usage
+      // Record usage + broadcast to dashboard
       if (lastResult) {
+        const usedModel = Object.keys(lastResult.modelUsage ?? {})[0] ?? null;
         await this.store.recordUsage({
           id: crypto.randomUUID(),
           agentId: blueprint.id,
@@ -357,9 +406,19 @@ export class AgentManager extends EventEmitter {
           costUsd: lastResult.total_cost_usd ?? 0,
           numTurns: lastResult.num_turns ?? 0,
           durationMs: lastResult.duration_ms ?? 0,
-          model: Object.keys(lastResult.modelUsage ?? {})[0] ?? null,
+          model: usedModel,
         });
+
+        this.emit('usageUpdate', {
+          agentId: blueprint.id,
+          taskId: task.id,
+          costUsd: lastResult.total_cost_usd ?? 0,
+          inputTokens: lastResult.usage?.input_tokens ?? 0,
+          outputTokens: lastResult.usage?.output_tokens ?? 0,
+          model: usedModel,
+        } satisfies UsageSnapshot);
       }
+      this.lastActivityAt.set(blueprint.id, Date.now());
 
       await this.store.updateTaskStatus(task.id, 'review');
       await this.store.updateAgentStatus(blueprint.id, 'idle');
@@ -537,8 +596,14 @@ export class AgentManager extends EventEmitter {
     // This means Alice's investor DM session stays separate from her #leadership chats.
     const sessionKey = `${agentId}:${channel}`;
     const existingChatSession = this.chatSessionIds.get(sessionKey);
+    // Adaptive model routing: promote tier if agent has consecutive failures
+    const failures = this.chatFailures.get(agentId) ?? 0;
+    let chatModel = baselineChatModel(agentId);
+    if (failures >= 2) chatModel = promoteModel(chatModel);
+    if (failures >= 4) chatModel = promoteModel(chatModel);
+
     const chatOptions: Record<string, any> = {
-      model: selectChatModel(agentId, context),
+      model: chatModel,
       customSystemPrompt: blueprint.systemPrompt,
       cwd: workDir,
       allowedTools: [],
@@ -557,11 +622,19 @@ export class AgentManager extends EventEmitter {
     for await (const msg of stream) {
       if (msg.type === 'result') {
         const r = msg as SDKResultMessage;
-        if (r.subtype === 'success') result = r.result;
+        if (r.subtype === 'success') {
+          result = r.result;
+          // Reset failure counter on success
+          this.chatFailures.delete(agentId);
+        } else {
+          // Track failure for adaptive promotion
+          this.chatFailures.set(agentId, (this.chatFailures.get(agentId) ?? 0) + 1);
+        }
         // Capture chat session ID for future resumption
         if ((r as any).sessionId) {
           this.chatSessionIds.set(sessionKey, (r as any).sessionId);
         }
+        const usedModel = Object.keys(r.modelUsage ?? {})[0] ?? null;
         try {
           await this.store.recordUsage({
             id: crypto.randomUUID(),
@@ -574,12 +647,23 @@ export class AgentManager extends EventEmitter {
             costUsd: r.total_cost_usd ?? 0,
             numTurns: r.num_turns ?? 0,
             durationMs: r.duration_ms ?? 0,
-            model: Object.keys(r.modelUsage ?? {})[0] ?? null,
+            model: usedModel,
           });
         } catch { /* non-critical */ }
+
+        // Broadcast usage to dashboard
+        this.emit('usageUpdate', {
+          agentId,
+          taskId: null,
+          costUsd: r.total_cost_usd ?? 0,
+          inputTokens: r.usage?.input_tokens ?? 0,
+          outputTokens: r.usage?.output_tokens ?? 0,
+          model: usedModel,
+        } satisfies UsageSnapshot);
       }
     }
 
+    this.lastActivityAt.set(agentId, Date.now());
     await this.store.updateAgentStatus(agentId, 'idle');
 
     return result || "hey, give me a sec";

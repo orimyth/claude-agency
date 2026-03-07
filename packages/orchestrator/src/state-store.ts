@@ -266,6 +266,33 @@ export class StateStore {
     );
   }
 
+  /**
+   * Batch-create multiple tasks in a single transaction.
+   * Much faster than sequential createTask() calls when PM creates 5+ tasks at once.
+   */
+  async createTasks(tasks: Task[]): Promise<void> {
+    if (tasks.length === 0) return;
+    if (tasks.length === 1) return this.createTask(tasks[0]);
+
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      for (const task of tasks) {
+        await conn.query(
+          `INSERT INTO tasks (id, title, description, status, project_id, assigned_to, created_by, parent_task_id, depends_on, priority)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [task.id, task.title, task.description, task.status, task.projectId, task.assignedTo, task.createdBy, task.parentTaskId, task.dependsOn, task.priority]
+        );
+      }
+      await conn.commit();
+    } catch (err) {
+      await conn.rollback();
+      throw err;
+    } finally {
+      conn.release();
+    }
+  }
+
   async getTask(id: string): Promise<Task | null> {
     const [rows] = await this.pool.query<RowDataPacket[]>(
       'SELECT * FROM tasks WHERE id = ?', [id]
@@ -814,6 +841,74 @@ export class StateStore {
       model: r.model,
       recordedAt: new Date(r.recorded_at),
     }));
+  }
+
+  /**
+   * Aggregate cost by project — joins usage_log → tasks → projects.
+   */
+  async getCostByProject(): Promise<Array<{
+    projectId: string;
+    projectName: string;
+    totalCostUsd: number;
+    totalInputTokens: number;
+    totalOutputTokens: number;
+    sessions: number;
+  }>> {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      `SELECT
+        p.id as project_id,
+        p.name as project_name,
+        COALESCE(SUM(u.cost_usd), 0) as total_cost,
+        COALESCE(SUM(u.input_tokens), 0) as total_input,
+        COALESCE(SUM(u.output_tokens), 0) as total_output,
+        COUNT(u.id) as sessions
+      FROM projects p
+      LEFT JOIN tasks t ON t.project_id = p.id
+      LEFT JOIN usage_log u ON u.task_id = t.id
+      GROUP BY p.id, p.name
+      ORDER BY total_cost DESC`
+    );
+    return rows.map(r => ({
+      projectId: r.project_id,
+      projectName: r.project_name,
+      totalCostUsd: Number(r.total_cost),
+      totalInputTokens: Number(r.total_input),
+      totalOutputTokens: Number(r.total_output),
+      sessions: Number(r.sessions),
+    }));
+  }
+
+  /**
+   * Prune expired memories and old low-importance entries.
+   * Returns number of entries pruned.
+   */
+  async pruneMemories(maxAgeDays = 30, minImportance = 2): Promise<number> {
+    // Delete expired entries
+    const [expired] = await this.pool.query<ResultSetHeader>(
+      `DELETE FROM memories WHERE expires_at IS NOT NULL AND expires_at < NOW()`
+    );
+    // Delete old low-importance entries that aren't summaries
+    const [old] = await this.pool.query<ResultSetHeader>(
+      `DELETE FROM memories WHERE type != 'summary' AND importance <= ? AND created_at < DATE_SUB(NOW(), INTERVAL ? DAY) AND superseded_by IS NULL`,
+      [minImportance, maxAgeDays]
+    );
+    return (expired.affectedRows ?? 0) + (old.affectedRows ?? 0);
+  }
+
+  /**
+   * Count QA fix cycles for a task chain to prevent infinite loops.
+   * Walks the dependsOn chain backwards counting "Fix bugs:" tasks.
+   */
+  async countFixCycles(taskId: string, maxDepth = 10): Promise<number> {
+    let count = 0;
+    let currentId: string | null = taskId;
+    for (let i = 0; i < maxDepth && currentId; i++) {
+      const task = await this.getTask(currentId);
+      if (!task) break;
+      if (task.title.startsWith('Fix bugs:')) count++;
+      currentId = task.dependsOn;
+    }
+    return count;
   }
 
   // Settings

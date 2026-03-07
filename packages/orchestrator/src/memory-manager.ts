@@ -249,4 +249,16 @@ export class MemoryManager {
   async getAll(scope?: string) {
     return this.store.getAllMemories(scope);
   }
+
+  /**
+   * Prune stale memories: expired entries + old low-importance entries.
+   * Called periodically by the scheduler.
+   */
+  async prune(maxAgeDays = 30, minImportance = 2): Promise<number> {
+    const pruned = await this.store.pruneMemories(maxAgeDays, minImportance);
+    if (pruned > 0) {
+      console.log(`[Memory] Pruned ${pruned} stale entries (>${maxAgeDays}d, importance<=${minImportance})`);
+    }
+    return pruned;
+  }
 }
