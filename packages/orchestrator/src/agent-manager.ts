@@ -12,13 +12,39 @@ import { sdkEnv } from './sdk-util.js';
 /** Roles that get agency management tools (can create projects, tasks, etc.) */
 const MANAGEMENT_ROLES = new Set(['ceo', 'pm', 'architect', 'hr']);
 
-/** Best model for complex task execution (coding, architecture, planning). */
-const TASK_MODEL = 'claude-opus-4-6';
-/** Mid-tier model for conversational responses (chat, agent-to-agent). */
-const CHAT_MODEL = 'claude-sonnet-4-6';
+/** Model tiers for smart routing */
+const MODEL_OPUS = 'claude-opus-4-6';
+const MODEL_SONNET = 'claude-sonnet-4-6';
+const MODEL_HAIKU = 'claude-haiku-4-5-20251001';
 
 /** Worker roles that only get git push/repo listing APIs */
 const WORKER_ROLES = new Set(['developer', 'frontend-developer', 'backend-developer', 'designer']);
+
+/**
+ * Smart model routing — pick the cheapest model that can handle the task.
+ * - Opus: complex coding, architecture, multi-step tasks
+ * - Sonnet: management tasks (PM planning, CEO investor chats)
+ * - Haiku: simple chat, status updates, acknowledgments
+ */
+function selectTaskModel(agentId: string, task: { title: string; description: string }): string {
+  // Architect tasks need deep reasoning
+  if (agentId === 'architect') return MODEL_OPUS;
+  // Developer/QA tasks involve coding — use Opus
+  if (WORKER_ROLES.has(agentId) || agentId === 'qa' || agentId === 'security') return MODEL_OPUS;
+  // PM/CEO management tasks (creating projects, assigning) — Sonnet is sufficient
+  if (MANAGEMENT_ROLES.has(agentId)) return MODEL_SONNET;
+  // Default to Sonnet for unknown roles
+  return MODEL_SONNET;
+}
+
+function selectChatModel(agentId: string, context?: string): string {
+  // CEO investor chats need nuance — Sonnet
+  if (agentId === 'ceo') return MODEL_SONNET;
+  // HR chat (may need to generate blueprints) — Sonnet
+  if (agentId === 'hr') return MODEL_SONNET;
+  // All other chat (status updates, acknowledgments) — Haiku
+  return MODEL_HAIKU;
+}
 
 export interface AgentEvents {
   message: (agentId: string, channel: string, content: string) => void;
@@ -91,56 +117,36 @@ export class AgentManager extends EventEmitter {
   }
 
   /**
-   * Append API usage instructions to the system prompt based on role.
-   * Management roles get full API access; workers get git push only.
-   * These are static instructions that benefit from prompt caching.
+   * Build the system prompt: static role first (cacheable), then API docs, then language.
+   * Structured for maximum prompt caching: most-static content first, least-static last.
    */
   private enrichSystemPrompt(blueprint: AgentBlueprint): string {
     const apiUrl = `http://localhost:${this.config.wsPort + 1}`;
-    // Language instruction goes in system prompt so it's cached across all calls
+    const H = `-H 'Content-Type: application/json'`;
+    // Language instruction last — it can change via settings, so it should be after the cached prefix
     const langExtra = `\n\n${this.getLanguageInstruction()}`;
     let apiExtra = '';
 
     if (MANAGEMENT_ROLES.has(blueprint.id)) {
       apiExtra = [
-        `\n\n## Agency Management API`,
-        `You can manage projects, tasks, and repos via the Agency API using curl.`,
-        `Base URL: ${apiUrl}`,
-        ``,
-        `**Project management:**`,
-        `- Create project: curl -X POST ${apiUrl}/api/agency/projects -H 'Content-Type: application/json' -d '{"name":"...","description":"..."}'`,
-        `- List projects: curl ${apiUrl}/api/projects`,
-        `- Get project detail: curl ${apiUrl}/api/projects/{projectId}`,
-        ``,
-        `**Repository management:**`,
-        `- Add repo to project: curl -X POST ${apiUrl}/api/agency/repositories -H 'Content-Type: application/json' -d '{"projectId":"...","repoUrl":"https://github.com/..."}'`,
-        `- Clone repo locally: curl -X POST ${apiUrl}/api/agency/repositories/{repoId}/clone`,
-        `- List repos: curl ${apiUrl}/api/projects/{projectId}/repositories`,
-        ``,
-        `**Task management:**`,
-        `- Create & assign task: curl -X POST ${apiUrl}/api/agency/tasks -H 'Content-Type: application/json' -d '{"projectId":"...","title":"...","description":"...","assignTo":"developer","priority":7}'`,
-        `- Create task with dependency: add "dependsOn":"<taskId>" to make it wait for another task to finish first`,
-        `- List tasks: curl ${apiUrl}/api/tasks?projectId={id}`,
-        `- List agents: curl ${apiUrl}/api/agents`,
-        ``,
-        `**Git operations:**`,
-        `- Push changes (auto feature branch): curl -X POST ${apiUrl}/api/agency/repositories/{repoId}/push -H 'Content-Type: application/json' -d '{"commitMessage":"...","taskId":"..."}'`,
-        `- Merge feature branch to main (after QA passes): curl -X POST ${apiUrl}/api/agency/repositories/{repoId}/merge -H 'Content-Type: application/json' -d '{"featureBranch":"feature/..."}'`,
-        `Note: Push automatically creates a feature branch. Merge to main only after QA approves.`,
+        `\n\n## Agency API (use curl)`,
+        `Base: ${apiUrl}`,
+        `Projects: POST ${apiUrl}/api/agency/projects ${H} -d '{"name":"...","description":"..."}'`,
+        `  List: GET ${apiUrl}/api/projects | Detail: GET ${apiUrl}/api/projects/{id}`,
+        `Repos: POST ${apiUrl}/api/agency/repositories ${H} -d '{"projectId":"...","repoUrl":"..."}'`,
+        `  Clone: POST ${apiUrl}/api/agency/repositories/{id}/clone | List: GET ${apiUrl}/api/projects/{id}/repositories`,
+        `Tasks: POST ${apiUrl}/api/agency/tasks ${H} -d '{"projectId":"...","title":"...","description":"...","assignTo":"developer","priority":7}'`,
+        `  Dependencies: add "dependsOn":"<taskId>" | List: GET ${apiUrl}/api/tasks?projectId={id} | Agents: GET ${apiUrl}/api/agents`,
+        `Git: POST ${apiUrl}/api/agency/repositories/{id}/push ${H} -d '{"commitMessage":"...","taskId":"..."}'`,
+        `  Merge: POST ${apiUrl}/api/agency/repositories/{id}/merge ${H} -d '{"featureBranch":"feature/..."}'`,
+        `Push auto-creates feature branch. Merge only after QA passes.`,
       ].join('\n');
     } else if (WORKER_ROLES.has(blueprint.id)) {
       apiExtra = [
-        `\n\n## Git Push API`,
-        `After committing your changes locally, push them via the Agency API (do NOT use git push directly).`,
-        `The API auto-creates a feature branch so you never push to main.`,
-        ``,
-        `**Push changes:**`,
-        `curl -X POST ${apiUrl}/api/agency/repositories/{repoId}/push -H 'Content-Type: application/json' -d '{"commitMessage":"describe what you did","taskId":"<your-task-id>"}'`,
-        ``,
-        `**List repos (to find repoId):**`,
-        `curl ${apiUrl}/api/projects/{projectId}/repositories`,
-        ``,
-        `The repoId is shown in the Project Context in your task prompt. Use it directly.`,
+        `\n\n## Git Push API (do NOT use git push directly)`,
+        `Push: curl -X POST ${apiUrl}/api/agency/repositories/{repoId}/push ${H} -d '{"commitMessage":"...","taskId":"<your-task-id>"}'`,
+        `List repos: curl ${apiUrl}/api/projects/{projectId}/repositories`,
+        `repoId is in your Project Context. Push auto-creates feature branch.`,
       ].join('\n');
     }
 
@@ -236,7 +242,7 @@ export class AgentManager extends EventEmitter {
       const existingSession = this.agentSessionIds.get(blueprint.id);
 
       const queryOptions: Record<string, any> = {
-        model: TASK_MODEL,
+        model: selectTaskModel(blueprint.id, task),
         customSystemPrompt: blueprint.systemPrompt,
         cwd: workDir,
         allowedTools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep'],
@@ -261,6 +267,8 @@ export class AgentManager extends EventEmitter {
       let lastResult: SDKResultMessage | null = null;
       const startTime = Date.now();
       let lastProgressAt = startTime;
+      let cumulativeCost = 0;
+      const costBudget = this.config.maxCostPerTask;
 
       for await (const message of stream) {
         // Only emit progress if agent has been working for 15+ min since last update
@@ -285,6 +293,17 @@ export class AgentManager extends EventEmitter {
           // Capture session ID for future resumption
           if ((resultMsg as any).sessionId) {
             this.agentSessionIds.set(blueprint.id, (resultMsg as any).sessionId);
+          }
+
+          // Token budget circuit breaker — abort if task exceeds cost limit
+          cumulativeCost = resultMsg.total_cost_usd ?? 0;
+          if (cumulativeCost >= costBudget) {
+            abortController.abort();
+            const channel = task.projectId ? `project-${task.projectId}` : 'general';
+            this.emit('message', blueprint.id, channel,
+              `budget exceeded ($${cumulativeCost.toFixed(2)} / $${costBudget.toFixed(2)} limit) — stopping task`);
+            console.warn(`[Budget] ${blueprint.name} exceeded $${costBudget} on task "${task.title}" ($${cumulativeCost.toFixed(2)})`);
+            break;
           }
         }
       }
@@ -519,7 +538,7 @@ export class AgentManager extends EventEmitter {
     const sessionKey = `${agentId}:${channel}`;
     const existingChatSession = this.chatSessionIds.get(sessionKey);
     const chatOptions: Record<string, any> = {
-      model: CHAT_MODEL,
+      model: selectChatModel(agentId, context),
       customSystemPrompt: blueprint.systemPrompt,
       cwd: workDir,
       allowedTools: [],

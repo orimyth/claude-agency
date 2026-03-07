@@ -261,7 +261,7 @@ export class Agency {
               `Original task description: ${task.description?.slice(0, 500) ?? 'N/A'}`,
               ``,
               // Include the developer's own summary so QA knows what was actually done
-              resultText ? `## Developer's Summary\n${resultText.slice(0, 800)}\n` : '',
+              resultText ? `## Developer's Summary\n${resultText.slice(0, 400)}\n` : '',
               `Your job:`,
               `1. Check the code that was written/changed`,
               `2. Try to build/run the project — does it start without errors?`,
@@ -311,7 +311,7 @@ export class Agency {
           if (depTask.assignedTo && this.agentManager.getBlueprint(depTask.assignedTo)) {
             // Enrich dependent task with predecessor context
             if (resultText) {
-              const predecessorSummary = `\n\n## Predecessor Task Result\n**"${cleanTitle}"** completed by ${this.agentManager.getBlueprint(agentId)?.name ?? agentId}:\n${resultText.slice(0, 800)}`;
+              const predecessorSummary = `\n\n## Predecessor Task Result\n**"${cleanTitle}"** completed by ${this.agentManager.getBlueprint(agentId)?.name ?? agentId}:\n${resultText.slice(0, 400)}`;
               depTask.description = (depTask.description ?? '') + predecessorSummary;
               await this.store.updateTaskDescription(depTask.id, depTask.description);
             }
@@ -393,22 +393,21 @@ export class Agency {
     this.scheduler.on('statusReport', async (data: any) => {
       const { summary, activeDetails, blockedTasks } = data;
 
-      // Have the CEO generate a natural status report
+      // Template-based status report — eliminates a Sonnet call every ~15 min
       try {
-        const context = [
-          `You are Alice, the CEO. Generate a brief team status update for the #agency-general Slack channel.`,
-          ``,
-          `Current status:`,
-          `- ${summary.activeAgents} agents working, ${summary.idleAgents} idle, ${summary.onBreakAgents} on break`,
-          `- ${summary.tasksInProgress} tasks in progress, ${summary.tasksCompleted} completed, ${summary.tasksPending} pending`,
-          summary.tasksBlocked > 0 ? `- ${summary.tasksBlocked} BLOCKED tasks that need attention` : '',
-          activeDetails.length > 0 ? `- Currently working: ${activeDetails.map((a: any) => a.name).join(', ')}` : '- Nobody working right now',
-          blockedTasks.length > 0 ? `- Blocked: ${blockedTasks.map((t: any) => t.title).join(', ')}` : '',
-          ``,
-          `Write a casual 2-4 sentence Slack update. Be like a real CEO checking in. If everything is quiet, keep it very short. If there are blocked tasks, flag them. Only output the message itself, nothing else.`,
-        ].filter(Boolean).join('\n');
-
-        const report = await this.agentManager.chat('ceo', '', context, 'status-reports');
+        const parts: string[] = [];
+        const working = activeDetails.map((a: any) => a.name).join(', ');
+        if (summary.activeAgents > 0) {
+          parts.push(`${working} ${summary.activeAgents === 1 ? 'is' : 'are'} on it`);
+        } else {
+          parts.push(`team is idle right now`);
+        }
+        parts.push(`${summary.tasksInProgress} in progress, ${summary.tasksCompleted} done, ${summary.tasksPending} queued`);
+        if (summary.tasksBlocked > 0) {
+          const blocked = blockedTasks.map((t: any) => t.title).join(', ');
+          parts.push(`heads up: ${summary.tasksBlocked} blocked — ${blocked}`);
+        }
+        const report = parts.join('. ');
         if (this.slack) {
           const ceoBp = this.agentManager.getBlueprint('ceo');
           await this.slack.sendAgentMessage('agency-general', 'Alice', 'CEO', report, ceoBp?.avatar);
@@ -441,7 +440,7 @@ export class Agency {
         });
 
         // Build conversation history for context (limit to 5 for efficiency)
-        const recentMessages = await this.store.getChannelMessages('ceo-investor', 5);
+        const recentMessages = await this.store.getChannelMessages('ceo-investor', 3);
         const history = recentMessages
           .map(m => `${m.fromAgentId === 'investor' ? 'Investor' : 'Alice'}: ${m.content}`)
           .join('\n');
@@ -542,7 +541,7 @@ export class Agency {
         respondingAgents = msg.mentionedAgents;
       } else {
         // Check recent messages: if the investor was just talking to one agent, continue that conversation
-        const recentMsgs = await this.store.getChannelMessages(msg.channelName, 5);
+        const recentMsgs = await this.store.getChannelMessages(msg.channelName, 3);
         const recentAgentReplies = recentMsgs
           .filter(m => m.fromAgentId && m.fromAgentId !== 'investor')
           .map(m => m.fromAgentId!);
@@ -557,9 +556,9 @@ export class Agency {
         }
       }
 
-      // Build chat history (limit to 5 messages for token efficiency)
+      // Build chat history (limit to 3 messages for token efficiency)
       const slackChannel = msg.channelName;
-      const recentMessages = await this.store.getChannelMessages(slackChannel, 5);
+      const recentMessages = await this.store.getChannelMessages(slackChannel, 3);
       const history = recentMessages
         .map(m => {
           const sender = m.fromAgentId === 'investor' ? 'Investor' : (this.agentManager.getBlueprint(m.fromAgentId ?? '')?.name ?? m.fromAgentId);

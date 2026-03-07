@@ -135,4 +135,6 @@ export interface AgencyConfig {
   };
   dashboardPort: number;
   wsPort: number;
+  /** Max cost in USD per single task execution. Agent is aborted if exceeded. Default: 2.00 */
+  maxCostPerTask: number;
 }
