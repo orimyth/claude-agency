@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { useCommandPalette } from "@/components/command-palette";
 
 const NAV_ITEMS = [
   { href: "/", label: "Dashboard", icon: "grid" },
@@ -31,6 +32,7 @@ const ICONS: Record<string, string> = {
 
 export function Sidebar() {
   const pathname = usePathname();
+  const { open: openPalette } = useCommandPalette();
 
   return (
     <aside className="w-64 bg-gray-900 text-white min-h-screen p-4 flex flex-col">
@@ -38,6 +40,20 @@ export function Sidebar() {
         <h1 className="text-xl font-bold">Claude Agency</h1>
         <p className="text-gray-400 text-sm mt-1">Autonomous AI Company</p>
       </div>
+
+      {/* Search trigger */}
+      <button
+        onClick={openPalette}
+        className="flex items-center gap-2 px-3 py-2 mb-4 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-400 hover:text-gray-200 text-sm transition-colors border border-gray-700"
+      >
+        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+        </svg>
+        <span className="flex-1 text-left">Search...</span>
+        <kbd className="px-1.5 py-0.5 rounded bg-gray-700 border border-gray-600 text-[10px] font-mono text-gray-500">
+          &thinsp;K
+        </kbd>
+      </button>
 
       <nav className="flex-1 space-y-1">
         {NAV_ITEMS.map((item) => {
