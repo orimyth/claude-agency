@@ -7,22 +7,58 @@ import type { StateStore } from './state-store.js';
 import type { PermissionEngine } from './permission-engine.js';
 import type { MemoryManager } from './memory-manager.js';
 import type { AgentToolHandler } from './agent-tools.js';
-
-// Build an env with node's directory in PATH for the Claude Code SDK.
-const nodeDir = dirname(process.execPath);
-const sdkEnv: Record<string, string> = {};
-for (const [k, v] of Object.entries(process.env)) {
-  if (v !== undefined) sdkEnv[k] = v;
-}
-if (!sdkEnv.PATH?.includes(nodeDir)) {
-  sdkEnv.PATH = `${nodeDir}:${sdkEnv.PATH || ''}`;
-}
+import { sdkEnv } from './sdk-util.js';
 
 /** Roles that get agency management tools (can create projects, tasks, etc.) */
 const MANAGEMENT_ROLES = new Set(['ceo', 'pm', 'architect', 'hr']);
 
+/** Model tiers for smart routing */
+const MODEL_OPUS = 'claude-opus-4-6';
+const MODEL_SONNET = 'claude-sonnet-4-6';
+const MODEL_HAIKU = 'claude-haiku-4-5-20251001';
+
 /** Worker roles that only get git push/repo listing APIs */
 const WORKER_ROLES = new Set(['developer', 'frontend-developer', 'backend-developer', 'designer']);
+
+/**
+ * Smart model routing — pick the cheapest model that can handle the task.
+ * - Opus: complex coding, architecture, multi-step tasks
+ * - Sonnet: management tasks (PM planning, CEO investor chats)
+ * - Haiku: simple chat, status updates, acknowledgments
+ */
+function selectTaskModel(agentId: string, task: { title: string; description: string }): string {
+  // Architect tasks need deep reasoning
+  if (agentId === 'architect') return MODEL_OPUS;
+  // Developer/QA tasks involve coding — use Opus
+  if (WORKER_ROLES.has(agentId) || agentId === 'qa' || agentId === 'security') return MODEL_OPUS;
+  // PM/CEO management tasks (creating projects, assigning) — Sonnet is sufficient
+  if (MANAGEMENT_ROLES.has(agentId)) return MODEL_SONNET;
+  // Default to Sonnet for unknown roles
+  return MODEL_SONNET;
+}
+
+/** Baseline chat model selection (before adaptive promotion) */
+function baselineChatModel(agentId: string): string {
+  if (agentId === 'ceo') return MODEL_SONNET;
+  if (agentId === 'hr') return MODEL_SONNET;
+  return MODEL_HAIKU;
+}
+
+/** Promote a model one tier up */
+function promoteModel(model: string): string {
+  if (model === MODEL_HAIKU) return MODEL_SONNET;
+  if (model === MODEL_SONNET) return MODEL_OPUS;
+  return MODEL_OPUS;
+}
+
+export interface UsageSnapshot {
+  agentId: string;
+  taskId: string | null;
+  costUsd: number;
+  inputTokens: number;
+  outputTokens: number;
+  model: string | null;
+}
 
 export interface AgentEvents {
   message: (agentId: string, channel: string, content: string) => void;
@@ -32,6 +68,7 @@ export interface AgentEvents {
   breakEnded: (agentId: string) => void;
   error: (agentId: string, error: Error) => void;
   needsApproval: (agentId: string, title: string, description: string) => void;
+  usageUpdate: (snapshot: UsageSnapshot) => void;
 }
 
 export class AgentManager extends EventEmitter {
@@ -40,16 +77,57 @@ export class AgentManager extends EventEmitter {
   private config: AgencyConfig;
   private blueprints: Map<string, AgentBlueprint> = new Map();
   private activeSessions: Map<string, AbortController> = new Map();
+  /** Persistent session IDs per agent — allows resuming conversations instead of starting fresh. */
+  private agentSessionIds: Map<string, string> = new Map();
+  /** Persistent session IDs for chat, keyed by "agentId:channel" for isolation. */
+  private chatSessionIds: Map<string, string> = new Map();
   private activeCount = 0;
   private languageOverride: string | null = null;
   private memoryManager: MemoryManager | null = null;
   private toolHandler: AgentToolHandler | null = null;
+  /** Track consecutive chat failures per agent for adaptive model promotion */
+  private chatFailures: Map<string, number> = new Map();
+  /** Track last activity time per agent for idle session recycling */
+  private lastActivityAt: Map<string, number> = new Map();
+  /** Track task retry attempts: taskId → retryCount */
+  private taskRetries: Map<string, number> = new Map();
+  /** Max retries before marking task as blocked */
+  private static readonly MAX_TASK_RETRIES = 2;
+  /** Idle session recycling interval */
+  private idleRecycleTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(store: StateStore, permissions: PermissionEngine, config: AgencyConfig) {
     super();
     this.store = store;
     this.permissions = permissions;
     this.config = config;
+
+    // Recycle idle agent sessions every 10 min to free resources
+    this.idleRecycleTimer = setInterval(() => this.recycleIdleSessions(), 10 * 60_000);
+  }
+
+  /**
+   * Drop SDK sessions for agents idle >30 min to free server-side resources.
+   */
+  private recycleIdleSessions(): void {
+    const now = Date.now();
+    const IDLE_THRESHOLD_MS = 30 * 60_000;
+
+    for (const [agentId, lastActive] of this.lastActivityAt.entries()) {
+      if (now - lastActive > IDLE_THRESHOLD_MS && !this.activeSessions.has(agentId)) {
+        // Drop both task and chat sessions
+        if (this.agentSessionIds.has(agentId)) {
+          this.agentSessionIds.delete(agentId);
+          console.log(`[IdleRecycle] Dropped task session for ${agentId} (idle ${Math.round((now - lastActive) / 60_000)} min)`);
+        }
+        // Drop all chat sessions for this agent
+        for (const key of this.chatSessionIds.keys()) {
+          if (key.startsWith(`${agentId}:`)) {
+            this.chatSessionIds.delete(key);
+          }
+        }
+      }
+    }
   }
 
   setMemoryManager(mm: MemoryManager): void {
@@ -84,7 +162,47 @@ export class AgentManager extends EventEmitter {
   }
 
   registerBlueprint(blueprint: AgentBlueprint): void {
-    this.blueprints.set(blueprint.id, blueprint);
+    // Inject role-specific API instructions into the system prompt at registration time.
+    // This makes them cacheable by the SDK instead of re-sent as user tokens every task.
+    const enriched = { ...blueprint, systemPrompt: this.enrichSystemPrompt(blueprint) };
+    this.blueprints.set(enriched.id, enriched);
+  }
+
+  /**
+   * Build the system prompt: static role first (cacheable), then API docs, then language.
+   * Structured for maximum prompt caching: most-static content first, least-static last.
+   */
+  private enrichSystemPrompt(blueprint: AgentBlueprint): string {
+    const apiUrl = `http://localhost:${this.config.wsPort + 1}`;
+    const H = `-H 'Content-Type: application/json'`;
+    // Language instruction last — it can change via settings, so it should be after the cached prefix
+    const langExtra = `\n\n${this.getLanguageInstruction()}`;
+    let apiExtra = '';
+
+    if (MANAGEMENT_ROLES.has(blueprint.id)) {
+      apiExtra = [
+        `\n\n## Agency API (use curl)`,
+        `Base: ${apiUrl}`,
+        `Projects: POST ${apiUrl}/api/agency/projects ${H} -d '{"name":"...","description":"..."}'`,
+        `  List: GET ${apiUrl}/api/projects | Detail: GET ${apiUrl}/api/projects/{id}`,
+        `Repos: POST ${apiUrl}/api/agency/repositories ${H} -d '{"projectId":"...","repoUrl":"..."}'`,
+        `  Clone: POST ${apiUrl}/api/agency/repositories/{id}/clone | List: GET ${apiUrl}/api/projects/{id}/repositories`,
+        `Tasks: POST ${apiUrl}/api/agency/tasks ${H} -d '{"projectId":"...","title":"...","description":"...","assignTo":"developer","priority":7}'`,
+        `  Dependencies: add "dependsOn":"<taskId>" | List: GET ${apiUrl}/api/tasks?projectId={id} | Agents: GET ${apiUrl}/api/agents`,
+        `Git: POST ${apiUrl}/api/agency/repositories/{id}/push ${H} -d '{"commitMessage":"...","taskId":"..."}'`,
+        `  Merge: POST ${apiUrl}/api/agency/repositories/{id}/merge ${H} -d '{"featureBranch":"feature/..."}'`,
+        `Push auto-creates feature branch. Merge only after QA passes.`,
+      ].join('\n');
+    } else if (WORKER_ROLES.has(blueprint.id)) {
+      apiExtra = [
+        `\n\n## Git Push API (do NOT use git push directly)`,
+        `Push: curl -X POST ${apiUrl}/api/agency/repositories/{repoId}/push ${H} -d '{"commitMessage":"...","taskId":"<your-task-id>"}'`,
+        `List repos: curl ${apiUrl}/api/projects/{projectId}/repositories`,
+        `repoId is in your Project Context. Push auto-creates feature branch.`,
+      ].join('\n');
+    }
+
+    return blueprint.systemPrompt + langExtra + apiExtra;
   }
 
   getBlueprint(id: string): AgentBlueprint | undefined {
@@ -118,6 +236,13 @@ export class AgentManager extends EventEmitter {
 
     if (agent.status === 'on_break') {
       await this.store.updateTaskStatus(task.id, 'assigned', agentId);
+      return;
+    }
+
+    // Emergency pause — queue the task but don't start it
+    if (this.config.emergencyPause) {
+      await this.store.updateTaskStatus(task.id, 'assigned', agentId);
+      this.emit('message', agentId, 'system', `emergency pause active — task queued`);
       return;
     }
 
@@ -171,23 +296,38 @@ export class AgentManager extends EventEmitter {
     agentEnv.AGENCY_AGENT_ID = blueprint.id;
 
     try {
+      // Resume existing session if available — keeps context across tasks.
+      // This means the agent remembers previous work, decisions, and codebase knowledge.
+      const existingSession = this.agentSessionIds.get(blueprint.id);
+
+      const queryOptions: Record<string, any> = {
+        model: selectTaskModel(blueprint.id, task),
+        customSystemPrompt: blueprint.systemPrompt,
+        cwd: workDir,
+        allowedTools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep'],
+        abortController,
+        permissionMode: 'bypassPermissions',
+        maxTurns: 50,
+        env: agentEnv,
+      };
+
+      // If we have a previous session, resume it to maintain context
+      if (existingSession) {
+        queryOptions.sessionId = existingSession;
+        queryOptions.resume = true;
+      }
+
       const stream = query({
         prompt,
-        options: {
-          customSystemPrompt: blueprint.systemPrompt,
-          cwd: workDir,
-          allowedTools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep'],
-          abortController,
-          permissionMode: 'bypassPermissions',
-          maxTurns: 50,
-          env: agentEnv,
-        },
+        options: queryOptions,
       });
 
       let resultText = '';
       let lastResult: SDKResultMessage | null = null;
       const startTime = Date.now();
       let lastProgressAt = startTime;
+      let cumulativeCost = 0;
+      const costBudget = this.config.maxCostPerTask;
 
       for await (const message of stream) {
         // Only emit progress if agent has been working for 15+ min since last update
@@ -200,6 +340,8 @@ export class AgentManager extends EventEmitter {
             const channel = task.projectId ? `project-${task.projectId}` : 'general';
             this.emit('message', blueprint.id, channel,
               `still on it (${totalMins} min in)`);
+            // Auto-save progress note for long-running tasks
+            this.store.addTaskNote(task.id, blueprint.id, `Still working (${totalMins} min in)`).catch(() => {});
           }
         }
 
@@ -208,6 +350,21 @@ export class AgentManager extends EventEmitter {
           lastResult = resultMsg;
           if (resultMsg.subtype === 'success') {
             resultText = resultMsg.result;
+          }
+          // Capture session ID for future resumption
+          if ((resultMsg as any).sessionId) {
+            this.agentSessionIds.set(blueprint.id, (resultMsg as any).sessionId);
+          }
+
+          // Token budget circuit breaker — abort if task exceeds cost limit
+          cumulativeCost = resultMsg.total_cost_usd ?? 0;
+          if (cumulativeCost >= costBudget) {
+            abortController.abort();
+            const channel = task.projectId ? `project-${task.projectId}` : 'general';
+            this.emit('message', blueprint.id, channel,
+              `budget exceeded ($${cumulativeCost.toFixed(2)} / $${costBudget.toFixed(2)} limit) — stopping task`);
+            console.warn(`[Budget] ${blueprint.name} exceeded $${costBudget} on task "${task.title}" ($${cumulativeCost.toFixed(2)})`);
+            break;
           }
         }
       }
@@ -248,8 +405,9 @@ export class AgentManager extends EventEmitter {
       this.emit('message', blueprint.id, channel, summary);
       this.emit('taskComplete', blueprint.id, task.id, resultText);
 
-      // Record usage
+      // Record usage + broadcast to dashboard
       if (lastResult) {
+        const usedModel = Object.keys(lastResult.modelUsage ?? {})[0] ?? null;
         await this.store.recordUsage({
           id: crypto.randomUUID(),
           agentId: blueprint.id,
@@ -261,16 +419,27 @@ export class AgentManager extends EventEmitter {
           costUsd: lastResult.total_cost_usd ?? 0,
           numTurns: lastResult.num_turns ?? 0,
           durationMs: lastResult.duration_ms ?? 0,
-          model: Object.keys(lastResult.modelUsage ?? {})[0] ?? null,
+          model: usedModel,
         });
+
+        this.emit('usageUpdate', {
+          agentId: blueprint.id,
+          taskId: task.id,
+          costUsd: lastResult.total_cost_usd ?? 0,
+          inputTokens: lastResult.usage?.input_tokens ?? 0,
+          outputTokens: lastResult.usage?.output_tokens ?? 0,
+          model: usedModel,
+        } satisfies UsageSnapshot);
       }
+      this.lastActivityAt.set(blueprint.id, Date.now());
 
       await this.store.updateTaskStatus(task.id, 'review');
       await this.store.updateAgentStatus(blueprint.id, 'idle');
       await this.store.recordKPI(blueprint.id, 'tasks_completed', 1);
 
-      // Extract learnings
-      if (this.memoryManager && resultText) {
+      // Extract learnings — skip for QA reviews and short results (they're derivative, not worth the model call)
+      const isQAReview = task.title.startsWith('QA Review:') || task.title.startsWith('Fix bugs:');
+      if (this.memoryManager && resultText && resultText.length >= 100 && !isQAReview) {
         this.memoryManager.extractLearnings(blueprint.id, task.title, resultText, task.projectId)
           .catch(() => { /* non-critical */ });
       }
@@ -283,10 +452,29 @@ export class AgentManager extends EventEmitter {
       } else if (abortController.signal.aborted) {
         await this.store.updateAgentStatus(blueprint.id, 'paused');
       } else {
-        this.emit('error', blueprint.id, err);
-        this.emit('taskFailed', blueprint.id, task.id, err.message);
-        await this.store.updateTaskStatus(task.id, 'blocked');
-        await this.store.updateAgentStatus(blueprint.id, 'error');
+        // Retry with exponential backoff before giving up
+        const retryCount = this.taskRetries.get(task.id) ?? 0;
+        if (retryCount < AgentManager.MAX_TASK_RETRIES) {
+          this.taskRetries.set(task.id, retryCount + 1);
+          const backoffMs = Math.pow(2, retryCount) * 5000; // 5s, 10s
+          const channel = task.projectId ? `project-${task.projectId}` : 'general';
+          this.emit('message', blueprint.id, channel,
+            `hit an error, retrying in ${backoffMs / 1000}s (attempt ${retryCount + 2}/${AgentManager.MAX_TASK_RETRIES + 1})`);
+          await this.store.updateAgentStatus(blueprint.id, 'idle');
+          setTimeout(() => {
+            this.assignTask(blueprint.id, task).catch(retryErr => {
+              console.error(`[Retry] Failed retry for ${blueprint.id}: ${retryErr.message}`);
+            });
+          }, backoffMs);
+        } else {
+          // Exhausted retries — mark as blocked
+          this.taskRetries.delete(task.id);
+          this.emit('error', blueprint.id, err);
+          this.emit('taskFailed', blueprint.id, task.id, err.message);
+          await this.store.updateTaskStatus(task.id, 'blocked');
+          await this.store.updateAgentStatus(blueprint.id, 'error');
+          await this.store.recordKPI(blueprint.id, 'tasks_failed', 1);
+        }
       }
     } finally {
       this.activeSessions.delete(blueprint.id);
@@ -295,11 +483,8 @@ export class AgentManager extends EventEmitter {
   }
 
   private async buildTaskPrompt(blueprint: AgentBlueprint, task: Task): Promise<string> {
-    const parts = [
-      `You are ${blueprint.name}, the ${blueprint.role}.`,
-      this.getLanguageInstruction(),
-      ``,
-    ];
+    // Identity + language are already in the system prompt — don't repeat here.
+    const parts: string[] = [];
 
     // Inject organizational memory context
     if (this.memoryManager) {
@@ -332,99 +517,57 @@ export class AgentManager extends EventEmitter {
       } catch { /* non-critical */ }
     }
 
-    // Agency API instructions for management roles
-    if (MANAGEMENT_ROLES.has(blueprint.id)) {
-      const apiUrl = `http://localhost:${this.config.wsPort + 1}`;
-      parts.push(
-        `## Agency Management API`,
-        `You can manage projects, tasks, and repos via the Agency API using curl.`,
-        `Base URL: ${apiUrl}`,
-        ``,
-        `**Project management:**`,
-        `- Create project: curl -X POST ${apiUrl}/api/agency/projects -H 'Content-Type: application/json' -d '{"name":"...","description":"..."}'`,
-        `- List projects: curl ${apiUrl}/api/projects`,
-        `- Get project detail: curl ${apiUrl}/api/projects/{projectId}`,
-        ``,
-        `**Repository management:**`,
-        `- Add repo to project: curl -X POST ${apiUrl}/api/agency/repositories -H 'Content-Type: application/json' -d '{"projectId":"...","repoUrl":"https://github.com/..."}'`,
-        `- Clone repo locally: curl -X POST ${apiUrl}/api/agency/repositories/{repoId}/clone`,
-        `- List repos: curl ${apiUrl}/api/projects/{projectId}/repositories`,
-        ``,
-        `**Task management:**`,
-        `- Create & assign task: curl -X POST ${apiUrl}/api/agency/tasks -H 'Content-Type: application/json' -d '{"projectId":"...","title":"...","description":"...","assignTo":"developer","priority":7}'`,
-        `- Create task with dependency: add "dependsOn":"<taskId>" to make it wait for another task to finish first`,
-        `- List tasks: curl ${apiUrl}/api/tasks?projectId={id}`,
-        `- List agents: curl ${apiUrl}/api/agents`,
-        ``,
-        `**Git operations:**`,
-        `- Push changes (auto feature branch): curl -X POST ${apiUrl}/api/agency/repositories/{repoId}/push -H 'Content-Type: application/json' -d '{"commitMessage":"...","taskId":"..."}'`,
-        `- Merge feature branch to main (after QA passes): curl -X POST ${apiUrl}/api/agency/repositories/{repoId}/merge -H 'Content-Type: application/json' -d '{"featureBranch":"feature/..."}'`,
-        `Note: Push automatically creates a feature branch. Merge to main only after QA approves.`,
-        ``,
-        `When the investor gives you a project idea:`,
-        `1. Create a project via API`,
-        `2. If repos are mentioned, add and clone them via API`,
-        `3. Break down the work into tasks and assign to the right agents via API`,
-        ``,
-      );
+    // API instructions are now in the system prompt (cacheable) via enrichSystemPrompt().
+    // Only inject the task-specific taskId hint for workers so they know their task ID for git push.
+    if (WORKER_ROLES.has(blueprint.id) && task.id) {
+      parts.push(`**Your task ID for git push:** ${task.id}`, '');
     }
 
-    // Agency Git API instructions for worker roles (limited subset — push & list repos only)
-    if (WORKER_ROLES.has(blueprint.id)) {
-      const apiUrl = `http://localhost:${this.config.wsPort + 1}`;
-      parts.push(
-        `## Git Push API`,
-        `After committing your changes locally, push them via the Agency API (do NOT use git push directly).`,
-        `The API auto-creates a feature branch so you never push to main.`,
-        ``,
-        `**Push changes:**`,
-        `\`\`\``,
-        `curl -X POST ${apiUrl}/api/agency/repositories/{repoId}/push \\`,
-        `  -H 'Content-Type: application/json' \\`,
-        `  -d '{"commitMessage":"describe what you did","taskId":"${task.id}"}'`,
-        `\`\`\``,
-        ``,
-        `**List repos (to find repoId):**`,
-        `\`\`\``,
-        `curl ${apiUrl}/api/projects/{projectId}/repositories`,
-        `\`\`\``,
-        ``,
-        `The repoId is shown in the Project Context above. Use it directly.`,
-        ``,
-      );
-    }
-
-    // Inject active sibling tasks for context isolation
+    // Inject sibling task titles for context isolation (limit to 5 to save tokens)
     if (task.projectId) {
       try {
         const projectTasks = await this.store.getTasksByProject(task.projectId);
         const siblingTasks = projectTasks.filter(t =>
           t.id !== task.id && t.assignedTo && t.assignedTo !== blueprint.id &&
           ['assigned', 'in_progress'].includes(t.status)
-        );
+        ).slice(0, 5);
         if (siblingTasks.length > 0) {
-          parts.push(`## Other Active Tasks (DO NOT work on these — other agents handle them)`);
-          for (const st of siblingTasks) {
-            const assigneeBp = this.blueprints.get(st.assignedTo!);
-            const assigneeName = assigneeBp ? `${assigneeBp.name} (${assigneeBp.role})` : st.assignedTo;
-            parts.push(`- "${st.title}" → assigned to ${assigneeName}`);
-          }
-          parts.push(`Only work on YOUR task below. Do not duplicate work from the tasks above.`);
-          parts.push('');
+          const siblings = siblingTasks.map(st => `"${st.title}" (${st.assignedTo})`).join(', ');
+          parts.push(`**Other active tasks (don't touch):** ${siblings}`, '');
         }
       } catch { /* non-critical */ }
     }
 
+    // Inject progress notes from previous attempts (if any)
+    try {
+      const notes = await this.store.getTaskNotes(task.id);
+      if (notes.length > 0) {
+        parts.push(`## Previous Progress Notes`);
+        for (const note of notes.slice(-5)) { // last 5 notes
+          const who = this.blueprints.get(note.agentId)?.name ?? note.agentId;
+          parts.push(`- ${who}: ${note.content.slice(0, 200)}`);
+        }
+        parts.push('');
+      }
+    } catch { /* non-critical */ }
+
+    // Cap description to avoid bloated prompts from long predecessor results / QA reports
+    const cappedDescription = task.description.length > 2000
+      ? task.description.slice(0, 2000) + '\n[...truncated]'
+      : task.description;
+
+    // Deadline awareness
+    const deadlineNote = task.deadline
+      ? `\n**Deadline:** ${task.deadline.toISOString()} — prioritize accordingly.`
+      : '';
+
     parts.push(
       `## Current Task`,
       `**${task.title}**`,
-      task.description,
+      cappedDescription,
+      deadlineNote,
       ``,
-      `## Instructions`,
-      `- Complete this task autonomously`,
-      `- BEFORE saying done: build the project, run tests, verify it actually works`,
-      `- When done, summarize what you did and how you verified it. Plain text only, no markdown, no bold, no headers — write like a Slack message`,
-      `- If you're blocked, say exactly what you need`,
+      `Complete this task autonomously. Build/test/verify before saying done. Summarize in plain text. If blocked, say what you need.`,
     );
 
     return parts.join('\n');
@@ -486,7 +629,7 @@ export class AgentManager extends EventEmitter {
    * Send a conversational message to an agent and get a response.
    * Unlike assignTask, this doesn't create tasks — it's for direct chat.
    */
-  async chat(agentId: string, message: string, context?: string): Promise<string> {
+  async chat(agentId: string, message: string, context?: string, channel = 'default'): Promise<string> {
     const blueprint = this.blueprints.get(agentId);
     if (!blueprint) throw new Error(`No blueprint for agent ${agentId}`);
 
@@ -495,29 +638,54 @@ export class AgentManager extends EventEmitter {
     // Mark agent as active while chatting
     await this.store.updateAgentStatus(agentId, 'active');
 
-    const langRule = this.getLanguageInstruction();
-
+    // Language instruction is in system prompt already (cached).
     const prompt = context
-      ? `${langRule}\n\n${context}`
-      : `${langRule}\n\nThe investor (your boss) just sent you this message on Slack:\n\n"${message}"\n\nRespond naturally. If they're asking you to build or do something, say you'll get the team on it. If it's casual chat, just be friendly and human. Keep it short — 1-3 sentences max, like a real Slack message.`;
+      ? context
+      : `The investor (your boss) just sent you this message on Slack:\n\n"${message}"\n\nRespond naturally. If they're asking you to build or do something, say you'll get the team on it. If it's casual chat, just be friendly and human. Keep it short — 1-3 sentences max, like a real Slack message.`;
 
-    const stream = query({
-      prompt,
-      options: {
-        customSystemPrompt: blueprint.systemPrompt,
-        cwd: workDir,
-        allowedTools: [],
-        maxTurns: 1,
-        permissionMode: 'bypassPermissions',
-        env: sdkEnv,
-      },
-    });
+    // Resume chat session if available — keyed by agent+channel for isolation.
+    // This means Alice's investor DM session stays separate from her #leadership chats.
+    const sessionKey = `${agentId}:${channel}`;
+    const existingChatSession = this.chatSessionIds.get(sessionKey);
+    // Adaptive model routing: promote tier if agent has consecutive failures
+    const failures = this.chatFailures.get(agentId) ?? 0;
+    let chatModel = baselineChatModel(agentId);
+    if (failures >= 2) chatModel = promoteModel(chatModel);
+    if (failures >= 4) chatModel = promoteModel(chatModel);
+
+    const chatOptions: Record<string, any> = {
+      model: chatModel,
+      customSystemPrompt: blueprint.systemPrompt,
+      cwd: workDir,
+      allowedTools: [],
+      maxTurns: 1,
+      permissionMode: 'bypassPermissions',
+      env: sdkEnv,
+    };
+    if (existingChatSession) {
+      chatOptions.sessionId = existingChatSession;
+      chatOptions.resume = true;
+    }
+
+    const stream = query({ prompt, options: chatOptions });
 
     let result = '';
     for await (const msg of stream) {
       if (msg.type === 'result') {
         const r = msg as SDKResultMessage;
-        if (r.subtype === 'success') result = r.result;
+        if (r.subtype === 'success') {
+          result = r.result;
+          // Reset failure counter on success
+          this.chatFailures.delete(agentId);
+        } else {
+          // Track failure for adaptive promotion
+          this.chatFailures.set(agentId, (this.chatFailures.get(agentId) ?? 0) + 1);
+        }
+        // Capture chat session ID for future resumption
+        if ((r as any).sessionId) {
+          this.chatSessionIds.set(sessionKey, (r as any).sessionId);
+        }
+        const usedModel = Object.keys(r.modelUsage ?? {})[0] ?? null;
         try {
           await this.store.recordUsage({
             id: crypto.randomUUID(),
@@ -530,12 +698,23 @@ export class AgentManager extends EventEmitter {
             costUsd: r.total_cost_usd ?? 0,
             numTurns: r.num_turns ?? 0,
             durationMs: r.duration_ms ?? 0,
-            model: Object.keys(r.modelUsage ?? {})[0] ?? null,
+            model: usedModel,
           });
         } catch { /* non-critical */ }
+
+        // Broadcast usage to dashboard
+        this.emit('usageUpdate', {
+          agentId,
+          taskId: null,
+          costUsd: r.total_cost_usd ?? 0,
+          inputTokens: r.usage?.input_tokens ?? 0,
+          outputTokens: r.usage?.output_tokens ?? 0,
+          model: usedModel,
+        } satisfies UsageSnapshot);
       }
     }
 
+    this.lastActivityAt.set(agentId, Date.now());
     await this.store.updateAgentStatus(agentId, 'idle');
 
     return result || "hey, give me a sec";
@@ -561,7 +740,7 @@ export class AgentManager extends EventEmitter {
       `Respond naturally as ${to.name}. Keep it short — 1-3 sentences, like a real Slack message. Only respond with your message.`,
     ].join('\n');
 
-    const response = await this.chat(toId, message, context);
+    const response = await this.chat(toId, message, context, channel);
     this.emit('message', toId, channel, response);
     return response;
   }
@@ -590,6 +769,7 @@ export class AgentManager extends EventEmitter {
       parentTaskId: null,
       dependsOn: null,
       priority: 5,
+      deadline: null,
       createdAt: new Date(),
       updatedAt: new Date(),
     };
@@ -598,7 +778,76 @@ export class AgentManager extends EventEmitter {
     await this.assignTask(toId, task);
   }
 
+  /**
+   * Send a notification message from one agent to a channel without invoking Claude.
+   * Use this for status updates that don't need an AI-generated response.
+   * Saves a full model call compared to agentToAgentChat().
+   */
+  notify(fromId: string, channel: string, message: string): void {
+    this.emit('message', fromId, channel, message);
+  }
+
+  /**
+   * Emergency pause — abort all active agents and prevent new tasks from starting.
+   */
+  async pauseAll(): Promise<number> {
+    this.config.emergencyPause = true;
+    let aborted = 0;
+    for (const [agentId, controller] of this.activeSessions.entries()) {
+      controller.abort();
+      await this.store.updateAgentStatus(agentId, 'paused');
+      aborted++;
+    }
+    console.log(`[EmergencyPause] Paused ${aborted} active agents`);
+    return aborted;
+  }
+
+  /**
+   * Resume from emergency pause — allow agents to pick up queued tasks.
+   */
+  async resumeAll(): Promise<void> {
+    this.config.emergencyPause = false;
+    const agents = await this.store.getAllAgents();
+    for (const agent of agents) {
+      if (agent.status === 'paused') {
+        await this.store.updateAgentStatus(agent.id, 'idle');
+        this.pickUpNextTask(agent.id).catch(() => {});
+      }
+    }
+    console.log(`[EmergencyPause] Resumed all agents`);
+  }
+
   getActiveCount(): number {
     return this.activeCount;
+  }
+
+  isEmergencyPaused(): boolean {
+    return this.config.emergencyPause;
+  }
+
+  /**
+   * Gracefully shut down: clear timers, abort active sessions, wait for in-flight work.
+   */
+  async shutdown(): Promise<void> {
+    // Stop idle recycling timer
+    if (this.idleRecycleTimer) {
+      clearInterval(this.idleRecycleTimer);
+      this.idleRecycleTimer = null;
+    }
+
+    // Abort all active agent sessions
+    if (this.activeSessions.size > 0) {
+      console.log(`[Shutdown] Aborting ${this.activeSessions.size} active agent session(s)...`);
+      for (const [agentId, controller] of this.activeSessions) {
+        console.log(`[Shutdown] Aborting session for ${agentId}`);
+        controller.abort();
+      }
+      // Give sessions a moment to clean up
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      this.activeSessions.clear();
+    }
+
+    this.activeCount = 0;
+    console.log('[Shutdown] Agent manager stopped');
   }
 }

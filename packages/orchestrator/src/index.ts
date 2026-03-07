@@ -13,22 +13,15 @@ import { DashboardWSServer } from './ws-server.js';
 import { MemoryManager } from './memory-manager.js';
 import { AgentToolHandler } from './agent-tools.js';
 import { APIServer } from './api-server.js';
-import { query, type SDKResultMessage } from '@anthropic-ai/claude-code';
 import { SlackBridge, type InvestorMessage } from 'slack-bridge';
 import { dirname, resolve } from 'path';
 import { fileURLToPath } from 'url';
-
-// PATH fix for SDK calls in this module
-const _nodeDir = dirname(process.execPath);
-const _classifyEnv: Record<string, string> = {};
-for (const [k, v] of Object.entries(process.env)) {
-  if (v !== undefined) _classifyEnv[k] = v;
-}
-if (!_classifyEnv.PATH?.includes(_nodeDir)) {
-  _classifyEnv.PATH = `${_nodeDir}:${_classifyEnv.PATH || ''}`;
-}
+import { quickQuery } from './sdk-util.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
+/** Lightweight model for utility tasks (intent classification). */
+const UTILITY_MODEL = 'claude-haiku-4-5-20251001';
 
 export class Agency {
   private store: StateStore;
@@ -44,6 +37,12 @@ export class Agency {
   private toolHandler: AgentToolHandler;
   private apiServer: APIServer;
   private slack: SlackBridge | null = null;
+  /** Maps "channel:taskTitle" → Slack thread_ts for threaded replies */
+  private taskThreads: Map<string, string> = new Map();
+  /** Webhook delivery queue — fire-and-forget */
+  private webhookQueue: Array<{ event: string; data: any }> = [];
+  /** Background loop timer handles for cleanup on shutdown */
+  private backgroundTimers: ReturnType<typeof setInterval>[] = [];
 
   constructor() {
     this.store = new StateStore(agencyConfig.mysql);
@@ -124,6 +123,12 @@ export class Agency {
     this.setupSchedulerEvents();
     console.log('Scheduler started');
 
+    // Register all background loops with tracked timers for clean shutdown
+    this.registerBackgroundLoops();
+
+    // Seed default task templates
+    await this.seedTaskTemplates();
+
     // Wire project creation → Slack channel creation
     this.toolHandler.setOnProjectCreated(async (projectId: string, projectName: string) => {
       if (this.slack) {
@@ -135,6 +140,7 @@ export class Agency {
     // Start API server
     this.apiServer.setMemoryManager(this.memoryManager);
     this.apiServer.setToolHandler(this.toolHandler);
+    this.apiServer.setWSServer(this.wsServer);
     this.apiServer.setOnSettingsChanged(() => this.loadSettings());
     this.apiServer.start(agencyConfig.wsPort + 1);
 
@@ -156,12 +162,19 @@ export class Agency {
         timestamp: new Date(),
       });
 
-      // Forward to Slack
+      // Forward to Slack with threading support
       if (this.slack) {
         const blueprint = this.agentManager.getBlueprint(agentId);
         if (blueprint) {
           const slackChannel = this.mapToSlackChannel(channel);
-          await this.slack.sendAgentMessage(slackChannel, blueprint.name, blueprint.role, content, blueprint.avatar);
+          // Check if there's an existing thread for this channel+agent combo
+          const threadKey = `${channel}:${agentId}`;
+          const threadTs = this.taskThreads.get(threadKey);
+          const messageTs = await this.slack.sendAgentMessage(slackChannel, blueprint.name, blueprint.role, content, blueprint.avatar, threadTs);
+          // If this is a new message (no thread yet), start a thread for follow-ups
+          if (!threadTs && messageTs && content.includes('picking up')) {
+            this.taskThreads.set(threadKey, messageTs);
+          }
         }
       }
 
@@ -173,6 +186,9 @@ export class Agency {
 
     this.agentManager.on('taskComplete', async (agentId: string, taskId: string, resultText?: string) => {
       this.wsServer.broadcast('task:update', { agentId, taskId, status: 'review' });
+
+      // Fire webhook for task completion
+      this.fireWebhook('task:done', { agentId, taskId });
 
       const task = await this.store.getTask(taskId);
       if (!task) return;
@@ -186,14 +202,9 @@ export class Agency {
       // CEO Alice → reports to investor (if noteworthy)
 
       if (agentId === 'pm') {
-        // PM done → CEO gets status update
-        try {
-          await this.agentManager.agentToAgentChat(
-            agentId, 'ceo',
-            `done with "${cleanTitle}". team delivered, everything's in good shape`,
-            'leadership'
-          );
-        } catch { /* non-critical */ }
+        // PM done → CEO gets a simple notification (no Claude call needed)
+        this.agentManager.notify('pm', 'leadership',
+          `done with "${cleanTitle}". team delivered, everything's in good shape`);
       } else if (agentId === 'ceo') {
         // CEO completed something — no further escalation needed
       } else if (agentId === 'qa') {
@@ -207,12 +218,22 @@ export class Agency {
           qaResult.includes('ready to ship') || qaResult.includes('works as expected');
 
         if (hasBugs && !isPass) {
-          // QA found bugs → auto-create fix task for the original developer
+          // QA found bugs → auto-create fix task, but cap the loop
           try {
-            // Find the original task this QA was reviewing (via dependsOn)
             const originalTaskId = task.dependsOn;
             const originalTask = originalTaskId ? await this.store.getTask(originalTaskId) : null;
             const originalDev = originalTask?.assignedTo ?? 'developer';
+
+            // Cap QA→fix cycles at 3 to prevent infinite loops
+            const fixCycles = await this.store.countFixCycles(taskId);
+            if (fixCycles >= 3) {
+              const notifyChannel2 = task.projectId ? `project-${task.projectId}` : 'leadership';
+              this.agentManager.notify('qa', notifyChannel2,
+                `3 fix cycles on "${cleanTitle.replace('QA Review: ', '')}" — escalating to Diana for manual review`);
+              this.agentManager.notify('qa', 'leadership',
+                `repeated QA failures on "${cleanTitle.replace('QA Review: ', '')}". needs human or PM intervention`);
+              return;
+            }
 
             const fixTaskId = crypto.randomUUID();
             const fixTask = {
@@ -233,6 +254,7 @@ export class Agency {
               parentTaskId: task.parentTaskId,
               dependsOn: null as string | null,
               priority: Math.min(task.priority + 1, 10), // bump priority for fixes
+              deadline: null,
               createdAt: new Date(),
               updatedAt: new Date(),
             };
@@ -250,18 +272,115 @@ export class Agency {
             console.error(`[QA Fix Loop] Error: ${err.message}`);
           }
         } else {
-          // QA passed → notify PM, mark original task as done
+          // QA passed → create architect code review before final merge
+          this.agentManager.notify('qa', notifyChannel,
+            `QA passed for "${cleanTitle.replace('QA Review: ', '')}". sending to Charlie for code review`);
+
           try {
-            await this.agentManager.agentToAgentChat(
-              agentId, 'pm',
-              `QA passed for "${cleanTitle.replace('QA Review: ', '')}". tested and good to ship`,
-              notifyChannel
-            );
-            // Mark the original reviewed task as done
-            if (task.dependsOn) {
-              await this.store.updateTaskStatus(task.dependsOn, 'done');
+            const originalTaskId = task.dependsOn;
+            const originalTask = originalTaskId ? await this.store.getTask(originalTaskId) : null;
+
+            const reviewTaskId = crypto.randomUUID();
+            const reviewTask = {
+              id: reviewTaskId,
+              title: `Code Review: ${cleanTitle.replace('QA Review: ', '')}`,
+              description: [
+                `QA passed. Review the code changes for architecture, patterns, and quality.`,
+                ``,
+                originalTask ? `Original task: "${originalTask.title}" by ${originalTask.assignedTo}` : '',
+                resultText ? `## QA Report\n${resultText.slice(0, 400)}` : '',
+                ``,
+                `Check:`,
+                `1. Code follows established patterns and architecture`,
+                `2. No unnecessary complexity or over-engineering`,
+                `3. Proper error handling at system boundaries`,
+                `4. No security issues (injection, XSS, etc.)`,
+                `5. Good naming, clear intent`,
+                ``,
+                `If approved, mark as done. If changes needed, list them specifically.`,
+              ].filter(Boolean).join('\n'),
+              status: 'assigned' as const,
+              projectId: task.projectId,
+              assignedTo: 'architect',
+              createdBy: 'system',
+              parentTaskId: task.parentTaskId,
+              dependsOn: taskId,
+              priority: task.priority,
+              deadline: null,
+              createdAt: new Date(),
+              updatedAt: new Date(),
+            };
+            await this.store.createTask(reviewTask);
+            await this.agentManager.assignTask('architect', reviewTask);
+          } catch (err: any) {
+            console.error(`[Code Review] Failed to create review task: ${err.message}`);
+            // Fallback: mark original task as done directly
+            try {
+              if (task.dependsOn) {
+                await this.store.updateTaskStatus(task.dependsOn, 'done');
+              }
+            } catch { /* non-critical */ }
+          }
+        }
+      } else if (agentId === 'architect' && cleanTitle.startsWith('Code Review: ')) {
+        // Architect finished code review → check if approved
+        const reviewResult = (resultText ?? '').toLowerCase();
+        const approved = reviewResult.includes('approved') || reviewResult.includes('lgtm') ||
+          reviewResult.includes('looks good') || reviewResult.includes('good to merge') ||
+          reviewResult.includes('no issues');
+
+        const notifyChannel2 = task.projectId ? `project-${task.projectId}` : 'leadership';
+        if (approved) {
+          this.agentManager.notify('architect', notifyChannel2,
+            `code review approved: "${cleanTitle.replace('Code Review: ', '')}". merging`);
+          // Walk the dependency chain back to mark the original dev task as done
+          try {
+            let depId = task.dependsOn; // QA task
+            if (depId) {
+              const qaTask = await this.store.getTask(depId);
+              if (qaTask?.dependsOn) {
+                await this.store.updateTaskStatus(qaTask.dependsOn, 'done');
+              }
+              await this.store.updateTaskStatus(depId, 'done');
             }
           } catch { /* non-critical */ }
+        } else {
+          // Architect wants changes → send back to original dev
+          this.agentManager.notify('architect', notifyChannel2,
+            `code review needs changes: "${cleanTitle.replace('Code Review: ', '')}"`);
+          try {
+            const qaTaskId = task.dependsOn;
+            const qaTask = qaTaskId ? await this.store.getTask(qaTaskId) : null;
+            const originalTaskId = qaTask?.dependsOn;
+            const originalTask = originalTaskId ? await this.store.getTask(originalTaskId) : null;
+            if (originalTask?.assignedTo) {
+              const fixTaskId = crypto.randomUUID();
+              await this.store.createTask({
+                id: fixTaskId,
+                title: `Code review fixes: ${cleanTitle.replace('Code Review: ', '')}`,
+                description: [
+                  `Architect review requested changes:`,
+                  ``,
+                  resultText?.slice(0, 800) ?? 'See review feedback',
+                  ``,
+                  `Apply the requested changes, then verify build/test.`,
+                ].join('\n'),
+                status: 'assigned' as const,
+                projectId: task.projectId,
+                assignedTo: originalTask.assignedTo,
+                createdBy: 'architect',
+                parentTaskId: task.parentTaskId,
+                dependsOn: null,
+                priority: Math.min(task.priority + 1, 10),
+                deadline: null,
+                createdAt: new Date(),
+                updatedAt: new Date(),
+              });
+              this.agentManager.assignTask(originalTask.assignedTo, await this.store.getTask(fixTaskId) as any).catch(() => {});
+            }
+          } catch (err: any) {
+            console.error(`[Code Review] Failed to create fix task: ${err.message}`);
+          }
         }
       } else if (WORKER_ROLES.has(agentId) || WORKER_ROLES.has(agentId.replace(/-\d+$/, ''))) {
         // Worker done → auto-create QA review task
@@ -276,6 +395,8 @@ export class Agency {
               ``,
               `Original task description: ${task.description?.slice(0, 500) ?? 'N/A'}`,
               ``,
+              // Include the developer's own summary so QA knows what was actually done
+              resultText ? `## Developer's Summary\n${resultText.slice(0, 400)}\n` : '',
               `Your job:`,
               `1. Check the code that was written/changed`,
               `2. Try to build/run the project — does it start without errors?`,
@@ -286,7 +407,7 @@ export class Agency {
               ``,
               `If you find bugs, be specific: file, line, what's wrong, how to reproduce.`,
               `If everything is good, confirm it's ready to ship.`,
-            ].join('\n'),
+            ].filter(Boolean).join('\n'),
             status: 'assigned' as const,
             projectId: task.projectId,
             assignedTo: 'qa',
@@ -294,48 +415,45 @@ export class Agency {
             parentTaskId: task.parentTaskId,
             dependsOn: taskId,
             priority: task.priority,
+            deadline: null,
             createdAt: new Date(),
             updatedAt: new Date(),
           };
           await this.store.createTask(qaTask);
           await this.agentManager.assignTask('qa', qaTask);
 
-          // Notify PM that work is done and QA is reviewing
-          await this.agentManager.agentToAgentChat(
-            agentId, 'pm',
-            `finished "${cleanTitle}", sent to Nina for QA review`,
-            notifyChannel
-          );
+          // Simple notification to PM (no Claude call needed for status updates)
+          this.agentManager.notify(agentId, notifyChannel,
+            `finished "${cleanTitle}", sent to Nina for QA review`);
         } catch (err: any) {
           console.error(`[Auto QA] Failed to create QA task: ${err.message}`);
-          // Fallback: just notify PM directly
-          try {
-            await this.agentManager.agentToAgentChat(
-              agentId, 'pm',
-              `finished "${cleanTitle}", ready for review`,
-              notifyChannel
-            );
-          } catch { /* non-critical */ }
+          // Fallback: simple notification
+          const notifChannel = task.projectId ? `project-${task.projectId}` : 'leadership';
+          this.agentManager.notify(agentId, notifChannel,
+            `finished "${cleanTitle}", ready for review`);
         }
       } else {
-        // Any other agent → PM gets notified
+        // Any other agent → simple notification to PM
         const notifyChannel = task.projectId ? `project-${task.projectId}` : 'leadership';
-        try {
-          await this.agentManager.agentToAgentChat(
-            agentId, 'pm',
-            `finished "${cleanTitle}", ready for review`,
-            notifyChannel
-          );
-        } catch { /* non-critical */ }
+        this.agentManager.notify(agentId, notifyChannel,
+          `finished "${cleanTitle}", ready for review`);
       }
 
-      // Unblock dependent tasks now that this one is done
+      // Unblock dependent tasks now that this one is done.
+      // Inject predecessor's result summary so the next agent has context.
       try {
         const unblockedTasks = await this.store.getUnblockedTasks(taskId);
         for (const depTask of unblockedTasks) {
           if (depTask.assignedTo && this.agentManager.getBlueprint(depTask.assignedTo)) {
+            // Enrich dependent task with predecessor context
+            if (resultText) {
+              const predecessorSummary = `\n\n## Predecessor Task Result\n**"${cleanTitle}"** completed by ${this.agentManager.getBlueprint(agentId)?.name ?? agentId}:\n${resultText.slice(0, 400)}`;
+              depTask.description = (depTask.description ?? '') + predecessorSummary;
+              await this.store.updateTaskDescription(depTask.id, depTask.description);
+            }
+
             const depChannel = depTask.projectId ? `project-${depTask.projectId}` : 'general';
-            this.agentManager.emit('message', depTask.assignedTo, depChannel,
+            this.agentManager.notify(depTask.assignedTo, depChannel,
               `dependency "${cleanTitle}" is done, starting on "${depTask.title}"`);
             this.agentManager.assignTask(depTask.assignedTo, depTask).catch(err => {
               console.error(`[Unblock] Failed to assign ${depTask.id}: ${err.message}`);
@@ -350,12 +468,70 @@ export class Agency {
     this.agentManager.on('taskFailed', async (agentId: string, taskId: string, error: string) => {
       this.wsServer.broadcast('task:update', { agentId, taskId, status: 'blocked', error });
 
-      // Notify PM and CEO when a task is blocked
+      // Fire webhook for blocked task
+      this.fireWebhook('agent:blocked', { agentId, taskId, error: error.slice(0, 200) });
+
       const task = await this.store.getTask(taskId);
       const blueprint = this.agentManager.getBlueprint(agentId);
       if (task && blueprint) {
         const blockMsg = `blocked on "${task.title.replace('[Investor Idea] ', '')}": ${error.slice(0, 100)}`;
         this.agentManager.emit('message', agentId, 'general', blockMsg);
+
+        // --- Agent Handoff Protocol ---
+        // If a worker is blocked, try to find a relevant agent to help
+        const errorLower = error.toLowerCase();
+        let handoffTo: string | null = null;
+
+        if (errorLower.includes('api') || errorLower.includes('backend') || errorLower.includes('endpoint')) {
+          if (agentId !== 'backend-developer') handoffTo = 'backend-developer';
+        } else if (errorLower.includes('frontend') || errorLower.includes('ui') || errorLower.includes('component')) {
+          if (agentId !== 'frontend-developer') handoffTo = 'frontend-developer';
+        } else if (errorLower.includes('design') || errorLower.includes('layout') || errorLower.includes('css')) {
+          if (agentId !== 'designer') handoffTo = 'designer';
+        } else if (errorLower.includes('deploy') || errorLower.includes('docker') || errorLower.includes('ci')) {
+          handoffTo = 'devops';
+        } else if (errorLower.includes('security') || errorLower.includes('auth') || errorLower.includes('permission')) {
+          handoffTo = 'security';
+        } else if (errorLower.includes('architecture') || errorLower.includes('design decision')) {
+          handoffTo = 'architect';
+        }
+
+        if (handoffTo && this.agentManager.getBlueprint(handoffTo)) {
+          const channel = task.projectId ? `project-${task.projectId}` : 'general';
+          const handoffName = this.agentManager.getBlueprint(handoffTo)?.name ?? handoffTo;
+          this.agentManager.notify(agentId, channel,
+            `need help from ${handoffName} — ${error.slice(0, 80)}`);
+
+          // Create a handoff task for the helper agent
+          const handoffTaskId = crypto.randomUUID();
+          await this.store.createTask({
+            id: handoffTaskId,
+            title: `Help ${blueprint.name}: ${task.title.slice(0, 80)}`,
+            description: [
+              `${blueprint.name} (${blueprint.role}) is blocked on "${task.title}" and needs your help.`,
+              ``,
+              `Error: ${error.slice(0, 500)}`,
+              ``,
+              `Original task: ${task.description?.slice(0, 300) ?? 'N/A'}`,
+              ``,
+              `Help resolve the blocker. Focus only on what's needed to unblock them.`,
+            ].join('\n'),
+            status: 'assigned',
+            projectId: task.projectId,
+            assignedTo: handoffTo,
+            createdBy: agentId,
+            parentTaskId: task.id,
+            dependsOn: null,
+            priority: Math.min(task.priority + 1, 10),
+            deadline: null,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          });
+
+          this.agentManager.assignTask(handoffTo, await this.store.getTask(handoffTaskId) as any).catch(err => {
+            console.error(`[Handoff] Failed to assign help task: ${err.message}`);
+          });
+        }
       }
     });
 
@@ -370,6 +546,15 @@ export class Agency {
     this.agentManager.on('error', (agentId: string, error: Error) => {
       console.error(`[Agent ${agentId}] Error:`, error.message);
       this.wsServer.broadcast('agent:status', { agentId, status: 'error', error: error.message });
+    });
+
+    // Real-time cost broadcasting to dashboard
+    this.agentManager.on('usageUpdate', (snapshot: any) => {
+      this.wsServer.broadcast('usage:update', snapshot);
+      // Fire webhook if cost is high (>80% of budget per task)
+      if (snapshot.costUsd >= agencyConfig.maxCostPerTask * 0.8) {
+        this.fireWebhook('budget:warning', snapshot);
+      }
     });
   }
 
@@ -411,22 +596,21 @@ export class Agency {
     this.scheduler.on('statusReport', async (data: any) => {
       const { summary, activeDetails, blockedTasks } = data;
 
-      // Have the CEO generate a natural status report
+      // Template-based status report — eliminates a Sonnet call every ~15 min
       try {
-        const context = [
-          `You are Alice, the CEO. Generate a brief team status update for the #agency-general Slack channel.`,
-          ``,
-          `Current status:`,
-          `- ${summary.activeAgents} agents working, ${summary.idleAgents} idle, ${summary.onBreakAgents} on break`,
-          `- ${summary.tasksInProgress} tasks in progress, ${summary.tasksCompleted} completed, ${summary.tasksPending} pending`,
-          summary.tasksBlocked > 0 ? `- ${summary.tasksBlocked} BLOCKED tasks that need attention` : '',
-          activeDetails.length > 0 ? `- Currently working: ${activeDetails.map((a: any) => a.name).join(', ')}` : '- Nobody working right now',
-          blockedTasks.length > 0 ? `- Blocked: ${blockedTasks.map((t: any) => t.title).join(', ')}` : '',
-          ``,
-          `Write a casual 2-4 sentence Slack update. Be like a real CEO checking in. If everything is quiet, keep it very short. If there are blocked tasks, flag them. Only output the message itself, nothing else.`,
-        ].filter(Boolean).join('\n');
-
-        const report = await this.agentManager.chat('ceo', '', context);
+        const parts: string[] = [];
+        const working = activeDetails.map((a: any) => a.name).join(', ');
+        if (summary.activeAgents > 0) {
+          parts.push(`${working} ${summary.activeAgents === 1 ? 'is' : 'are'} on it`);
+        } else {
+          parts.push(`team is idle right now`);
+        }
+        parts.push(`${summary.tasksInProgress} in progress, ${summary.tasksCompleted} done, ${summary.tasksPending} queued`);
+        if (summary.tasksBlocked > 0) {
+          const blocked = blockedTasks.map((t: any) => t.title).join(', ');
+          parts.push(`heads up: ${summary.tasksBlocked} blocked — ${blocked}`);
+        }
+        const report = parts.join('. ');
         if (this.slack) {
           const ceoBp = this.agentManager.getBlueprint('ceo');
           await this.slack.sendAgentMessage('agency-general', 'Alice', 'CEO', report, ceoBp?.avatar);
@@ -458,18 +642,41 @@ export class Agency {
           channel: 'ceo-investor', content: msg.text, timestamp: new Date(),
         });
 
-        // Build conversation history for context
-        const recentMessages = await this.store.getChannelMessages('ceo-investor', 10);
+        // Build conversation history for context (limit to 5 for efficiency)
+        const recentMessages = await this.store.getChannelMessages('ceo-investor', 3);
         const history = recentMessages
           .map(m => `${m.fromAgentId === 'investor' ? 'Investor' : 'Alice'}: ${m.content}`)
           .join('\n');
 
-        // Alice always responds conversationally first
-        const chatContext = history
-          ? `Recent conversation:\n${history}\n\nInvestor says: "${msg.text}"\n\nRespond naturally as Alice the CEO. If they're giving you a task or project idea, acknowledge it and say you'll hand it to Diana (PM) and the team. If it's casual chat, just be friendly. Keep it short — 1-3 sentences, like a real Slack message. Only respond with your message, nothing else.`
-          : undefined;
+        // Combined call: Alice responds AND classifies intent in one query.
+        // Saves a full model call per investor message.
+        const combinedContext = [
+          history ? `Recent conversation:\n${history}\n` : '',
+          `Investor says: "${msg.text}"`,
+          ``,
+          `Respond naturally as Alice the CEO. If they're giving you a task or project idea, acknowledge it and say you'll hand it to Diana (PM) and the team. If it's casual chat, just be friendly. Keep it short — 1-3 sentences, like a real Slack message.`,
+          ``,
+          `IMPORTANT: After your response, add a newline then a JSON line classifying the intent:`,
+          `{"intent":"<project_idea|simple_task|hire_request|question|chat>","summary":"<1 sentence>"}`,
+          `The JSON must be on its own line at the very end.`,
+        ].filter(Boolean).join('\n');
 
-        const response = await this.agentManager.chat('ceo', msg.text, chatContext);
+        const rawResponse = await this.agentManager.chat('ceo', msg.text, combinedContext, 'ceo-investor');
+
+        // Parse combined response: split chat response from intent JSON
+        const jsonMatch = rawResponse.match(/\{[^{}]*"intent"\s*:\s*"[^"]*"[^{}]*\}\s*$/);
+        const response = jsonMatch
+          ? rawResponse.slice(0, rawResponse.lastIndexOf(jsonMatch[0])).trim()
+          : rawResponse.trim();
+
+        let intent: { type: string; summary: string } = { type: 'chat', summary: msg.text.slice(0, 100) };
+        if (jsonMatch) {
+          try {
+            const parsed = JSON.parse(jsonMatch[0]);
+            if (parsed.intent) intent = { type: parsed.intent, summary: parsed.summary ?? msg.text.slice(0, 100) };
+          } catch { /* fallback to default */ }
+        }
+
         const ceoBp = this.agentManager.getBlueprint('ceo');
         await this.slack!.sendAgentMessage('agency-ceo-investor', 'Alice', 'CEO', response, ceoBp?.avatar);
 
@@ -478,9 +685,14 @@ export class Agency {
           channel: 'ceo-investor', content: response, timestamp: new Date(),
         });
 
-        // Classify intent using Claude (replaces keyword matching)
-        const intent = await this.classifyIntent(msg.text);
         console.log(`[Intent] "${msg.text.slice(0, 50)}..." → ${intent.type}`);
+
+        // Audit log: record investor interaction with full context
+        await this.auditLog('investor:message', 'investor', 'ceo-investor', msg.text, {
+          intent: intent.type,
+          summary: intent.summary,
+          ceoResponse: response.slice(0, 200),
+        });
 
         switch (intent.type) {
           case 'project_idea':
@@ -539,7 +751,7 @@ export class Agency {
         respondingAgents = msg.mentionedAgents;
       } else {
         // Check recent messages: if the investor was just talking to one agent, continue that conversation
-        const recentMsgs = await this.store.getChannelMessages(msg.channelName, 5);
+        const recentMsgs = await this.store.getChannelMessages(msg.channelName, 3);
         const recentAgentReplies = recentMsgs
           .filter(m => m.fromAgentId && m.fromAgentId !== 'investor')
           .map(m => m.fromAgentId!);
@@ -554,9 +766,9 @@ export class Agency {
         }
       }
 
-      // Build chat history
+      // Build chat history (limit to 3 messages for token efficiency)
       const slackChannel = msg.channelName;
-      const recentMessages = await this.store.getChannelMessages(slackChannel, 10);
+      const recentMessages = await this.store.getChannelMessages(slackChannel, 3);
       const history = recentMessages
         .map(m => {
           const sender = m.fromAgentId === 'investor' ? 'Investor' : (this.agentManager.getBlueprint(m.fromAgentId ?? '')?.name ?? m.fromAgentId);
@@ -583,7 +795,7 @@ export class Agency {
             `Only respond with your message, nothing else. No markdown, no bold, plain text only.`,
           ].join('\n');
 
-          const chatResponse = await this.agentManager.chat(agentId, msg.text, context);
+          const chatResponse = await this.agentManager.chat(agentId, msg.text, context, slackChannel);
           await this.slack!.sendAgentMessage(slackChannel, blueprint.name, blueprint.role, chatResponse, blueprint.avatar);
 
           await this.store.saveMessage({
@@ -630,39 +842,34 @@ export class Agency {
     type: 'project_idea' | 'simple_task' | 'hire_request' | 'question' | 'chat';
     summary: string;
   }> {
+    const lower = text.toLowerCase().trim();
+
+    // Zero-cost heuristic for obvious cases — no model call needed
+    const CHAT_PATTERNS = /^(hey|hi|hello|thanks|thank you|good morning|good evening|gm|ok|okay|cool|nice|great|lol|haha|sure|np|bye|cheers|yo)\b/i;
+    if (lower.length < 20 && CHAT_PATTERNS.test(lower)) {
+      return { type: 'chat', summary: text };
+    }
+
+    const QUESTION_PATTERNS = /^(how|what|when|where|why|who|is |are |can |could |do |does |did |will |would |should |status|update)\b/i;
+    if (QUESTION_PATTERNS.test(lower) && lower.endsWith('?')) {
+      return { type: 'question', summary: text.slice(0, 100) };
+    }
+
+    const HIRE_PATTERNS = /\b(hire|recruit|need a |add a |find a |new role|new position|team member)\b/i;
+    if (HIRE_PATTERNS.test(lower)) {
+      return { type: 'hire_request', summary: text.slice(0, 100) };
+    }
+
+    // Only call Claude for genuinely ambiguous messages
     try {
       const prompt = [
-        `Classify this message from a company investor/owner. Respond with ONLY a JSON object, nothing else.`,
-        ``,
+        `Classify this investor message. Respond with ONLY JSON, nothing else.`,
         `Message: "${text}"`,
-        ``,
-        `Categories:`,
-        `- "project_idea": A new product, app, feature, or initiative that needs planning (e.g. "let's build a recipe app", "I want a new SaaS product")`,
-        `- "simple_task": A concrete, actionable request that can be done quickly (e.g. "fix the login bug", "add a dark mode toggle", "update the README")`,
-        `- "hire_request": Wants to hire/add a new team member or role (e.g. "we need a security expert", "hire a data scientist")`,
-        `- "question": Asking for information, status, or opinions (e.g. "how's the project going?", "what tech stack should we use?")`,
-        `- "chat": Casual conversation, greetings, or non-actionable messages (e.g. "hey", "good morning", "thanks")`,
-        ``,
-        `{"type":"<category>","summary":"<1 sentence summary of what they want>"}`,
+        `Categories: "project_idea" (new app/product/initiative), "simple_task" (quick fix/change), "question", "chat"`,
+        `{"type":"<category>","summary":"<1 sentence>"}`,
       ].join('\n');
 
-      const stream = query({
-        prompt,
-        options: {
-          allowedTools: [],
-          maxTurns: 1,
-          permissionMode: 'bypassPermissions',
-          env: _classifyEnv,
-        },
-      });
-
-      let result = '';
-      for await (const msg of stream) {
-        if (msg.type === 'result') {
-          const r = msg as SDKResultMessage;
-          if (r.subtype === 'success') result = r.result;
-        }
-      }
+      const result = await quickQuery(prompt, UTILITY_MODEL);
 
       const match = result.match(/\{[\s\S]*\}/);
       if (match) {
@@ -670,10 +877,9 @@ export class Agency {
         if (parsed.type && parsed.summary) return parsed;
       }
     } catch {
-      // Fallback to simple heuristic if classification fails
+      // Fallback to heuristic
     }
 
-    // Fallback: short messages are chat, longer ones are probably tasks
     if (text.length < 30) return { type: 'chat', summary: text };
     return { type: 'simple_task', summary: text.slice(0, 100) };
   }
@@ -686,79 +892,39 @@ export class Agency {
    * and create subtasks assigned to the right agents.
    */
   private async delegateTopm(investorMessage: string, summary: string): Promise<void> {
-    // Alice tells Diana in #leadership
-    try {
-      await this.agentManager.agentToAgentChat(
-        'ceo', 'pm',
-        `new project from the investor: "${summary}". take point on this — figure out what we need and get the team moving`,
-        'leadership'
-      );
-    } catch { /* non-critical */ }
+    // One-way announcement — no model call needed (Diana gets the full context in her task)
+    this.agentManager.notify('ceo', 'leadership',
+      `new project from the investor: "${summary}". passing to diana`);
 
-    // Create a PM task with full context and API access
-    const apiUrl = `http://localhost:${agencyConfig.wsPort + 1}`;
     const agents = this.agentManager.getAllBlueprints();
     const agentList = agents.filter(a => !['ceo', 'hr'].includes(a.id))
       .map(a => `- ${a.id}: ${a.name} (${a.role})`).join('\n');
 
+    // API instructions are already in PM's system prompt (cached).
+    // Only include task-specific context here to minimize input tokens.
     const task = {
       id: crypto.randomUUID(),
       title: `Plan & execute: ${summary.slice(0, 100)}`,
       description: [
         `The investor wants: "${investorMessage}"`,
         ``,
-        `You are Diana, the PM/Tech Lead. Your job:`,
-        `1. Evaluate the complexity of this request`,
-        `2. If it's a complex project, create a project and consult Charlie (architect) first`,
-        `3. If it's straightforward, go ahead and break it into tasks`,
-        `4. Assign tasks to the right agents using the API`,
-        `5. If repos are needed, ask the investor or create them via API`,
+        `Your job:`,
+        `1. Evaluate complexity`,
+        `2. Complex project → create project via API, consult Charlie (architect) first`,
+        `3. Straightforward → break into tasks and assign directly`,
+        `4. If repos are needed, create them via API`,
         ``,
         `## Available Team`,
         agentList,
         ``,
-        `## Agency API (use via curl)`,
-        `- Create project: curl -s -X POST ${apiUrl}/api/agency/projects -H 'Content-Type: application/json' -d '{"name":"...","description":"..."}'`,
-        `- Add repo: curl -s -X POST ${apiUrl}/api/agency/repositories -H 'Content-Type: application/json' -d '{"projectId":"...","repoUrl":"..."}'`,
-        `- Clone repo: curl -s -X POST ${apiUrl}/api/agency/repositories/{repoId}/clone`,
-        `- Create & assign task: curl -s -X POST ${apiUrl}/api/agency/tasks -H 'Content-Type: application/json' -d '{"projectId":"...","title":"...","description":"...","assignTo":"developer","priority":7}'`,
-        `- Create task with dependency: curl -s -X POST ${apiUrl}/api/agency/tasks -H 'Content-Type: application/json' -d '{"projectId":"...","title":"...","description":"...","assignTo":"frontend-developer","priority":7,"dependsOn":"<taskId>"}'`,
-        `- List agents: curl -s ${apiUrl}/api/agents`,
-        `- List projects: curl -s ${apiUrl}/api/projects`,
+        `## Rules`,
+        `- Each task → exactly ONE agent. Frontend → Maya, Backend → Eve/Alex, Design → Frank.`,
+        `- Design + frontend: create design task first, chain frontend with "dependsOn".`,
+        `- QA is automatic — don't create QA tasks manually.`,
+        `- Task descriptions must be specific: WHAT, HOW, WHERE, ACCEPTANCE CRITERIA.`,
+        `- Use the Agency API (in your system prompt) to create projects, repos, and tasks.`,
         ``,
-        `## IMPORTANT RULES`,
-        `- Each task is assigned to EXACTLY ONE agent. Never give the same task to two people.`,
-        `- Frontend work → "frontend-developer" (Maya). Backend → "developer" (Eve) or "backend-developer". NEVER mix.`,
-        `- If a feature needs design + frontend: create design task for "designer" FIRST, get its taskId, then create frontend task with "dependsOn" set to that taskId. The frontend task auto-starts when design is done.`,
-        `- QA review is automatic — when any worker finishes, Nina (QA) gets a review task. You don't create QA tasks.`,
-        `- Use "dependsOn" to enforce correct order. Tasks with dependencies wait automatically.`,
-        ``,
-        `## Decision Guide`,
-        `- Need architecture review? → Create a task for "architect" first`,
-        `- Need UI/design? → Create a task for "designer", then chain dependent frontend tasks`,
-        `- Need research? → Create a task for "researcher"`,
-        `- Pure frontend? → "frontend-developer"`,
-        `- Pure backend? → "developer" or "backend-developer"`,
-        `- Full-stack feature? → Separate backend + frontend tasks, with frontend depending on backend`,
-        `- Simple enough for one person? → Create just one task for the right specialist`,
-        `- Complex? → Create multiple subtasks with correct dependencies and assign to different specialists`,
-        ``,
-        `## TASK DESCRIPTION TEMPLATE — every task MUST follow this format:`,
-        `Each task description you create must be specific and actionable. Include:`,
-        `1. WHAT to build/change (specific components, files, endpoints)`,
-        `2. HOW it should work (exact behavior, inputs/outputs, edge cases)`,
-        `3. WHERE in the codebase (which directory, which files to modify/create)`,
-        `4. ACCEPTANCE CRITERIA (how to know it's done — what should work when tested)`,
-        ``,
-        `BAD: "Build the frontend for the recipe app"`,
-        `GOOD: "Create the recipe list page at /recipes using React + Tailwind. Show recipes as cards in a responsive grid (3 cols desktop, 1 col mobile). Each card shows: title, image, cooking time, difficulty badge. Data comes from GET /api/recipes. Include loading skeleton and empty state. Acceptance: page renders with mock data, responsive layout works, no console errors."`,
-        ``,
-        `## Git workflow`,
-        `- Agents push to feature branches automatically (never directly to main)`,
-        `- After QA passes, use merge API to merge feature branch to main`,
-        `- Merge endpoint: curl -s -X POST ${apiUrl}/api/agency/repositories/{repoId}/merge -H 'Content-Type: application/json' -d '{"featureBranch":"feature/..."}'`,
-        ``,
-        `Take action now. Use curl to create the project and tasks via the API.`,
+        `Take action now.`,
       ].join('\n'),
       status: 'assigned' as const,
       projectId: null,
@@ -767,12 +933,22 @@ export class Agency {
       parentTaskId: null,
       dependsOn: null,
       priority: 8,
+      deadline: null,
       createdAt: new Date(),
       updatedAt: new Date(),
     };
 
     await this.store.createTask(task);
     await this.agentManager.assignTask('pm', task);
+
+    // Track investor request
+    await this.store.saveInvestorRequest({
+      id: crypto.randomUUID(),
+      investorMessage,
+      intent: 'project_idea',
+      summary,
+      rootTaskId: task.id,
+    });
   }
 
   /**
@@ -780,30 +956,21 @@ export class Agency {
    * For very simple things PM might just assign to one developer directly.
    */
   private async delegateSimpleTask(investorMessage: string, summary: string): Promise<void> {
-    const apiUrl = `http://localhost:${agencyConfig.wsPort + 1}`;
     const agents = this.agentManager.getAllBlueprints();
     const agentList = agents.filter(a => !['ceo', 'hr'].includes(a.id))
       .map(a => `- ${a.id}: ${a.name} (${a.role})`).join('\n');
 
+    // API instructions are already in PM's system prompt (cached).
     const task = {
       id: crypto.randomUUID(),
       title: summary.slice(0, 120),
       description: [
         `Investor request: "${investorMessage}"`,
         ``,
-        `You are Diana, the PM. This is a simple/direct request.`,
-        `Figure out who should do it and assign it via the API.`,
+        `Simple/direct request. Figure out who should do it and assign via the Agency API.`,
+        `Frontend → Maya, Backend → Eve/Alex, Design → Frank. QA is automatic.`,
         ``,
-        `## Available Team`,
-        agentList,
-        ``,
-        `## API`,
-        `- Create & assign task: curl -s -X POST ${apiUrl}/api/agency/tasks -H 'Content-Type: application/json' -d '{"title":"...","description":"...","assignTo":"developer","priority":7}'`,
-        `- With dependency: add "dependsOn":"<taskId>" to chain tasks`,
-        `- List agents: curl -s ${apiUrl}/api/agents`,
-        ``,
-        `Assign to the right specialist. Frontend → "frontend-developer", backend → "developer" or "backend-developer", design → "designer".`,
-        `Each task goes to exactly one agent. QA review happens automatically.`,
+        `Team: ${agentList}`,
       ].join('\n'),
       status: 'assigned' as const,
       projectId: null,
@@ -812,12 +979,22 @@ export class Agency {
       parentTaskId: null,
       dependsOn: null,
       priority: 7,
+      deadline: null,
       createdAt: new Date(),
       updatedAt: new Date(),
     };
 
     await this.store.createTask(task);
     await this.agentManager.assignTask('pm', task);
+
+    // Track investor request
+    await this.store.saveInvestorRequest({
+      id: crypto.randomUUID(),
+      investorMessage,
+      intent: 'simple_task',
+      summary,
+      rootTaskId: task.id,
+    });
   }
 
   /**
@@ -826,7 +1003,8 @@ export class Agency {
   private async routeToHr(investorMessage: string, ceoResponse: string): Promise<void> {
     try {
       const hrResponse = await this.agentManager.chat('hr', investorMessage,
-        `You are Bob (HR Manager). The investor asked: "${investorMessage}"\n\nAlice (CEO) responded: "${ceoResponse}"\n\nIf this is a hiring request, create the blueprint JSON immediately. Include all required fields: id, role, name, gender, systemPrompt. Respond with your message and the JSON blueprint if applicable.`
+        `You are Bob (HR Manager). The investor asked: "${investorMessage}"\n\nAlice (CEO) responded: "${ceoResponse}"\n\nIf this is a hiring request, create the blueprint JSON immediately. Include all required fields: id, role, name, gender, systemPrompt. Respond with your message and the JSON blueprint if applicable.`,
+        'leadership'
       );
       if (this.slack) {
         const hrBp = this.agentManager.getBlueprint('hr');
@@ -963,6 +1141,63 @@ export class Agency {
     } catch { /* settings table may not exist yet on first run */ }
   }
 
+  /**
+   * Seed default task templates — reusable patterns for common workflows.
+   */
+  private async seedTaskTemplates(): Promise<void> {
+    const templates = [
+      {
+        id: 'new-feature',
+        name: 'New Feature',
+        description: 'Full feature workflow: design → frontend → backend → QA',
+        steps: [
+          { title: 'Design: {name}', description: 'Create UI/UX design for {name}. Include wireframes, component structure, and visual specs.', assignTo: 'designer' },
+          { title: 'Frontend: {name}', description: 'Implement the frontend for {name} based on the design. Build components, pages, and client-side logic.', assignTo: 'frontend-developer', dependsOnStep: 0 },
+          { title: 'Backend: {name}', description: 'Implement backend API and logic for {name}. Create endpoints, database models, and business logic.', assignTo: 'backend-developer' },
+        ],
+        createdBy: 'system',
+      },
+      {
+        id: 'bug-fix',
+        name: 'Bug Fix',
+        description: 'Fix → QA verification workflow',
+        steps: [
+          { title: 'Fix: {name}', description: 'Investigate and fix the bug: {name}. Write a test to prevent regression.', assignTo: 'developer' },
+        ],
+        createdBy: 'system',
+      },
+      {
+        id: 'security-audit',
+        name: 'Security Audit',
+        description: 'Security review → fix → re-audit workflow',
+        steps: [
+          { title: 'Security Audit: {name}', description: 'Perform a security audit on {name}. Check for OWASP top 10, auth issues, injection, XSS.', assignTo: 'security' },
+          { title: 'Fix Security Issues: {name}', description: 'Fix security issues found in the audit for {name}.', assignTo: 'developer', dependsOnStep: 0 },
+        ],
+        createdBy: 'system',
+      },
+      {
+        id: 'full-stack-feature',
+        name: 'Full-Stack Feature with Architecture Review',
+        description: 'Architecture → design → frontend + backend (parallel) → integration',
+        steps: [
+          { title: 'Architecture: {name}', description: 'Design the architecture for {name}. Define data models, API contracts, component structure.', assignTo: 'architect' },
+          { title: 'Design: {name}', description: 'Create UI/UX design based on architecture. Follow the defined component structure.', assignTo: 'designer', dependsOnStep: 0 },
+          { title: 'Frontend: {name}', description: 'Implement frontend based on design and architecture specs.', assignTo: 'frontend-developer', dependsOnStep: 1 },
+          { title: 'Backend: {name}', description: 'Implement backend API following the architecture spec. Create endpoints and data layer.', assignTo: 'backend-developer', dependsOnStep: 0 },
+        ],
+        createdBy: 'system',
+      },
+    ];
+
+    for (const t of templates) {
+      try {
+        await this.store.saveTaskTemplate(t);
+      } catch { /* may already exist */ }
+    }
+    console.log(`  Seeded ${templates.length} task templates`);
+  }
+
   async submitIdea(title: string, description: string) {
     return this.taskRouter.submitIdea(title, description);
   }
@@ -975,13 +1210,252 @@ export class Agency {
   getMemoryManager(): MemoryManager { return this.memoryManager; }
   getSlack(): SlackBridge | null { return this.slack; }
 
+  /**
+   * Fire a webhook event — queued for async delivery.
+   */
+  private fireWebhook(event: string, data: any): void {
+    if (agencyConfig.webhooks.length > 0) {
+      this.webhookQueue.push({ event, data });
+    }
+  }
+
+  /**
+   * Process queued webhook events — delivers to all matching webhook URLs.
+   */
+  private async processWebhookQueue(): Promise<void> {
+    if (this.webhookQueue.length === 0 || agencyConfig.webhooks.length === 0) return;
+
+    const batch = this.webhookQueue.splice(0, 10); // process up to 10 at a time
+    for (const { event, data } of batch) {
+      for (const hook of agencyConfig.webhooks) {
+        if (hook.events.includes(event) || hook.events.includes('*')) {
+          try {
+            const payload = JSON.stringify({ event, data, timestamp: new Date().toISOString() });
+            // Fire-and-forget HTTP POST
+            const { request } = await import('http');
+            const url = new URL(hook.url);
+            const req = request({
+              hostname: url.hostname,
+              port: url.port,
+              path: url.pathname,
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(payload),
+                ...(hook.secret ? { 'X-Webhook-Secret': hook.secret } : {}),
+              },
+              timeout: 5000,
+            });
+            req.on('error', () => {}); // swallow errors
+            req.write(payload);
+            req.end();
+          } catch { /* non-critical */ }
+        }
+      }
+    }
+  }
+
+  /**
+   * Log an audit entry for investor interactions.
+   */
+  private async auditLog(eventType: string, actorId: string, channel: string, content: string, metadata: Record<string, any> = {}): Promise<void> {
+    try {
+      await this.store.saveAuditEntry({
+        id: crypto.randomUUID(),
+        eventType,
+        actorId,
+        channel,
+        content,
+        metadata,
+      });
+    } catch { /* non-critical */ }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Background loop lifecycle — all intervals tracked for clean shutdown
+  // ---------------------------------------------------------------------------
+
+  private registerBackgroundLoops(): void {
+    const track = (fn: () => void | Promise<void>, intervalMs: number): void => {
+      this.backgroundTimers.push(setInterval(fn, intervalMs));
+    };
+
+    // Prune stale memories every 6 hours
+    track(() => {
+      this.memoryManager.prune().catch(err => {
+        console.error('[Memory prune error]', err.message);
+      });
+    }, 6 * 60 * 60_000);
+
+    // Deadlock detection every 5 minutes
+    track(async () => {
+      try {
+        const cycles = await this.store.detectDeadlocks();
+        for (const cycle of cycles) {
+          console.warn(`[Deadlock] Circular dependency detected: ${cycle.join(' → ')}`);
+          const firstTaskId = cycle[0];
+          const firstTask = await this.store.getTask(firstTaskId);
+          if (firstTask) {
+            await this.store.updateTaskStatus(firstTaskId, 'assigned');
+            await this.store.updateTaskDescription(firstTaskId,
+              (firstTask.description ?? '') + '\n\n[Deadlock auto-resolved: dependency cycle broken by system]');
+            const channel = firstTask.projectId ? `project-${firstTask.projectId}` : 'leadership';
+            this.agentManager.notify('pm', channel,
+              `broke a deadlock cycle: "${firstTask.title}" was in a circular dependency. unblocked it`);
+          }
+        }
+      } catch (err: any) {
+        console.error('[Deadlock detection error]', err.message);
+      }
+    }, 5 * 60_000);
+
+    // Message retention — purge old messages daily
+    track(async () => {
+      try {
+        const purged = await this.store.purgeOldMessages(agencyConfig.messageRetentionDays);
+        if (purged > 0) {
+          console.log(`[Retention] Purged ${purged} messages older than ${agencyConfig.messageRetentionDays} days`);
+        }
+      } catch (err: any) {
+        console.error('[Retention error]', err.message);
+      }
+    }, 24 * 60 * 60_000);
+
+    // Auto-deprioritize stale backlog tasks weekly
+    track(async () => {
+      try {
+        const deprioritized = await this.store.deprioritizeStaleBacklog(14);
+        if (deprioritized > 0) {
+          console.log(`[Priority] Deprioritized ${deprioritized} stale backlog tasks`);
+          this.agentManager.notify('pm', 'leadership',
+            `auto-deprioritized ${deprioritized} stale backlog tasks (>14 days old)`);
+        }
+      } catch (err: any) {
+        console.error('[Priority rebalance error]', err.message);
+      }
+    }, 7 * 24 * 60 * 60_000);
+
+    // Webhook delivery loop — process queued events every 2 seconds
+    track(() => this.processWebhookQueue(), 2000);
+
+    // SLA monitoring — check for overdue/near-deadline tasks every 10 minutes
+    track(async () => {
+      try {
+        const overdue = await this.store.getOverdueTasks();
+        for (const task of overdue) {
+          const agentName = task.assignedTo
+            ? (this.agentManager.getBlueprint(task.assignedTo)?.name ?? task.assignedTo)
+            : 'unassigned';
+          const channel = task.projectId ? `project-${task.projectId}` : 'leadership';
+          this.agentManager.notify('pm', channel,
+            `SLA breach: "${task.title}" (${agentName}) is past deadline`);
+          this.fireWebhook('sla:breach', { taskId: task.id, title: task.title, assignedTo: task.assignedTo, deadline: task.deadline });
+        }
+
+        const nearDeadline = await this.store.getTasksNearDeadline(2);
+        for (const task of nearDeadline) {
+          const channel = task.projectId ? `project-${task.projectId}` : 'leadership';
+          this.agentManager.notify('pm', channel,
+            `heads up: "${task.title}" deadline in <2 hours`);
+        }
+      } catch (err: any) {
+        console.error('[SLA monitor error]', err.message);
+      }
+    }, 10 * 60_000);
+
+    // Daily cost digest — send summary to leadership every 24 hours
+    track(async () => {
+      try {
+        const digest = await this.store.getCostDigest(24);
+        if (digest.totalSessions > 0) {
+          const agentBreakdown = digest.byAgent.slice(0, 5)
+            .map(a => `${this.agentManager.getBlueprint(a.agentId)?.name ?? a.agentId}: $${a.cost.toFixed(4)}`)
+            .join(', ');
+          const topTask = digest.topExpensiveTask
+            ? ` | most expensive task: "${digest.topExpensiveTask.title}" ($${digest.topExpensiveTask.cost.toFixed(4)})`
+            : '';
+          const report = `daily cost report: $${digest.totalCost.toFixed(4)} across ${digest.totalSessions} sessions. ${agentBreakdown}${topTask}`;
+          this.agentManager.notify('ceo', 'leadership', report);
+          this.fireWebhook('cost:daily', digest);
+        }
+      } catch (err: any) {
+        console.error('[Cost digest error]', err.message);
+      }
+    }, 24 * 60 * 60_000);
+
+    // Workload balancing — check every 15 minutes for imbalanced agent loads
+    track(async () => {
+      try {
+        const workloads = await this.store.getAgentWorkloads();
+        if (workloads.length < 2) return;
+
+        const maxLoad = workloads[0];
+        const minLoad = workloads[workloads.length - 1];
+
+        if (maxLoad.queuedTasks - minLoad.totalLoad >= 3) {
+          const maxBp = this.agentManager.getBlueprint(maxLoad.agentId);
+          const minBp = this.agentManager.getBlueprint(minLoad.agentId);
+          if (maxBp && minBp && maxBp.role === minBp.role) {
+            const candidates = await this.store.getRebalanceCandidates(maxLoad.agentId, 1);
+            for (const task of candidates) {
+              await this.store.cascadeReassignTask(task.id, minLoad.agentId, false);
+              const channel = task.projectId ? `project-${task.projectId}` : 'leadership';
+              this.agentManager.notify('pm', channel,
+                `rebalanced "${task.title}" from ${maxBp.name} → ${minBp.name} (workload balancing)`);
+            }
+          }
+        }
+      } catch (err: any) {
+        console.error('[Workload balance error]', err.message);
+      }
+    }, 15 * 60_000);
+
+    // Orphaned task recovery — detect stuck in_progress tasks every 10 minutes
+    track(async () => {
+      try {
+        const recovered = await this.store.recoverOrphanedTasks(30);
+        for (const task of recovered) {
+          console.warn(`[Recovery] Orphaned task "${task.title}" (${task.id}) returned to assigned queue`);
+          const channel = task.projectId ? `project-${task.projectId}` : 'leadership';
+          this.agentManager.notify('pm', channel,
+            `recovered orphaned task: "${task.title}" was stuck in_progress for >30 min. re-queued for assignment.`);
+          this.fireWebhook('task:recovered', { taskId: task.id, title: task.title, assignedTo: task.assignedTo });
+        }
+      } catch (err: any) {
+        console.error('[Orphan recovery error]', err.message);
+      }
+    }, 10 * 60_000);
+
+    console.log(`  Registered ${this.backgroundTimers.length} background loops`);
+  }
+
   async shutdown(): Promise<void> {
     console.log('Shutting down...');
+
+    // Stop all background loops
+    for (const timer of this.backgroundTimers) {
+      clearInterval(timer);
+    }
+    this.backgroundTimers.length = 0;
+
     this.scheduler.stop();
+
+    // Gracefully shut down agent manager (abort active sessions, clear timers)
+    await this.agentManager.shutdown();
+
     this.apiServer.close();
     this.wsServer.close();
     if (this.slack) await this.slack.stop();
-    await this.store.close();
+
+    // Close DB with timeout to prevent hanging on stuck connections
+    await Promise.race([
+      this.store.close(),
+      new Promise<void>(resolve => setTimeout(() => {
+        console.warn('DB close timed out after 10s — forcing exit');
+        resolve();
+      }, 10_000)),
+    ]);
+
     console.log('Claude Agency stopped.');
   }
 }

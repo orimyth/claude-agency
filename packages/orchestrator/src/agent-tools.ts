@@ -235,6 +235,7 @@ export class AgentToolHandler {
       parentTaskId: input.parentTaskId ?? null,
       dependsOn: dependsOn ?? null,
       priority: priority ?? 5,
+      deadline: null,
       createdAt: new Date(),
       updatedAt: new Date(),
     };
@@ -413,9 +414,30 @@ export class AgentToolHandler {
 
       await this.store.updateRepositorySync(repo.id, mainBranch);
 
+      // Auto-create GitHub PR if this is a GitHub repo
+      let prUrl: string | null = null;
+      if (repo.repoUrl.includes('github.com')) {
+        try {
+          const prTitle = `Merge ${featureBranch}`;
+          const prBody = input.taskId
+            ? `Auto-created by Claude Agency after QA passed.\n\nTask: ${input.taskId}`
+            : `Auto-created by Claude Agency after QA passed.`;
+          const prOutput = execSync(
+            `cd "${cwd}" && gh pr create --base "${mainBranch}" --head "${featureBranch}" --title "${prTitle}" --body "${prBody}" 2>&1 || true`,
+            { timeout: 30000 }
+          ).toString().trim();
+          // gh pr create outputs the URL on success
+          const urlMatch = prOutput.match(/https:\/\/github\.com\/[^\s]+/);
+          if (urlMatch) prUrl = urlMatch[0];
+        } catch { /* gh CLI may not be available — non-critical */ }
+      }
+
       return {
         success: true,
-        data: { branch: mainBranch, merged: featureBranch, message: `Merged '${featureBranch}' into '${mainBranch}' and pushed.` },
+        data: {
+          branch: mainBranch, merged: featureBranch, prUrl,
+          message: `Merged '${featureBranch}' into '${mainBranch}' and pushed.${prUrl ? ` PR: ${prUrl}` : ''}`,
+        },
       };
     } catch (err: any) {
       return { success: false, error: `Git merge failed: ${err.message}` };

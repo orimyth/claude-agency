@@ -146,11 +146,11 @@ export class SlackBridge extends EventEmitter {
 
   // --- Sending messages ---
 
-  async sendAgentMessage(channelName: string, agentName: string, role: string, content: string, avatar?: string | null): Promise<void> {
+  async sendAgentMessage(channelName: string, agentName: string, role: string, content: string, avatar?: string | null, threadTs?: string | null): Promise<string | undefined> {
     const channelId = this.channelManager.getChannelId(channelName);
     if (!channelId) {
       console.warn(`[Slack] Channel '${channelName}' not found, skipping message`);
-      return;
+      return undefined;
     }
 
     const publicAvatarUrl = avatarToPublicUrl(avatar);
@@ -168,7 +168,13 @@ export class SlackBridge extends EventEmitter {
       msgPayload.icon_emoji = formatted.icon_emoji;
     }
 
-    await this.app.client.chat.postMessage(msgPayload as any);
+    // Thread replies — send as reply to an existing message
+    if (threadTs) {
+      msgPayload.thread_ts = threadTs;
+    }
+
+    const result = await this.app.client.chat.postMessage(msgPayload as any);
+    return result.ts;
   }
 
   async sendApprovalRequest(approvalId: string, title: string, description: string, agentName: string): Promise<void> {

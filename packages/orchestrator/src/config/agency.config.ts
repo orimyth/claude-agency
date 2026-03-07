@@ -29,4 +29,8 @@ export const agencyConfig: AgencyConfig = {
   },
   dashboardPort: parseInt(env('DASHBOARD_PORT', '3000'), 10),
   wsPort: parseInt(env('WS_PORT', '3001'), 10),
+  maxCostPerTask: parseFloat(env('MAX_COST_PER_TASK', '2.00')),
+  emergencyPause: false,
+  webhooks: [],
+  messageRetentionDays: parseInt(env('MESSAGE_RETENTION_DAYS', '7'), 10),
 };

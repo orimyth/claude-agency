@@ -1,16 +1,5 @@
-import { query, type SDKResultMessage } from '@anthropic-ai/claude-code';
 import type { StateStore } from './state-store.js';
-import { dirname } from 'path';
-
-// Same PATH fix as other modules
-const nodeDir = dirname(process.execPath);
-const memEnv: Record<string, string> = {};
-for (const [k, v] of Object.entries(process.env)) {
-  if (v !== undefined) memEnv[k] = v;
-}
-if (!memEnv.PATH?.includes(nodeDir)) {
-  memEnv.PATH = `${nodeDir}:${memEnv.PATH || ''}`;
-}
+import { quickQuery } from './sdk-util.js';
 
 /** Max tokens of memory context to inject per agent call */
 const MAX_CONTEXT_TOKENS = 2000;
@@ -19,6 +8,12 @@ const CHARS_PER_TOKEN = 4;
 const MAX_CONTEXT_CHARS = MAX_CONTEXT_TOKENS * CHARS_PER_TOKEN;
 /** When a scope+category has this many entries, auto-summarize */
 const SUMMARIZE_THRESHOLD = 15;
+
+/**
+ * Lightweight model for utility tasks (JSON extraction, summarization).
+ * Uses Haiku for simple structured output tasks — ~15x cheaper than Opus.
+ */
+const UTILITY_MODEL = 'claude-haiku-4-5-20251001';
 
 /**
  * Role → relevant memory categories mapping.
@@ -41,6 +36,8 @@ const ROLE_CATEGORIES: Record<string, string[]> = {
 
 export class MemoryManager {
   private store: StateStore;
+  /** Fast flag to skip DB queries when no memories exist yet. */
+  private hasMemories = false;
 
   constructor(store: StateStore) {
     this.store = store;
@@ -58,6 +55,7 @@ export class MemoryManager {
     importance?: number;
     createdBy?: string;
   }): Promise<string> {
+    this.hasMemories = true;
     const id = crypto.randomUUID();
     await this.store.saveMemory({
       id,
@@ -84,6 +82,9 @@ export class MemoryManager {
    * Stays within token budget.
    */
   async buildContext(agentId: string, projectId?: string | null): Promise<string> {
+    // Skip DB query entirely when no memories have been saved yet
+    if (!this.hasMemories) return '';
+
     const categories = ROLE_CATEGORIES[agentId] ?? ['general'];
 
     // Scopes to search: always include company, optionally include project
@@ -147,23 +148,7 @@ export class MemoryManager {
         'Only output the JSON array, nothing else.',
       ].join('\n');
 
-      const stream = query({
-        prompt,
-        options: {
-          allowedTools: [],
-          maxTurns: 1,
-          permissionMode: 'bypassPermissions',
-          env: memEnv,
-        },
-      });
-
-      let result = '';
-      for await (const msg of stream) {
-        if (msg.type === 'result') {
-          const r = msg as SDKResultMessage;
-          if (r.subtype === 'success') result = r.result;
-        }
-      }
+      const result = await quickQuery(prompt, UTILITY_MODEL);
 
       // Parse learnings
       const match = result.match(/\[[\s\S]*\]/);
@@ -224,18 +209,7 @@ export class MemoryManager {
         'Only output the JSON array.',
       ].join('\n');
 
-      const stream = query({
-        prompt,
-        options: { allowedTools: [], maxTurns: 1, permissionMode: 'bypassPermissions', env: memEnv },
-      });
-
-      let result = '';
-      for await (const msg of stream) {
-        if (msg.type === 'result') {
-          const r = msg as SDKResultMessage;
-          if (r.subtype === 'success') result = r.result;
-        }
-      }
+      const result = await quickQuery(prompt, UTILITY_MODEL);
 
       const match = result.match(/\[[\s\S]*\]/);
       if (!match) return;
@@ -274,5 +248,17 @@ export class MemoryManager {
    */
   async getAll(scope?: string) {
     return this.store.getAllMemories(scope);
+  }
+
+  /**
+   * Prune stale memories: expired entries + old low-importance entries.
+   * Called periodically by the scheduler.
+   */
+  async prune(maxAgeDays = 30, minImportance = 2): Promise<number> {
+    const pruned = await this.store.pruneMemories(maxAgeDays, minImportance);
+    if (pruned > 0) {
+      console.log(`[Memory] Pruned ${pruned} stale entries (>${maxAgeDays}d, importance<=${minImportance})`);
+    }
+    return pruned;
   }
 }

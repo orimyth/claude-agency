@@ -39,6 +39,7 @@ export interface Task {
   parentTaskId: string | null;
   dependsOn: string | null;  // task ID this task waits for
   priority: number;
+  deadline: Date | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -135,4 +136,18 @@ export interface AgencyConfig {
   };
   dashboardPort: number;
   wsPort: number;
+  /** Max cost in USD per single task execution. Agent is aborted if exceeded. Default: 2.00 */
+  maxCostPerTask: number;
+  /** Emergency pause — when true, no new tasks are started. Default: false */
+  emergencyPause: boolean;
+  /** Webhook URLs to notify on key events. Default: [] */
+  webhooks: WebhookConfig[];
+  /** Message retention in days. Messages older than this are auto-purged. Default: 7 */
+  messageRetentionDays: number;
+}
+
+export interface WebhookConfig {
+  url: string;
+  events: string[]; // e.g., ['task:done', 'agent:blocked', 'budget:exceeded']
+  secret?: string;
 }

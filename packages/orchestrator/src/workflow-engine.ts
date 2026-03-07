@@ -7,16 +7,7 @@ import type { AgentBlueprint, Task, AgencyConfig } from './types.js';
 import { EventEmitter } from 'events';
 import { dirname, resolve } from 'path';
 import { fileURLToPath } from 'url';
-
-// Same PATH fix as agent-manager
-const nodeDir = dirname(process.execPath);
-const wfEnv: Record<string, string> = {};
-for (const [k, v] of Object.entries(process.env)) {
-  if (v !== undefined) wfEnv[k] = v;
-}
-if (!wfEnv.PATH?.includes(nodeDir)) {
-  wfEnv.PATH = `${nodeDir}:${wfEnv.PATH || ''}`;
-}
+import { sdkEnv } from './sdk-util.js';
 
 /**
  * Handles complex multi-agent workflows:
@@ -104,12 +95,13 @@ export class WorkflowEngine extends EventEmitter {
       const stream = query({
         prompt: evaluationPrompt,
         options: {
+          model: 'claude-opus-4-6',
           customSystemPrompt: ceoBlueprint.systemPrompt,
           cwd: this.resolveWorkDir(),
           allowedTools: ['Bash'],
           maxTurns: 15,
           permissionMode: 'bypassPermissions',
-          env: wfEnv,
+          env: sdkEnv,
         },
       });
 
@@ -171,6 +163,7 @@ export class WorkflowEngine extends EventEmitter {
       parentTaskId: null,
       dependsOn: null,
       priority: 9,
+      deadline: null,
       createdAt: new Date(),
       updatedAt: new Date(),
     };

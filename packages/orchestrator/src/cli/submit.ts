@@ -44,8 +44,13 @@ async function submit(title: string, description: string) {
   const result = await router.submitIdea(title, description);
 
   console.log(`\n  Idea submitted!`);
-  console.log(`  Task:    ${result.taskId}`);
-  console.log(`  Status:  Assigned to CEO (Alice)\n`);
+  console.log(`  Task:     ${result.taskId}`);
+  console.log(`  Routed:   ${result.routedTo === 'ceo' ? 'CEO (Alice) — complex idea' : 'PM (Bob) — routine task'}`);
+  console.log(`  Priority: ${result.priority}/10`);
+  if (result.duplicate) {
+    console.log(`  ⚠ Similar: "${result.duplicate.title}" (${Math.round(result.duplicate.similarity * 100)}% match)`);
+  }
+  console.log();
 
   await store.close();
 }

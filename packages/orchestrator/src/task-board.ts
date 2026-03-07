@@ -51,6 +51,7 @@ export class TaskBoard {
         parentTaskId,
         dependsOn: null,
         priority: sub.priority ?? parent.priority,
+        deadline: null,
         createdAt: new Date(),
         updatedAt: new Date(),
       };
