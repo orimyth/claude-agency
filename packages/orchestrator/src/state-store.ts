@@ -13,6 +13,9 @@ export class StateStore {
       database: config.database,
       waitForConnections: true,
       connectionLimit: 10,
+      connectTimeout: 10_000,    // 10s to establish connection
+      enableKeepAlive: true,
+      keepAliveInitialDelay: 30_000, // TCP keepalive after 30s idle
     });
   }
 
@@ -246,10 +249,12 @@ export class StateStore {
         )
       `);
 
-      // Performance index on tasks.depends_on for dependency chain queries
+      // Performance indices for common query patterns
       try { await conn.query(`CREATE INDEX idx_depends_on ON tasks (depends_on)`); } catch { /* already exists */ }
-      // Performance index on tasks.assigned_to for workload queries
       try { await conn.query(`CREATE INDEX idx_assigned_to ON tasks (assigned_to)`); } catch { /* already exists */ }
+      try { await conn.query(`CREATE INDEX idx_tasks_status_priority ON tasks (status, priority DESC, created_at)`); } catch { /* already exists */ }
+      try { await conn.query(`CREATE INDEX idx_tasks_status_assigned ON tasks (status, assigned_to)`); } catch { /* already exists */ }
+      try { await conn.query(`CREATE INDEX idx_tasks_status_updated ON tasks (status, updated_at)`); } catch { /* already exists */ }
 
       // Migration: add deadline column to tasks
       try { await conn.query(`ALTER TABLE tasks ADD COLUMN deadline DATETIME NULL`); } catch { /* already exists */ }
@@ -1787,5 +1792,28 @@ export class StateStore {
       createdAt: new Date(row.created_at),
       resolvedAt: row.resolved_at ? new Date(row.resolved_at) : null,
     };
+  }
+
+  /**
+   * Recover orphaned tasks that have been stuck in 'in_progress' for longer
+   * than `staleMinutes`. Moves them back to 'assigned' so they get picked up again.
+   */
+  async recoverOrphanedTasks(staleMinutes: number): Promise<Task[]> {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      `SELECT * FROM tasks
+       WHERE status = 'in_progress'
+         AND updated_at < DATE_SUB(NOW(), INTERVAL ? MINUTE)`,
+      [staleMinutes],
+    );
+
+    const recovered: Task[] = [];
+    for (const row of rows) {
+      await this.pool.query(
+        `UPDATE tasks SET status = 'assigned', updated_at = NOW() WHERE id = ?`,
+        [row.id],
+      );
+      recovered.push(this.mapTask(row));
+    }
+    return recovered;
   }
 }

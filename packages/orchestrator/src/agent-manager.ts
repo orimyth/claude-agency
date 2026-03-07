@@ -824,4 +824,30 @@ export class AgentManager extends EventEmitter {
   isEmergencyPaused(): boolean {
     return this.config.emergencyPause;
   }
+
+  /**
+   * Gracefully shut down: clear timers, abort active sessions, wait for in-flight work.
+   */
+  async shutdown(): Promise<void> {
+    // Stop idle recycling timer
+    if (this.idleRecycleTimer) {
+      clearInterval(this.idleRecycleTimer);
+      this.idleRecycleTimer = null;
+    }
+
+    // Abort all active agent sessions
+    if (this.activeSessions.size > 0) {
+      console.log(`[Shutdown] Aborting ${this.activeSessions.size} active agent session(s)...`);
+      for (const [agentId, controller] of this.activeSessions) {
+        console.log(`[Shutdown] Aborting session for ${agentId}`);
+        controller.abort();
+      }
+      // Give sessions a moment to clean up
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      this.activeSessions.clear();
+    }
+
+    this.activeCount = 0;
+    console.log('[Shutdown] Agent manager stopped');
+  }
 }

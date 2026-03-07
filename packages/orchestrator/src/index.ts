@@ -41,6 +41,8 @@ export class Agency {
   private taskThreads: Map<string, string> = new Map();
   /** Webhook delivery queue — fire-and-forget */
   private webhookQueue: Array<{ event: string; data: any }> = [];
+  /** Background loop timer handles for cleanup on shutdown */
+  private backgroundTimers: ReturnType<typeof setInterval>[] = [];
 
   constructor() {
     this.store = new StateStore(agencyConfig.mysql);
@@ -121,138 +123,8 @@ export class Agency {
     this.setupSchedulerEvents();
     console.log('Scheduler started');
 
-    // Prune stale memories every 6 hours
-    setInterval(() => {
-      this.memoryManager.prune().catch(err => {
-        console.error('[Memory prune error]', err.message);
-      });
-    }, 6 * 60 * 60_000);
-
-    // Deadlock detection every 5 minutes
-    setInterval(async () => {
-      try {
-        const cycles = await this.store.detectDeadlocks();
-        for (const cycle of cycles) {
-          console.warn(`[Deadlock] Circular dependency detected: ${cycle.join(' → ')}`);
-          // Auto-resolve by breaking the cycle: unblock the first task
-          const firstTaskId = cycle[0];
-          const firstTask = await this.store.getTask(firstTaskId);
-          if (firstTask) {
-            await this.store.updateTaskStatus(firstTaskId, 'assigned');
-            // Clear the dependency to break the cycle
-            await this.store.updateTaskDescription(firstTaskId,
-              (firstTask.description ?? '') + '\n\n[Deadlock auto-resolved: dependency cycle broken by system]');
-            const channel = firstTask.projectId ? `project-${firstTask.projectId}` : 'leadership';
-            this.agentManager.notify('pm', channel,
-              `broke a deadlock cycle: "${firstTask.title}" was in a circular dependency. unblocked it`);
-          }
-        }
-      } catch (err: any) {
-        console.error('[Deadlock detection error]', err.message);
-      }
-    }, 5 * 60_000);
-
-    // Message retention — purge old messages daily
-    setInterval(async () => {
-      try {
-        const purged = await this.store.purgeOldMessages(agencyConfig.messageRetentionDays);
-        if (purged > 0) {
-          console.log(`[Retention] Purged ${purged} messages older than ${agencyConfig.messageRetentionDays} days`);
-        }
-      } catch (err: any) {
-        console.error('[Retention error]', err.message);
-      }
-    }, 24 * 60 * 60_000);
-
-    // Auto-deprioritize stale backlog tasks weekly
-    setInterval(async () => {
-      try {
-        const deprioritized = await this.store.deprioritizeStaleBacklog(14);
-        if (deprioritized > 0) {
-          console.log(`[Priority] Deprioritized ${deprioritized} stale backlog tasks`);
-          this.agentManager.notify('pm', 'leadership',
-            `auto-deprioritized ${deprioritized} stale backlog tasks (>14 days old)`);
-        }
-      } catch (err: any) {
-        console.error('[Priority rebalance error]', err.message);
-      }
-    }, 7 * 24 * 60 * 60_000); // weekly
-
-    // Webhook delivery loop — process queued events every 2 seconds
-    setInterval(() => this.processWebhookQueue(), 2000);
-
-    // SLA monitoring — check for overdue/near-deadline tasks every 10 minutes
-    setInterval(async () => {
-      try {
-        const overdue = await this.store.getOverdueTasks();
-        for (const task of overdue) {
-          const agentName = task.assignedTo
-            ? (this.agentManager.getBlueprint(task.assignedTo)?.name ?? task.assignedTo)
-            : 'unassigned';
-          const channel = task.projectId ? `project-${task.projectId}` : 'leadership';
-          this.agentManager.notify('pm', channel,
-            `SLA breach: "${task.title}" (${agentName}) is past deadline`);
-          this.fireWebhook('sla:breach', { taskId: task.id, title: task.title, assignedTo: task.assignedTo, deadline: task.deadline });
-        }
-
-        const nearDeadline = await this.store.getTasksNearDeadline(2);
-        for (const task of nearDeadline) {
-          const channel = task.projectId ? `project-${task.projectId}` : 'leadership';
-          this.agentManager.notify('pm', channel,
-            `heads up: "${task.title}" deadline in <2 hours`);
-        }
-      } catch (err: any) {
-        console.error('[SLA monitor error]', err.message);
-      }
-    }, 10 * 60_000);
-
-    // Daily cost digest — send summary to leadership every 24 hours
-    setInterval(async () => {
-      try {
-        const digest = await this.store.getCostDigest(24);
-        if (digest.totalSessions > 0) {
-          const agentBreakdown = digest.byAgent.slice(0, 5)
-            .map(a => `${this.agentManager.getBlueprint(a.agentId)?.name ?? a.agentId}: $${a.cost.toFixed(4)}`)
-            .join(', ');
-          const topTask = digest.topExpensiveTask
-            ? ` | most expensive task: "${digest.topExpensiveTask.title}" ($${digest.topExpensiveTask.cost.toFixed(4)})`
-            : '';
-          const report = `daily cost report: $${digest.totalCost.toFixed(4)} across ${digest.totalSessions} sessions. ${agentBreakdown}${topTask}`;
-          this.agentManager.notify('ceo', 'leadership', report);
-          this.fireWebhook('cost:daily', digest);
-        }
-      } catch (err: any) {
-        console.error('[Cost digest error]', err.message);
-      }
-    }, 24 * 60 * 60_000);
-
-    // Workload balancing — check every 15 minutes for imbalanced agent loads
-    setInterval(async () => {
-      try {
-        const workloads = await this.store.getAgentWorkloads();
-        if (workloads.length < 2) return;
-
-        const maxLoad = workloads[0]; // sorted DESC by total load
-        const minLoad = workloads[workloads.length - 1];
-
-        // Only rebalance if one agent has 3+ more queued tasks than another with same role type
-        if (maxLoad.queuedTasks - minLoad.totalLoad >= 3) {
-          const maxBp = this.agentManager.getBlueprint(maxLoad.agentId);
-          const minBp = this.agentManager.getBlueprint(minLoad.agentId);
-          if (maxBp && minBp && maxBp.role === minBp.role) {
-            const candidates = await this.store.getRebalanceCandidates(maxLoad.agentId, 1);
-            for (const task of candidates) {
-              await this.store.cascadeReassignTask(task.id, minLoad.agentId, false);
-              const channel = task.projectId ? `project-${task.projectId}` : 'leadership';
-              this.agentManager.notify('pm', channel,
-                `rebalanced "${task.title}" from ${maxBp.name} → ${minBp.name} (workload balancing)`);
-            }
-          }
-        }
-      } catch (err: any) {
-        console.error('[Workload balance error]', err.message);
-      }
-    }, 15 * 60_000);
+    // Register all background loops with tracked timers for clean shutdown
+    this.registerBackgroundLoops();
 
     // Seed default task templates
     await this.seedTaskTemplates();
@@ -1399,13 +1271,191 @@ export class Agency {
     } catch { /* non-critical */ }
   }
 
+  // ---------------------------------------------------------------------------
+  // Background loop lifecycle — all intervals tracked for clean shutdown
+  // ---------------------------------------------------------------------------
+
+  private registerBackgroundLoops(): void {
+    const track = (fn: () => void | Promise<void>, intervalMs: number): void => {
+      this.backgroundTimers.push(setInterval(fn, intervalMs));
+    };
+
+    // Prune stale memories every 6 hours
+    track(() => {
+      this.memoryManager.prune().catch(err => {
+        console.error('[Memory prune error]', err.message);
+      });
+    }, 6 * 60 * 60_000);
+
+    // Deadlock detection every 5 minutes
+    track(async () => {
+      try {
+        const cycles = await this.store.detectDeadlocks();
+        for (const cycle of cycles) {
+          console.warn(`[Deadlock] Circular dependency detected: ${cycle.join(' → ')}`);
+          const firstTaskId = cycle[0];
+          const firstTask = await this.store.getTask(firstTaskId);
+          if (firstTask) {
+            await this.store.updateTaskStatus(firstTaskId, 'assigned');
+            await this.store.updateTaskDescription(firstTaskId,
+              (firstTask.description ?? '') + '\n\n[Deadlock auto-resolved: dependency cycle broken by system]');
+            const channel = firstTask.projectId ? `project-${firstTask.projectId}` : 'leadership';
+            this.agentManager.notify('pm', channel,
+              `broke a deadlock cycle: "${firstTask.title}" was in a circular dependency. unblocked it`);
+          }
+        }
+      } catch (err: any) {
+        console.error('[Deadlock detection error]', err.message);
+      }
+    }, 5 * 60_000);
+
+    // Message retention — purge old messages daily
+    track(async () => {
+      try {
+        const purged = await this.store.purgeOldMessages(agencyConfig.messageRetentionDays);
+        if (purged > 0) {
+          console.log(`[Retention] Purged ${purged} messages older than ${agencyConfig.messageRetentionDays} days`);
+        }
+      } catch (err: any) {
+        console.error('[Retention error]', err.message);
+      }
+    }, 24 * 60 * 60_000);
+
+    // Auto-deprioritize stale backlog tasks weekly
+    track(async () => {
+      try {
+        const deprioritized = await this.store.deprioritizeStaleBacklog(14);
+        if (deprioritized > 0) {
+          console.log(`[Priority] Deprioritized ${deprioritized} stale backlog tasks`);
+          this.agentManager.notify('pm', 'leadership',
+            `auto-deprioritized ${deprioritized} stale backlog tasks (>14 days old)`);
+        }
+      } catch (err: any) {
+        console.error('[Priority rebalance error]', err.message);
+      }
+    }, 7 * 24 * 60 * 60_000);
+
+    // Webhook delivery loop — process queued events every 2 seconds
+    track(() => this.processWebhookQueue(), 2000);
+
+    // SLA monitoring — check for overdue/near-deadline tasks every 10 minutes
+    track(async () => {
+      try {
+        const overdue = await this.store.getOverdueTasks();
+        for (const task of overdue) {
+          const agentName = task.assignedTo
+            ? (this.agentManager.getBlueprint(task.assignedTo)?.name ?? task.assignedTo)
+            : 'unassigned';
+          const channel = task.projectId ? `project-${task.projectId}` : 'leadership';
+          this.agentManager.notify('pm', channel,
+            `SLA breach: "${task.title}" (${agentName}) is past deadline`);
+          this.fireWebhook('sla:breach', { taskId: task.id, title: task.title, assignedTo: task.assignedTo, deadline: task.deadline });
+        }
+
+        const nearDeadline = await this.store.getTasksNearDeadline(2);
+        for (const task of nearDeadline) {
+          const channel = task.projectId ? `project-${task.projectId}` : 'leadership';
+          this.agentManager.notify('pm', channel,
+            `heads up: "${task.title}" deadline in <2 hours`);
+        }
+      } catch (err: any) {
+        console.error('[SLA monitor error]', err.message);
+      }
+    }, 10 * 60_000);
+
+    // Daily cost digest — send summary to leadership every 24 hours
+    track(async () => {
+      try {
+        const digest = await this.store.getCostDigest(24);
+        if (digest.totalSessions > 0) {
+          const agentBreakdown = digest.byAgent.slice(0, 5)
+            .map(a => `${this.agentManager.getBlueprint(a.agentId)?.name ?? a.agentId}: $${a.cost.toFixed(4)}`)
+            .join(', ');
+          const topTask = digest.topExpensiveTask
+            ? ` | most expensive task: "${digest.topExpensiveTask.title}" ($${digest.topExpensiveTask.cost.toFixed(4)})`
+            : '';
+          const report = `daily cost report: $${digest.totalCost.toFixed(4)} across ${digest.totalSessions} sessions. ${agentBreakdown}${topTask}`;
+          this.agentManager.notify('ceo', 'leadership', report);
+          this.fireWebhook('cost:daily', digest);
+        }
+      } catch (err: any) {
+        console.error('[Cost digest error]', err.message);
+      }
+    }, 24 * 60 * 60_000);
+
+    // Workload balancing — check every 15 minutes for imbalanced agent loads
+    track(async () => {
+      try {
+        const workloads = await this.store.getAgentWorkloads();
+        if (workloads.length < 2) return;
+
+        const maxLoad = workloads[0];
+        const minLoad = workloads[workloads.length - 1];
+
+        if (maxLoad.queuedTasks - minLoad.totalLoad >= 3) {
+          const maxBp = this.agentManager.getBlueprint(maxLoad.agentId);
+          const minBp = this.agentManager.getBlueprint(minLoad.agentId);
+          if (maxBp && minBp && maxBp.role === minBp.role) {
+            const candidates = await this.store.getRebalanceCandidates(maxLoad.agentId, 1);
+            for (const task of candidates) {
+              await this.store.cascadeReassignTask(task.id, minLoad.agentId, false);
+              const channel = task.projectId ? `project-${task.projectId}` : 'leadership';
+              this.agentManager.notify('pm', channel,
+                `rebalanced "${task.title}" from ${maxBp.name} → ${minBp.name} (workload balancing)`);
+            }
+          }
+        }
+      } catch (err: any) {
+        console.error('[Workload balance error]', err.message);
+      }
+    }, 15 * 60_000);
+
+    // Orphaned task recovery — detect stuck in_progress tasks every 10 minutes
+    track(async () => {
+      try {
+        const recovered = await this.store.recoverOrphanedTasks(30);
+        for (const task of recovered) {
+          console.warn(`[Recovery] Orphaned task "${task.title}" (${task.id}) returned to assigned queue`);
+          const channel = task.projectId ? `project-${task.projectId}` : 'leadership';
+          this.agentManager.notify('pm', channel,
+            `recovered orphaned task: "${task.title}" was stuck in_progress for >30 min. re-queued for assignment.`);
+          this.fireWebhook('task:recovered', { taskId: task.id, title: task.title, assignedTo: task.assignedTo });
+        }
+      } catch (err: any) {
+        console.error('[Orphan recovery error]', err.message);
+      }
+    }, 10 * 60_000);
+
+    console.log(`  Registered ${this.backgroundTimers.length} background loops`);
+  }
+
   async shutdown(): Promise<void> {
     console.log('Shutting down...');
+
+    // Stop all background loops
+    for (const timer of this.backgroundTimers) {
+      clearInterval(timer);
+    }
+    this.backgroundTimers.length = 0;
+
     this.scheduler.stop();
+
+    // Gracefully shut down agent manager (abort active sessions, clear timers)
+    await this.agentManager.shutdown();
+
     this.apiServer.close();
     this.wsServer.close();
     if (this.slack) await this.slack.stop();
-    await this.store.close();
+
+    // Close DB with timeout to prevent hanging on stuck connections
+    await Promise.race([
+      this.store.close(),
+      new Promise<void>(resolve => setTimeout(() => {
+        console.warn('DB close timed out after 10s — forcing exit');
+        resolve();
+      }, 10_000)),
+    ]);
+
     console.log('Claude Agency stopped.');
   }
 }
