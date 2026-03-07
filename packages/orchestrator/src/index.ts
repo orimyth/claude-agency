@@ -54,6 +54,9 @@ export class Agency {
   private webhookQueue: Array<{ event: string; data: any }> = [];
   /** Background loop timer handles for cleanup on shutdown */
   private backgroundTimers: ReturnType<typeof setInterval>[] = [];
+  /** Sequential queue for investor messages to prevent concurrent CEO calls */
+  private investorMsgQueue: Array<{ msg: InvestorMessage; resolve: () => void }> = [];
+  private investorMsgProcessing = false;
 
   constructor() {
     this.store = new StateStore(agencyConfig.mysql);
@@ -668,92 +671,12 @@ export class Agency {
     this.slack.on('investor:message', async (msg: InvestorMessage) => {
       console.log(`[Slack] Investor → CEO: ${msg.text}`);
 
-      try {
-        // Save investor message
-        await this.store.saveMessage({
-          id: crypto.randomUUID(), fromAgentId: 'investor', toAgentId: 'ceo',
-          channel: 'ceo-investor', content: msg.text, timestamp: new Date(),
-        });
-
-        // Build conversation history for context (limit to 5 for efficiency)
-        const recentMessages = await this.store.getChannelMessages('ceo-investor', 3);
-        const history = recentMessages
-          .map(m => `${m.fromAgentId === 'investor' ? 'Investor' : 'Alice'}: ${m.content}`)
-          .join('\n');
-
-        // Combined call: Alice responds AND classifies intent in one query.
-        // Saves a full model call per investor message.
-        const combinedContext = [
-          history ? `Recent conversation:\n${history}\n` : '',
-          `Investor says: "${msg.text}"`,
-          ``,
-          `Respond naturally as Alice the CEO. If they're giving you a task or project idea, acknowledge it and say you'll hand it to Diana (PM) and the team. If it's casual chat, just be friendly. Keep it short — 1-3 sentences, like a real Slack message.`,
-          ``,
-          `IMPORTANT: After your response, add a newline then a JSON line classifying the intent:`,
-          `{"intent":"<project_idea|simple_task|hire_request|question|chat>","summary":"<1 sentence>"}`,
-          `The JSON must be on its own line at the very end.`,
-        ].filter(Boolean).join('\n');
-
-        const rawResponse = await this.agentManager.chat('ceo', msg.text, combinedContext, 'ceo-investor');
-
-        // Parse combined response: split chat response from intent JSON
-        const jsonMatch = rawResponse.match(/\{[^{}]*"intent"\s*:\s*"[^"]*"[^{}]*\}\s*$/);
-        const response = jsonMatch
-          ? rawResponse.slice(0, rawResponse.lastIndexOf(jsonMatch[0])).trim()
-          : rawResponse.trim();
-
-        let intent: { type: string; summary: string } = { type: 'chat', summary: msg.text.slice(0, 100) };
-        if (jsonMatch) {
-          try {
-            const parsed = JSON.parse(jsonMatch[0]);
-            if (parsed.intent) intent = { type: parsed.intent, summary: parsed.summary ?? msg.text.slice(0, 100) };
-          } catch { /* fallback to default */ }
-        }
-
-        const ceoBp = this.agentManager.getBlueprint('ceo');
-        await this.slack!.sendAgentMessage('agency-ceo-investor', 'Alice', 'CEO', response, ceoBp?.avatar);
-
-        await this.store.saveMessage({
-          id: crypto.randomUUID(), fromAgentId: 'ceo', toAgentId: 'investor',
-          channel: 'ceo-investor', content: response, timestamp: new Date(),
-        });
-
-        console.log(`[Intent] "${msg.text.slice(0, 50)}..." → ${intent.type}`);
-
-        // Audit log: record investor interaction with full context
-        await this.auditLog('investor:message', 'investor', 'ceo-investor', msg.text, {
-          intent: intent.type,
-          summary: intent.summary,
-          ceoResponse: response.slice(0, 200),
-        });
-
-        switch (intent.type) {
-          case 'project_idea':
-            // Big project → Alice delegates to PM Diana
-            await this.delegateTopm(msg.text, intent.summary);
-            break;
-
-          case 'simple_task':
-            // Simple actionable request → Alice creates a task for PM to handle
-            await this.delegateSimpleTask(msg.text, intent.summary);
-            break;
-
-          case 'hire_request':
-            // HR request → route to Bob
-            await this.routeToHr(msg.text, response);
-            break;
-
-          case 'question':
-          case 'chat':
-            // Pure conversation — Alice already responded, nothing more to do
-            break;
-        }
-      } catch (err: any) {
-        console.error('[CEO chat error]', err.message);
-        const ceoBpFallback = this.agentManager.getBlueprint('ceo');
-        await this.slack!.sendAgentMessage('agency-ceo-investor', 'Alice', 'CEO',
-          `hey, give me a sec — something glitched on my end`, ceoBpFallback?.avatar);
-      }
+      // Queue messages to prevent concurrent CEO calls (race condition).
+      // Each message is processed sequentially so Alice has full context.
+      await new Promise<void>((resolve) => {
+        this.investorMsgQueue.push({ msg, resolve });
+        this.processInvestorQueue();
+      });
     });
 
     // --- Approval responses ---
@@ -918,6 +841,106 @@ export class Agency {
   }
 
   // --- Delegation Chain ---
+
+  /**
+   * Process investor messages sequentially to avoid concurrent CEO calls.
+   */
+  private async processInvestorQueue(): Promise<void> {
+    if (this.investorMsgProcessing) return;
+    this.investorMsgProcessing = true;
+
+    while (this.investorMsgQueue.length > 0) {
+      const { msg, resolve } = this.investorMsgQueue.shift()!;
+      try {
+        await this.handleInvestorMessage(msg);
+      } catch (err: any) {
+        console.error('[CEO chat error]', err.message);
+        const ceoBp = this.agentManager.getBlueprint('ceo');
+        await this.slack?.sendAgentMessage('agency-ceo-investor', 'Alice', 'CEO',
+          `sorry, had a hiccup processing that. can you repeat?`, ceoBp?.avatar);
+      }
+      resolve();
+    }
+
+    this.investorMsgProcessing = false;
+  }
+
+  /**
+   * Handle a single investor message — called sequentially from the queue.
+   */
+  private async handleInvestorMessage(msg: InvestorMessage): Promise<void> {
+    // Save investor message
+    await this.store.saveMessage({
+      id: crypto.randomUUID(), fromAgentId: 'investor', toAgentId: 'ceo',
+      channel: 'ceo-investor', content: msg.text, timestamp: new Date(),
+    });
+
+    // Build conversation history for context
+    const recentMessages = await this.store.getChannelMessages('ceo-investor', 8);
+    const history = recentMessages
+      .map(m => `${m.fromAgentId === 'investor' ? 'Investor' : 'Alice'}: ${m.content}`)
+      .join('\n');
+
+    // Combined call: Alice responds AND classifies intent in one query.
+    const combinedContext = [
+      history ? `Recent conversation:\n${history}\n` : '',
+      `Investor says: "${msg.text}"`,
+      ``,
+      `Respond naturally as Alice the CEO. If they're giving you a task or project idea, acknowledge it and say you'll hand it to Diana (PM) and the team. If they're referring to something from earlier in the conversation, use the conversation history above. If it's casual chat, just be friendly. Keep it short — 1-3 sentences, like a real Slack message.`,
+      ``,
+      `IMPORTANT: After your response, add a newline then a JSON line classifying the intent:`,
+      `{"intent":"<project_idea|simple_task|hire_request|question|chat>","summary":"<1 sentence>"}`,
+      `The JSON must be on its own line at the very end.`,
+    ].filter(Boolean).join('\n');
+
+    const rawResponse = await this.agentManager.chat('ceo', msg.text, combinedContext, 'ceo-investor');
+
+    // Parse combined response: split chat response from intent JSON
+    const jsonMatch = rawResponse.match(/\{[^{}]*"intent"\s*:\s*"[^"]*"[^{}]*\}\s*$/);
+    const response = jsonMatch
+      ? rawResponse.slice(0, rawResponse.lastIndexOf(jsonMatch[0])).trim()
+      : rawResponse.trim();
+
+    let intent: { type: string; summary: string } = { type: 'chat', summary: msg.text.slice(0, 100) };
+    if (jsonMatch) {
+      try {
+        const parsed = JSON.parse(jsonMatch[0]);
+        if (parsed.intent) intent = { type: parsed.intent, summary: parsed.summary ?? msg.text.slice(0, 100) };
+      } catch { /* fallback to default */ }
+    }
+
+    const ceoBp = this.agentManager.getBlueprint('ceo');
+    await this.slack!.sendAgentMessage('agency-ceo-investor', 'Alice', 'CEO', response, ceoBp?.avatar);
+
+    await this.store.saveMessage({
+      id: crypto.randomUUID(), fromAgentId: 'ceo', toAgentId: 'investor',
+      channel: 'ceo-investor', content: response, timestamp: new Date(),
+    });
+
+    console.log(`[Intent] "${msg.text.slice(0, 50)}..." → ${intent.type}`);
+
+    // Audit log
+    await this.auditLog('investor:message', 'investor', 'ceo-investor', msg.text, {
+      intent: intent.type,
+      summary: intent.summary,
+      ceoResponse: response.slice(0, 200),
+    });
+
+    switch (intent.type) {
+      case 'project_idea':
+        await this.delegateTopm(msg.text, intent.summary);
+        break;
+      case 'simple_task':
+        await this.delegateSimpleTask(msg.text, intent.summary);
+        break;
+      case 'hire_request':
+        await this.routeToHr(msg.text, response);
+        break;
+      case 'question':
+      case 'chat':
+        break;
+    }
+  }
 
   /**
    * CEO delegates a project idea to Diana (PM).
