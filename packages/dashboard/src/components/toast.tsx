@@ -88,7 +88,7 @@ function ToastItem({ toast, onDismiss }: { toast: Toast; onDismiss: () => void }
     <div
       className={`
         flex items-start gap-3 px-4 py-3 rounded-xl shadow-lg border backdrop-blur-sm
-        bg-white/95 ${style.border}
+        bg-white/95 dark:bg-gray-900/95 ${style.border}
         transition-all duration-300 ease-out max-w-sm w-full
         ${isExiting
           ? "opacity-0 translate-x-8 scale-95"
@@ -103,9 +103,9 @@ function ToastItem({ toast, onDismiss }: { toast: Toast; onDismiss: () => void }
         </svg>
       </div>
       <div className="flex-1 min-w-0 pt-0.5">
-        <p className="text-sm font-semibold text-gray-900 leading-tight">{toast.title}</p>
+        <p className="text-sm font-semibold text-gray-900 dark:text-gray-100 leading-tight">{toast.title}</p>
         {toast.message && (
-          <p className="text-xs text-gray-500 mt-0.5 line-clamp-2">{toast.message}</p>
+          <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5 line-clamp-2">{toast.message}</p>
         )}
       </div>
       <button

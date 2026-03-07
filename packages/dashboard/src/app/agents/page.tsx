@@ -46,8 +46,8 @@ export default function AgentsPage() {
     <div className="max-w-7xl mx-auto">
       <div className="flex items-center justify-between mb-6">
         <div>
-          <h1 className="text-2xl font-bold text-gray-900">Agent Roster</h1>
-          <p className="text-sm text-gray-500 mt-1">{agents.length} agents registered</p>
+          <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Agent Roster</h1>
+          <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">{agents.length} agents registered</p>
         </div>
         {agents.length > 0 && (
           <div className="flex items-center gap-3 text-xs text-gray-500">
@@ -78,7 +78,7 @@ export default function AgentsPage() {
               <SkeletonAgentCard />
             </>
           ) : agents.length === 0 ? (
-            <div className="bg-white rounded-xl shadow-sm border border-gray-100">
+            <div className="bg-white dark:bg-gray-900 rounded-xl shadow-sm border border-gray-100 dark:border-gray-800">
               <EmptyState
                 icon="agents"
                 title="No agents registered"
@@ -120,7 +120,7 @@ export default function AgentsPage() {
         <div>
           {agent ? (
             <div
-              className="bg-white rounded-xl shadow-sm border border-gray-100 sticky top-8 overflow-hidden"
+              className="bg-white dark:bg-gray-900 rounded-xl shadow-sm border border-gray-100 dark:border-gray-800 sticky top-8 overflow-hidden"
               style={{ animation: "fadeSlideIn 0.25s ease-out" }}
             >
               {/* Agent header */}
@@ -143,7 +143,7 @@ export default function AgentsPage() {
                     <div className={`absolute -bottom-0.5 -right-0.5 w-4 h-4 rounded-full border-2 border-white ${agentStyle(agent.status).dot}`} />
                   </div>
                   <div>
-                    <h2 className="text-lg font-bold text-gray-900">{agent.name}</h2>
+                    <h2 className="text-lg font-bold text-gray-900 dark:text-white">{agent.name}</h2>
                     <p className="text-sm text-gray-500">{agent.role}</p>
                     <span className={`inline-flex items-center mt-1 px-2 py-0.5 rounded-full text-xs font-medium ${agentStyle(agent.status).bg} ${agentStyle(agent.status).text}`}>
                       {agentStyle(agent.status).label}
@@ -153,12 +153,12 @@ export default function AgentsPage() {
               </div>
 
               {/* Stats row */}
-              <div className="grid grid-cols-3 border-y border-gray-100">
+              <div className="grid grid-cols-3 border-y border-gray-100 dark:border-gray-800">
                 <div className="px-4 py-3 text-center">
-                  <p className="text-lg font-bold text-gray-900 tabular-nums">{activeTasks.length}</p>
+                  <p className="text-lg font-bold text-gray-900 dark:text-white tabular-nums">{activeTasks.length}</p>
                   <p className="text-xs text-gray-400">Active</p>
                 </div>
-                <div className="px-4 py-3 text-center border-x border-gray-100">
+                <div className="px-4 py-3 text-center border-x border-gray-100 dark:border-gray-800">
                   <p className="text-lg font-bold text-emerald-600 tabular-nums">{completedTasks.length}</p>
                   <p className="text-xs text-gray-400">Done</p>
                 </div>
@@ -218,10 +218,10 @@ export default function AgentsPage() {
                         return (
                           <div
                             key={task.id}
-                            className="bg-gray-50 rounded-lg px-3 py-2 border border-gray-100"
+                            className="bg-gray-50 dark:bg-gray-800 rounded-lg px-3 py-2 border border-gray-100 dark:border-gray-700"
                           >
                             <div className="flex items-center justify-between gap-2">
-                              <p className="text-sm text-gray-900 truncate font-medium">
+                              <p className="text-sm text-gray-900 dark:text-gray-200 truncate font-medium">
                                 {task.title || task.id}
                               </p>
                               <span className={`flex-shrink-0 px-1.5 py-0.5 rounded text-xs font-medium ${style.bg} ${style.text}`}>
@@ -264,7 +264,7 @@ export default function AgentsPage() {
               </div>
             </div>
           ) : (
-            <div className="bg-white rounded-xl shadow-sm border border-gray-100 sticky top-8">
+            <div className="bg-white dark:bg-gray-900 rounded-xl shadow-sm border border-gray-100 dark:border-gray-800 sticky top-8">
               <EmptyState
                 icon="agents"
                 title="Select an agent"

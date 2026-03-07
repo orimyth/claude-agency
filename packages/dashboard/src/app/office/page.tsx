@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useMemo } from "react";
+import { useTheme } from "@/components/theme-provider";
 import { fetchAgents, fetchTasks } from "@/lib/api";
 import type { Agent, Task } from "@/lib/api";
 
@@ -504,6 +505,8 @@ function computePositions(
 // ---------------------------------------------------------------------------
 
 export default function OfficePage() {
+  const { resolved: theme } = useTheme();
+  const isDark = theme === "dark";
   const [agents, setAgents] = useState<Agent[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [hoveredAgent, setHoveredAgent] = useState<string | null>(null);
@@ -540,7 +543,7 @@ export default function OfficePage() {
     <div className="max-w-7xl mx-auto">
       <div className="flex items-center justify-between mb-5">
         <div>
-          <h1 className="text-2xl font-bold text-gray-900">The Office</h1>
+          <h1 className="text-2xl font-bold text-gray-900 dark:text-white">The Office</h1>
           <p className="text-sm text-gray-500 mt-1">
             Live view of your AI team — {agents.filter((a) => a.status === "active").length} working,{" "}
             {agents.filter((a) => a.status === "on_break").length} on break
@@ -562,7 +565,7 @@ export default function OfficePage() {
         </div>
       </div>
 
-      <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-4 overflow-x-auto">
+      <div className="bg-white dark:bg-gray-900 rounded-2xl shadow-sm border border-gray-100 dark:border-gray-800 p-4 overflow-x-auto transition-colors duration-300">
         <div className="relative" style={{ width: 800, height: 350, minWidth: 800 }}>
           {/* Room backgrounds as SVG */}
           <svg
@@ -575,10 +578,11 @@ export default function OfficePage() {
             {/* Grid pattern */}
             <defs>
               <pattern id="grid" width="20" height="20" patternUnits="userSpaceOnUse">
-                <path d="M 20 0 L 0 0 0 20" fill="none" stroke="#e5e7eb" strokeWidth="0.3" />
+                <path d="M 20 0 L 0 0 0 20" fill="none" stroke={isDark ? "#1f2937" : "#e5e7eb"} strokeWidth="0.3" />
               </pattern>
             </defs>
-            <rect width="800" height="350" fill="url(#grid)" />
+            <rect width="800" height="350" fill={isDark ? "#111827" : "url(#grid)"} />
+            {!isDark && <rect width="800" height="350" fill="url(#grid)" />}
 
             {/* Rooms */}
             {ROOMS.map((room) => (
@@ -590,11 +594,11 @@ export default function OfficePage() {
                   width={room.w}
                   height={room.h}
                   rx={8}
-                  fill={room.floorColor}
-                  stroke={room.color}
+                  fill={isDark ? "#1a1f2e" : room.floorColor}
+                  stroke={isDark ? room.color + "80" : room.color}
                   strokeWidth="1.5"
                   strokeDasharray={room.id === "hallway" ? "4 2" : "none"}
-                  opacity={0.9}
+                  opacity={isDark ? 0.95 : 0.9}
                 />
                 {/* Room label */}
                 <text
@@ -678,10 +682,10 @@ export default function OfficePage() {
           return (
             <div
               key={agent.id}
-              className={`bg-white rounded-lg border p-2.5 cursor-pointer transition-all text-center ${
+              className={`bg-white dark:bg-gray-900 rounded-lg border p-2.5 cursor-pointer transition-all text-center ${
                 hoveredAgent === agent.id
                   ? "border-blue-300 shadow-md ring-2 ring-blue-100"
-                  : "border-gray-100 hover:border-gray-200 hover:shadow-sm"
+                  : "border-gray-100 dark:border-gray-800 hover:border-gray-200 dark:hover:border-gray-700 hover:shadow-sm"
               }`}
               onMouseEnter={() => setHoveredAgent(agent.id)}
               onMouseLeave={() => setHoveredAgent(null)}
@@ -694,7 +698,7 @@ export default function OfficePage() {
                   walking={false}
                 />
               </div>
-              <p className="text-xs font-semibold text-gray-900 truncate">{agent.name}</p>
+              <p className="text-xs font-semibold text-gray-900 dark:text-gray-100 truncate">{agent.name}</p>
               <p className="text-[10px] text-gray-400 truncate">{agent.role}</p>
               {room && (
                 <p className="text-[10px] mt-0.5 truncate" style={{ color: room.color }}>

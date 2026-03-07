@@ -2,13 +2,13 @@
 
 export function SkeletonLine({ className = "" }: { className?: string }) {
   return (
-    <div className={`animate-pulse bg-gray-200 rounded ${className}`} />
+    <div className={`animate-pulse bg-gray-200 dark:bg-gray-700 rounded ${className}`} />
   );
 }
 
 export function SkeletonKPI() {
   return (
-    <div className="bg-white rounded-xl shadow-sm border-l-4 border-gray-200 p-6 animate-pulse">
+    <div className="bg-white dark:bg-gray-900 rounded-xl shadow-sm border-l-4 border-gray-200 p-6 animate-pulse">
       <div className="bg-gray-200 rounded h-3 w-20 mb-3" />
       <div className="bg-gray-200 rounded h-8 w-12 mb-2" />
       <div className="bg-gray-200 rounded h-3 w-16" />
@@ -18,7 +18,7 @@ export function SkeletonKPI() {
 
 export function SkeletonAgentCard() {
   return (
-    <div className="bg-white rounded-xl shadow-sm p-4 border border-gray-100 animate-pulse">
+    <div className="bg-white dark:bg-gray-900 rounded-xl shadow-sm p-4 border border-gray-100 dark:border-gray-800 animate-pulse">
       <div className="flex items-center gap-3 mb-3">
         <div className="w-10 h-10 rounded-full bg-gray-200" />
         <div className="flex-1">
@@ -27,7 +27,7 @@ export function SkeletonAgentCard() {
         </div>
         <div className="bg-gray-200 rounded-full h-3 w-3" />
       </div>
-      <div className="bg-gray-100 rounded-lg h-10" />
+      <div className="bg-gray-100 dark:bg-gray-800 rounded-lg h-10" />
     </div>
   );
 }

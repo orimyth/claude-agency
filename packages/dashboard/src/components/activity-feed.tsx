@@ -80,14 +80,14 @@ export function ActivityFeed({ events, maxItems = 20, loading = false }: Activit
   const recent = events.slice(-maxItems).reverse();
 
   return (
-    <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
-      <div className="px-5 py-3 border-b border-gray-100 flex items-center justify-between">
-        <h3 className="font-semibold text-gray-900 text-sm">Activity Feed</h3>
+    <div className="bg-white dark:bg-gray-900 rounded-xl shadow-sm border border-gray-100 dark:border-gray-800 overflow-hidden transition-colors duration-300">
+      <div className="px-5 py-3 border-b border-gray-100 dark:border-gray-800 flex items-center justify-between">
+        <h3 className="font-semibold text-gray-900 dark:text-gray-100 text-sm">Activity Feed</h3>
         {recent.length > 0 && (
           <span className="text-xs text-gray-400">{recent.length} events</span>
         )}
       </div>
-      <div className="divide-y divide-gray-50 max-h-[28rem] overflow-y-auto">
+      <div className="divide-y divide-gray-50 dark:divide-gray-800 max-h-[28rem] overflow-y-auto">
         {loading ? (
           <>
             <SkeletonActivityItem />
@@ -110,7 +110,7 @@ export function ActivityFeed({ events, maxItems = 20, loading = false }: Activit
             return (
               <div
                 key={`${event.timestamp}-${i}`}
-                className="px-5 py-2.5 flex items-start gap-3 hover:bg-gray-50/50 transition-colors duration-150"
+                className="px-5 py-2.5 flex items-start gap-3 hover:bg-gray-50/50 dark:hover:bg-gray-800/50 transition-colors duration-150"
                 style={{
                   animation: i < 3 ? `fadeSlideIn 0.3s ease-out ${i * 0.05}s both` : undefined,
                 }}
@@ -121,8 +121,8 @@ export function ActivityFeed({ events, maxItems = 20, loading = false }: Activit
                   </svg>
                 </div>
                 <div className="flex-1 min-w-0">
-                  <p className="text-sm text-gray-700 leading-snug line-clamp-2">{text}</p>
-                  <p className="text-xs text-gray-400 mt-0.5">{ago}</p>
+                  <p className="text-sm text-gray-700 dark:text-gray-300 leading-snug line-clamp-2">{text}</p>
+                  <p className="text-xs text-gray-400 dark:text-gray-500 mt-0.5">{ago}</p>
                 </div>
               </div>
             );

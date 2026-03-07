@@ -42,10 +42,10 @@ export function KPICard({
 }: KPICardProps) {
   return (
     <div
-      className={`bg-white rounded-xl shadow-sm border-l-4 ${BORDER_COLORS[color] ?? BORDER_COLORS.blue} p-5 transition-shadow duration-200 hover:shadow-md`}
+      className={`bg-white dark:bg-gray-900 rounded-xl shadow-sm border-l-4 ${BORDER_COLORS[color] ?? BORDER_COLORS.blue} p-5 transition-all duration-300 hover:shadow-md`}
     >
       <div className="flex items-start justify-between">
-        <p className="text-xs text-gray-500 font-medium uppercase tracking-wide">{title}</p>
+        <p className="text-xs text-gray-500 dark:text-gray-400 font-medium uppercase tracking-wide">{title}</p>
         {icon && (
           <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${ICON_COLORS[color] ?? ICON_COLORS.blue}`}>
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -54,9 +54,9 @@ export function KPICard({
           </div>
         )}
       </div>
-      <p className="text-3xl font-bold mt-2 tabular-nums transition-all duration-300">{value}</p>
+      <p className="text-3xl font-bold mt-2 tabular-nums transition-all duration-300 dark:text-white">{value}</p>
       {subtitle && (
-        <p className="text-sm text-gray-400 mt-1 flex items-center gap-1">
+        <p className="text-sm text-gray-400 dark:text-gray-500 mt-1 flex items-center gap-1">
           {trend === "up" && (
             <svg className="w-3.5 h-3.5 text-emerald-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 15l7-7 7 7" />

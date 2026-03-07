@@ -198,8 +198,8 @@ export default function Dashboard() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-gray-900">Agency Overview</h1>
-          <p className="text-gray-500 text-sm mt-1">
+          <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Agency Overview</h1>
+          <p className="text-gray-500 dark:text-gray-400 text-sm mt-1">
             {connected ? "Live" : "Connecting..."} — {agents.length} agents registered
           </p>
         </div>
@@ -231,13 +231,13 @@ export default function Dashboard() {
         <div className="lg:col-span-2 space-y-5">
           {/* Team */}
           <div>
-            <h2 className="text-sm font-semibold text-gray-900 uppercase tracking-wide mb-3">Team</h2>
+            <h2 className="text-sm font-semibold text-gray-900 dark:text-gray-100 uppercase tracking-wide mb-3">Team</h2>
             {loading ? (
               <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                 {Array.from({ length: 4 }).map((_, i) => <SkeletonAgentCard key={i} />)}
               </div>
             ) : agents.length === 0 ? (
-              <div className="bg-white rounded-xl shadow-sm border border-gray-100">
+              <div className="bg-white dark:bg-gray-900 rounded-xl shadow-sm border border-gray-100 dark:border-gray-800">
                 <EmptyState icon="agents" title="No agents registered" description="Agents will appear here once they connect to the orchestrator." />
               </div>
             ) : (
@@ -266,8 +266,8 @@ export default function Dashboard() {
           {/* Task Board — Grouped by Status */}
           <div>
             <div className="flex items-center justify-between mb-3">
-              <h2 className="text-sm font-semibold text-gray-900 uppercase tracking-wide">
-                Tasks {tasks.length > 0 && <span className="text-gray-400 font-normal">({tasks.length})</span>}
+              <h2 className="text-sm font-semibold text-gray-900 dark:text-gray-100 uppercase tracking-wide">
+                Tasks {tasks.length > 0 && <span className="text-gray-400 dark:text-gray-500 font-normal">({tasks.length})</span>}
               </h2>
               {blockedTasks > 0 && (
                 <span className="px-2 py-0.5 bg-red-50 text-red-600 rounded-full text-xs font-medium">
@@ -277,11 +277,11 @@ export default function Dashboard() {
             </div>
 
             {loading ? (
-              <div className="bg-white rounded-xl shadow-sm border border-gray-100 divide-y divide-gray-50">
+              <div className="bg-white dark:bg-gray-900 rounded-xl shadow-sm border border-gray-100 dark:border-gray-800 divide-y divide-gray-50">
                 {Array.from({ length: 5 }).map((_, i) => <SkeletonTaskRow key={i} />)}
               </div>
             ) : tasks.length === 0 ? (
-              <div className="bg-white rounded-xl shadow-sm border border-gray-100">
+              <div className="bg-white dark:bg-gray-900 rounded-xl shadow-sm border border-gray-100 dark:border-gray-800">
                 <EmptyState icon="tasks" title="No tasks yet" description="Submit an idea or create a task to get started." />
               </div>
             ) : (
@@ -292,16 +292,16 @@ export default function Dashboard() {
                   const displayTasks = isExpanded ? groupTasks.slice(0, 20) : [];
 
                   return (
-                    <div key={status} className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+                    <div key={status} className="bg-white dark:bg-gray-900 rounded-xl shadow-sm border border-gray-100 dark:border-gray-800 overflow-hidden">
                       {/* Group header */}
                       <button
                         onClick={() => toggleGroup(status)}
-                        className="w-full px-4 py-2.5 flex items-center justify-between hover:bg-gray-50 transition-colors duration-150"
+                        className="w-full px-4 py-2.5 flex items-center justify-between hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors duration-150"
                       >
                         <div className="flex items-center gap-2.5">
                           <div className={`w-2.5 h-2.5 rounded-full ${style.dot}`} />
-                          <span className="text-sm font-medium text-gray-900">{style.label}</span>
-                          <span className="px-1.5 py-0.5 bg-gray-100 text-gray-500 rounded text-xs font-medium tabular-nums">
+                          <span className="text-sm font-medium text-gray-900 dark:text-gray-100">{style.label}</span>
+                          <span className="px-1.5 py-0.5 bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400 rounded text-xs font-medium tabular-nums">
                             {groupTasks.length}
                           </span>
                         </div>
@@ -315,7 +315,7 @@ export default function Dashboard() {
 
                       {/* Task rows */}
                       {isExpanded && (
-                        <div className="border-t border-gray-100 divide-y divide-gray-50">
+                        <div className="border-t border-gray-100 dark:border-gray-800 divide-y divide-gray-50 dark:divide-gray-800">
                           {displayTasks.map((task) => {
                             const dependsOnTask = task.dependsOn ? taskMap.get(task.dependsOn) : null;
                             const isWaiting = dependsOnTask && dependsOnTask.status !== "done";
@@ -331,11 +331,11 @@ export default function Dashboard() {
                               >
                                 <div className="flex-1 min-w-0">
                                   <div className="flex items-center gap-2">
-                                    <p className="text-sm text-gray-900 truncate">
+                                    <p className="text-sm text-gray-900 dark:text-gray-200 truncate">
                                       {task.title || task.id}
                                     </p>
                                     {branch && (
-                                      <span className="flex-shrink-0 px-1.5 py-0.5 bg-gray-100 text-gray-500 rounded text-xs font-mono">
+                                      <span className="flex-shrink-0 px-1.5 py-0.5 bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400 rounded text-xs font-mono">
                                         {branch}
                                       </span>
                                     )}
