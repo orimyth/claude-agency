@@ -107,10 +107,11 @@ export class AgentManager extends EventEmitter {
   private enrichSystemPrompt(blueprint: AgentBlueprint): string {
     const apiUrl = `http://localhost:${this.config.wsPort + 1}`;
     // Language instruction goes in system prompt so it's cached across all calls
-    let extra = `\n\n${this.getLanguageInstruction()}`;
+    const langExtra = `\n\n${this.getLanguageInstruction()}`;
+    let apiExtra = '';
 
     if (MANAGEMENT_ROLES.has(blueprint.id)) {
-      extra = [
+      apiExtra = [
         `\n\n## Agency Management API`,
         `You can manage projects, tasks, and repos via the Agency API using curl.`,
         `Base URL: ${apiUrl}`,
@@ -137,7 +138,7 @@ export class AgentManager extends EventEmitter {
         `Note: Push automatically creates a feature branch. Merge to main only after QA approves.`,
       ].join('\n');
     } else if (WORKER_ROLES.has(blueprint.id)) {
-      extra = [
+      apiExtra = [
         `\n\n## Git Push API`,
         `After committing your changes locally, push them via the Agency API (do NOT use git push directly).`,
         `The API auto-creates a feature branch so you never push to main.`,
@@ -152,7 +153,7 @@ export class AgentManager extends EventEmitter {
       ].join('\n');
     }
 
-    return blueprint.systemPrompt + extra;
+    return blueprint.systemPrompt + langExtra + apiExtra;
   }
 
   getBlueprint(id: string): AgentBlueprint | undefined {
