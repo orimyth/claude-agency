@@ -8,6 +8,81 @@ import type { AgentToolHandler } from './agent-tools.js';
 import type { DashboardWSServer } from './ws-server.js';
 import { getSDKMetrics } from './sdk-util.js';
 
+// ---------------------------------------------------------------------------
+// Validation helpers
+// ---------------------------------------------------------------------------
+
+/** Validates a value is a non-empty string. */
+function requireString(val: unknown, name: string): string {
+  if (typeof val !== 'string' || val.trim().length === 0) {
+    throw new ValidationError(`${name} is required and must be a non-empty string`);
+  }
+  return val.trim();
+}
+
+/** Validates a value is a positive integer (or returns a default). */
+function optionalInt(val: unknown, defaultVal: number, min = 1, max = 1000): number {
+  if (val === undefined || val === null || val === '') return defaultVal;
+  const n = typeof val === 'string' ? parseInt(val, 10) : Number(val);
+  if (!Number.isFinite(n) || n < min) return min;
+  return Math.min(n, max);
+}
+
+class ValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ValidationError';
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Simple in-memory rate limiter (per-IP, sliding window)
+// ---------------------------------------------------------------------------
+
+interface RateBucket {
+  count: number;
+  resetAt: number;
+}
+
+class RateLimiter {
+  private buckets: Map<string, RateBucket> = new Map();
+  private maxRequests: number;
+  private windowMs: number;
+
+  constructor(maxRequests: number, windowMs: number) {
+    this.maxRequests = maxRequests;
+    this.windowMs = windowMs;
+  }
+
+  /** Returns true if the request should be allowed, false if rate limited. */
+  allow(key: string): boolean {
+    const now = Date.now();
+    const bucket = this.buckets.get(key);
+    if (!bucket || now > bucket.resetAt) {
+      this.buckets.set(key, { count: 1, resetAt: now + this.windowMs });
+      return true;
+    }
+    if (bucket.count >= this.maxRequests) return false;
+    bucket.count++;
+    return true;
+  }
+
+  /** Periodic cleanup of expired buckets. */
+  cleanup(): void {
+    const now = Date.now();
+    for (const [key, bucket] of this.buckets) {
+      if (now > bucket.resetAt) this.buckets.delete(key);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/** Max request body size: 256 KB. */
+const MAX_BODY_SIZE = 256 * 1024;
+
 /**
  * Simple HTTP API for the dashboard.
  * Runs on the same port as the WebSocket server + 1 (e.g., 3002).
@@ -23,11 +98,22 @@ export class APIServer {
   private server: ReturnType<typeof createServer> | null = null;
   private onSettingsChanged: (() => Promise<void>) | null = null;
 
+  // Rate limiters: mutation endpoints are stricter
+  private mutationLimiter = new RateLimiter(30, 60_000);   // 30 req/min
+  private readLimiter = new RateLimiter(120, 60_000);       // 120 req/min
+  private cleanupTimer: ReturnType<typeof setInterval> | null = null;
+
   constructor(store: StateStore, agentManager: AgentManager, taskRouter: TaskRouter, taskBoard: TaskBoard) {
     this.store = store;
     this.agentManager = agentManager;
     this.taskRouter = taskRouter;
     this.taskBoard = taskBoard;
+
+    // Clean up rate limiter buckets every 5 min
+    this.cleanupTimer = setInterval(() => {
+      this.mutationLimiter.cleanup();
+      this.readLimiter.cleanup();
+    }, 5 * 60_000);
   }
 
   setMemoryManager(mm: MemoryManager): void {
@@ -60,10 +146,25 @@ export class APIServer {
       }
 
       try {
+        // Rate limiting
+        const clientIp = req.socket.remoteAddress ?? 'unknown';
+        const isMutation = req.method === 'POST' || req.method === 'PUT';
+        const limiter = isMutation ? this.mutationLimiter : this.readLimiter;
+        if (!limiter.allow(clientIp)) {
+          res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '60' });
+          res.end(JSON.stringify({ error: 'Too many requests' }));
+          return;
+        }
+
         await this.route(req, res);
       } catch (err: any) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: err.message }));
+        if (err instanceof ValidationError) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: err.message }));
+        } else {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: err.message }));
+        }
       }
     });
 
@@ -105,24 +206,16 @@ export class APIServer {
     if (req.method === 'GET' && path.match(/^\/api\/blueprints\/[^/]+$/)) {
       const id = path.split('/').pop()!;
       const bp = await this.store.getBlueprint(id);
-      if (!bp) {
-        res.writeHead(404, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Blueprint not found' }));
-        return;
-      }
+      if (!bp) return this.notFound(res, 'Blueprint not found');
       this.json(res, bp);
       return;
     }
 
     if (req.method === 'PUT' && path.match(/^\/api\/blueprints\/[^/]+$/)) {
       const id = path.split('/').pop()!;
-      const body = JSON.parse(await this.readBody(req));
+      const body = await this.parseBody(req);
       const existing = await this.store.getBlueprint(id);
-      if (!existing) {
-        res.writeHead(404, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Blueprint not found' }));
-        return;
-      }
+      if (!existing) return this.notFound(res, 'Blueprint not found');
       const updated = { ...existing, ...body, id };
       await this.store.updateBlueprint(id, updated);
       this.agentManager.registerBlueprint(updated); // hot-reload
@@ -156,11 +249,7 @@ export class APIServer {
     if (req.method === 'GET' && path.match(/^\/api\/projects\/[^/]+$/)) {
       const projectId = path.split('/').pop()!;
       const project = await this.store.getProject(projectId);
-      if (!project) {
-        res.writeHead(404, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Project not found' }));
-        return;
-      }
+      if (!project) return this.notFound(res, 'Project not found');
       const repos = await this.store.getProjectRepositories(projectId);
       const tasks = await this.store.getTasksByProject(projectId);
       this.json(res, { ...project, repositories: repos, tasks });
@@ -174,14 +263,22 @@ export class APIServer {
       return;
     }
 
+    // Tasks with pagination & filtering
     if (req.method === 'GET' && path === '/api/tasks') {
       const projectId = url.searchParams.get('projectId');
+      const status = url.searchParams.get('status');
+      const agentId = url.searchParams.get('agentId');
+      const limit = optionalInt(url.searchParams.get('limit'), 100, 1, 500);
+      const offset = optionalInt(url.searchParams.get('offset'), 0, 0, 100_000);
+
       if (projectId) {
         const tasks = await this.store.getTasksByProject(projectId);
-        this.json(res, tasks);
+        const filtered = this.filterTasks(tasks, status, agentId);
+        this.json(res, { tasks: filtered.slice(offset, offset + limit), total: filtered.length });
       } else {
-        const tasks = await this.store.getAllTasks();
-        this.json(res, tasks);
+        const tasks = await this.store.getAllTasks(limit + offset);
+        const filtered = this.filterTasks(tasks, status, agentId);
+        this.json(res, { tasks: filtered.slice(offset, offset + limit), total: filtered.length });
       }
       return;
     }
@@ -193,8 +290,9 @@ export class APIServer {
     }
 
     if (req.method === 'POST' && path === '/api/submit') {
-      const body = await this.readBody(req);
-      const { title, description } = JSON.parse(body);
+      const body = await this.parseBody(req);
+      const title = requireString(body.title, 'title');
+      const description = requireString(body.description, 'description');
       const result = await this.taskRouter.submitIdea(title, description);
       this.json(res, result);
       return;
@@ -215,9 +313,12 @@ export class APIServer {
     }
 
     if (req.method === 'POST' && path === '/api/settings') {
-      const body = await this.readBody(req);
-      const entries = JSON.parse(body) as Record<string, string>;
+      const entries = await this.parseBody(req) as Record<string, string>;
+      if (typeof entries !== 'object' || entries === null || Array.isArray(entries)) {
+        throw new ValidationError('Body must be a JSON object of key/value pairs');
+      }
       for (const [key, value] of Object.entries(entries)) {
+        if (typeof key !== 'string' || typeof value !== 'string') continue;
         await this.store.setSetting(key, value);
       }
       if (this.onSettingsChanged) await this.onSettingsChanged();
@@ -239,14 +340,14 @@ export class APIServer {
     // --- Agency action endpoints (called by agents via curl) ---
 
     if (req.method === 'POST' && path === '/api/agency/projects' && this.toolHandler) {
-      const body = JSON.parse(await this.readBody(req));
+      const body = await this.parseBody(req);
       const result = await this.toolHandler.handleToolCall(body.agentId ?? 'system', 'agency_create_project', body);
       this.json(res, result);
       return;
     }
 
     if (req.method === 'POST' && path === '/api/agency/repositories' && this.toolHandler) {
-      const body = JSON.parse(await this.readBody(req));
+      const body = await this.parseBody(req);
       const result = await this.toolHandler.handleToolCall(body.agentId ?? 'system', 'agency_add_repository', body);
       this.json(res, result);
       return;
@@ -261,7 +362,7 @@ export class APIServer {
 
     if (req.method === 'POST' && path.match(/^\/api\/agency\/repositories\/[^/]+\/push$/) && this.toolHandler) {
       const repositoryId = path.split('/')[4];
-      const body = JSON.parse(await this.readBody(req));
+      const body = await this.parseBody(req);
       const result = await this.toolHandler.handleToolCall('system', 'agency_git_push', { repositoryId, ...body });
       this.json(res, result);
       return;
@@ -269,28 +370,23 @@ export class APIServer {
 
     if (req.method === 'POST' && path.match(/^\/api\/agency\/repositories\/[^/]+\/merge$/) && this.toolHandler) {
       const repositoryId = path.split('/')[4];
-      const body = JSON.parse(await this.readBody(req));
+      const body = await this.parseBody(req);
       const result = await this.toolHandler.handleToolCall('system', 'agency_git_merge', { repositoryId, ...body });
       this.json(res, result);
       return;
     }
 
     if (req.method === 'POST' && path === '/api/agency/hire' && this.toolHandler) {
-      // Quick hire by forking an existing blueprint
-      const body = JSON.parse(await this.readBody(req));
-      const { sourceRole, name, id, gender, customPrompt } = body;
-      if (!sourceRole || !name) {
-        this.json(res, { success: false, error: 'sourceRole and name are required' });
-        return;
-      }
-      // Find a blueprint with this role to fork from
+      const body = await this.parseBody(req);
+      const sourceRole = requireString(body.sourceRole, 'sourceRole');
+      const name = requireString(body.name, 'name');
       const blueprints = this.agentManager.getAllBlueprints();
       const source = blueprints.find(b => b.role.toLowerCase().includes(sourceRole.toLowerCase()) || b.id === sourceRole);
       if (!source) {
         this.json(res, { success: false, error: `No blueprint found for role '${sourceRole}'` });
         return;
       }
-      const agentId = id ?? name.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+      const agentId = body.id ?? name.toLowerCase().replace(/[^a-z0-9]+/g, '-');
       this.json(res, {
         success: true,
         data: { message: `Fork ${source.id} as ${agentId}. Use PUT /api/blueprints/${agentId} to finalize.`, sourceId: source.id, agentId },
@@ -299,9 +395,12 @@ export class APIServer {
     }
 
     if (req.method === 'POST' && path === '/api/agency/tasks' && this.toolHandler) {
-      const body = JSON.parse(await this.readBody(req));
-      // Support batch task creation: { tasks: [...] }
+      const body = await this.parseBody(req);
+      // Support batch task creation: { tasks: [...] } — limit to 20 per request
       if (Array.isArray(body.tasks)) {
+        if (body.tasks.length > 20) {
+          throw new ValidationError('Batch task creation limited to 20 tasks per request');
+        }
         const results = [];
         for (const taskInput of body.tasks) {
           const result = await this.toolHandler.handleToolCall(taskInput.agentId ?? body.agentId ?? 'system', 'agency_create_task', taskInput);
@@ -346,11 +445,7 @@ export class APIServer {
     if (req.method === 'GET' && path.match(/^\/api\/templates\/[^/]+$/)) {
       const id = path.split('/').pop()!;
       const template = await this.store.getTaskTemplate(id);
-      if (!template) {
-        res.writeHead(404, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Template not found' }));
-        return;
-      }
+      if (!template) return this.notFound(res, 'Template not found');
       this.json(res, template);
       return;
     }
@@ -359,17 +454,10 @@ export class APIServer {
     if (req.method === 'POST' && path.match(/^\/api\/templates\/[^/]+\/instantiate$/) && this.toolHandler) {
       const templateId = path.split('/')[3];
       const template = await this.store.getTaskTemplate(templateId);
-      if (!template) {
-        res.writeHead(404, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Template not found' }));
-        return;
-      }
-      const body = JSON.parse(await this.readBody(req));
-      const { name, projectId } = body;
-      if (!name) {
-        this.json(res, { success: false, error: 'name is required' });
-        return;
-      }
+      if (!template) return this.notFound(res, 'Template not found');
+      const body = await this.parseBody(req);
+      const name = requireString(body.name, 'name');
+      const projectId = body.projectId ?? null;
 
       // Create tasks from template steps, substituting {name}
       const createdTasks: any[] = [];
@@ -385,7 +473,7 @@ export class APIServer {
           title: step.title.replace(/\{name\}/g, name),
           description: step.description.replace(/\{name\}/g, name),
           status: (step.assignTo && !dependsOn) ? 'assigned' as const : 'backlog' as const,
-          projectId: projectId ?? null,
+          projectId,
           assignedTo: step.assignTo ?? null,
           createdBy: body.agentId ?? 'system',
           parentTaskId: null,
@@ -428,11 +516,13 @@ export class APIServer {
 
     // --- Task priority rebalancing ---
     if (req.method === 'POST' && path === '/api/tasks/rebalance') {
-      const body = JSON.parse(await this.readBody(req));
-      const { updates } = body; // Array of { taskId, priority }
+      const body = await this.parseBody(req);
+      const { updates } = body;
       if (!Array.isArray(updates)) {
-        this.json(res, { success: false, error: 'updates array is required' });
-        return;
+        throw new ValidationError('updates array is required');
+      }
+      if (updates.length > 50) {
+        throw new ValidationError('Maximum 50 priority updates per request');
       }
       await this.store.rebalancePriorities(updates);
       this.json(res, { success: true, updated: updates.length });
@@ -456,22 +546,20 @@ export class APIServer {
 
     // --- Skill matching ---
     if (req.method === 'POST' && path === '/api/skill-match') {
-      const body = JSON.parse(await this.readBody(req));
-      const { title, description, exclude } = body;
-      if (!title) {
-        this.json(res, { success: false, error: 'title is required' });
-        return;
-      }
+      const body = await this.parseBody(req);
+      const title = requireString(body.title, 'title');
+      const description = typeof body.description === 'string' ? body.description : '';
+      const exclude = Array.isArray(body.exclude) ? body.exclude : [];
       const blueprints = this.agentManager.getAllBlueprints();
-      const matches = this.store.findBestAgent(blueprints, title, description ?? '', exclude ?? []);
+      const matches = this.store.findBestAgent(blueprints, title, description, exclude);
       this.json(res, matches);
       return;
     }
 
-    // --- Audit log ---
+    // --- Audit log with pagination ---
     if (req.method === 'GET' && path === '/api/audit') {
       const channel = url.searchParams.get('channel') ?? 'ceo-investor';
-      const limit = parseInt(url.searchParams.get('limit') ?? '50', 10);
+      const limit = optionalInt(url.searchParams.get('limit'), 50, 1, 200);
       const entries = await this.store.getAuditLog(channel, limit);
       this.json(res, entries);
       return;
@@ -479,22 +567,20 @@ export class APIServer {
 
     // --- Webhook management ---
     if (req.method === 'GET' && path === '/api/webhooks') {
-      // Return configured webhooks (mask secrets)
       const hooks = (this.agentManager as any).config?.webhooks ?? [];
       this.json(res, hooks.map((h: any) => ({ url: h.url, events: h.events, hasSecret: !!h.secret })));
       return;
     }
 
     if (req.method === 'POST' && path === '/api/webhooks') {
-      const body = JSON.parse(await this.readBody(req));
-      const { url: hookUrl, events, secret } = body;
-      if (!hookUrl || !events) {
-        this.json(res, { success: false, error: 'url and events are required' });
-        return;
+      const body = await this.parseBody(req);
+      const hookUrl = requireString(body.url, 'url');
+      if (!Array.isArray(body.events) || body.events.length === 0) {
+        throw new ValidationError('events array is required and must not be empty');
       }
       const config = (this.agentManager as any).config;
       if (config?.webhooks) {
-        config.webhooks.push({ url: hookUrl, events, secret });
+        config.webhooks.push({ url: hookUrl, events: body.events, secret: body.secret });
       }
       this.json(res, { success: true });
       return;
@@ -503,7 +589,6 @@ export class APIServer {
     // --- Investor request tracking ---
     if (req.method === 'GET' && path === '/api/investor-requests') {
       const requests = await this.store.getInvestorRequests();
-      // Enrich with task progress
       const enriched = await Promise.all(requests.map(async r => {
         let tasks: any[] = [];
         if (r.rootTaskId) {
@@ -523,10 +608,13 @@ export class APIServer {
 
     if (req.method === 'POST' && path.startsWith('/api/approvals/')) {
       const approvalId = path.split('/').pop();
-      const body = await this.readBody(req);
-      const { status, feedback } = JSON.parse(body);
+      const body = await this.parseBody(req);
+      const status = requireString(body.status, 'status');
+      if (!['approved', 'rejected'].includes(status)) {
+        throw new ValidationError('status must be "approved" or "rejected"');
+      }
       if (approvalId) {
-        await this.store.resolveApproval(approvalId, status, feedback);
+        await this.store.resolveApproval(approvalId, status, body.feedback);
       }
       this.json(res, { ok: true });
       return;
@@ -549,13 +637,14 @@ export class APIServer {
     // --- Task Deadline / SLA ---
     if (req.method === 'POST' && path.match(/^\/api\/tasks\/[^/]+\/deadline$/)) {
       const taskId = path.split('/')[3];
-      const body = JSON.parse(await this.readBody(req));
-      if (!body.deadline) {
-        this.json(res, { success: false, error: 'deadline (ISO string) is required' });
-        return;
+      const body = await this.parseBody(req);
+      const deadlineStr = requireString(body.deadline, 'deadline');
+      const deadline = new Date(deadlineStr);
+      if (isNaN(deadline.getTime())) {
+        throw new ValidationError('deadline must be a valid ISO date string');
       }
-      await this.store.setTaskDeadline(taskId, new Date(body.deadline));
-      this.json(res, { success: true, taskId, deadline: body.deadline });
+      await this.store.setTaskDeadline(taskId, deadline);
+      this.json(res, { success: true, taskId, deadline: deadline.toISOString() });
       return;
     }
 
@@ -566,7 +655,7 @@ export class APIServer {
     }
 
     if (req.method === 'GET' && path === '/api/tasks/near-deadline') {
-      const hours = parseInt(url.searchParams.get('hours') ?? '2', 10);
+      const hours = optionalInt(url.searchParams.get('hours'), 2, 1, 168);
       const tasks = await this.store.getTasksNearDeadline(hours);
       this.json(res, tasks);
       return;
@@ -574,7 +663,7 @@ export class APIServer {
 
     // --- Daily Cost Digest ---
     if (req.method === 'GET' && path === '/api/cost-digest') {
-      const hours = parseInt(url.searchParams.get('hours') ?? '24', 10);
+      const hours = optionalInt(url.searchParams.get('hours'), 24, 1, 720);
       const digest = await this.store.getCostDigest(hours);
       this.json(res, digest);
       return;
@@ -602,12 +691,14 @@ export class APIServer {
 
     if (req.method === 'POST' && path.match(/^\/api\/tasks\/[^/]+\/reassign$/)) {
       const taskId = path.split('/')[3];
-      const body = JSON.parse(await this.readBody(req));
-      if (!body.agentId) {
-        this.json(res, { success: false, error: 'agentId is required' });
-        return;
+      const body = await this.parseBody(req);
+      const agentId = requireString(body.agentId, 'agentId');
+      // Validate target agent exists
+      const targetBp = this.agentManager.getBlueprint(agentId);
+      if (!targetBp) {
+        throw new ValidationError(`Agent '${agentId}' not found`);
       }
-      const reassigned = await this.store.cascadeReassignTask(taskId, body.agentId, body.cascade ?? false);
+      const reassigned = await this.store.cascadeReassignTask(taskId, agentId, body.cascade ?? false);
       this.json(res, { success: true, reassigned, count: reassigned.length });
       return;
     }
@@ -620,13 +711,11 @@ export class APIServer {
     }
 
     if (req.method === 'POST' && path === '/api/workload/rebalance') {
-      const body = JSON.parse(await this.readBody(req));
-      const { fromAgent, toAgent, count } = body;
-      if (!fromAgent || !toAgent) {
-        this.json(res, { success: false, error: 'fromAgent and toAgent are required' });
-        return;
-      }
-      const candidates = await this.store.getRebalanceCandidates(fromAgent, count ?? 1);
+      const body = await this.parseBody(req);
+      const fromAgent = requireString(body.fromAgent, 'fromAgent');
+      const toAgent = requireString(body.toAgent, 'toAgent');
+      const count = optionalInt(body.count, 1, 1, 10);
+      const candidates = await this.store.getRebalanceCandidates(fromAgent, count);
       const moved: string[] = [];
       for (const task of candidates) {
         await this.store.cascadeReassignTask(task.id, toAgent, false);
@@ -639,12 +728,10 @@ export class APIServer {
     // --- Task Progress Notes ---
     if (req.method === 'POST' && path.match(/^\/api\/tasks\/[^/]+\/notes$/)) {
       const taskId = path.split('/')[3];
-      const body = JSON.parse(await this.readBody(req));
-      if (!body.agentId || !body.content) {
-        this.json(res, { success: false, error: 'agentId and content are required' });
-        return;
-      }
-      const noteId = await this.store.addTaskNote(taskId, body.agentId, body.content);
+      const body = await this.parseBody(req);
+      const agentIdVal = requireString(body.agentId, 'agentId');
+      const content = requireString(body.content, 'content');
+      const noteId = await this.store.addTaskNote(taskId, agentIdVal, content);
       this.json(res, { success: true, noteId });
       return;
     }
@@ -657,14 +744,24 @@ export class APIServer {
     }
 
     if (req.method === 'GET' && path === '/api/activity-feed') {
-      const limit = parseInt(url.searchParams.get('limit') ?? '20', 10);
+      const limit = optionalInt(url.searchParams.get('limit'), 20, 1, 100);
       const feed = await this.store.getRecentTaskNotes(limit);
       this.json(res, feed);
       return;
     }
 
-    res.writeHead(404, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Not found' }));
+    this.notFound(res, 'Not found');
+  }
+
+  // -------------------------------------------------------------------------
+  // Helpers
+  // -------------------------------------------------------------------------
+
+  private filterTasks(tasks: any[], status: string | null, agentId: string | null): any[] {
+    let result = tasks;
+    if (status) result = result.filter(t => t.status === status);
+    if (agentId) result = result.filter(t => t.assignedTo === agentId);
+    return result;
   }
 
   private json(res: ServerResponse, data: any): void {
@@ -672,16 +769,42 @@ export class APIServer {
     res.end(JSON.stringify(data));
   }
 
+  private notFound(res: ServerResponse, message: string): void {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: message }));
+  }
+
+  /** Read and parse JSON body with size limit and safe parsing. */
+  private async parseBody(req: IncomingMessage): Promise<any> {
+    const raw = await this.readBody(req);
+    try {
+      return JSON.parse(raw);
+    } catch {
+      throw new ValidationError('Invalid JSON in request body');
+    }
+  }
+
+  /** Read raw request body with size limit. */
   private readBody(req: IncomingMessage): Promise<string> {
     return new Promise((resolve, reject) => {
       let body = '';
-      req.on('data', chunk => body += chunk);
+      let size = 0;
+      req.on('data', (chunk: Buffer | string) => {
+        size += typeof chunk === 'string' ? chunk.length : chunk.byteLength;
+        if (size > MAX_BODY_SIZE) {
+          req.destroy();
+          reject(new ValidationError(`Request body exceeds maximum size of ${MAX_BODY_SIZE / 1024}KB`));
+          return;
+        }
+        body += chunk;
+      });
       req.on('end', () => resolve(body));
       req.on('error', reject);
     });
   }
 
   close(): void {
+    if (this.cleanupTimer) clearInterval(this.cleanupTimer);
     this.server?.close();
   }
 }
