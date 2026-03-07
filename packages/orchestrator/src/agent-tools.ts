@@ -235,6 +235,7 @@ export class AgentToolHandler {
       parentTaskId: input.parentTaskId ?? null,
       dependsOn: dependsOn ?? null,
       priority: priority ?? 5,
+      deadline: null,
       createdAt: new Date(),
       updatedAt: new Date(),
     };

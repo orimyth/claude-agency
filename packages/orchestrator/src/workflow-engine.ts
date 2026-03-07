@@ -163,6 +163,7 @@ export class WorkflowEngine extends EventEmitter {
       parentTaskId: null,
       dependsOn: null,
       priority: 9,
+      deadline: null,
       createdAt: new Date(),
       updatedAt: new Date(),
     };

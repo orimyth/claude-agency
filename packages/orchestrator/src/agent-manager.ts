@@ -340,6 +340,8 @@ export class AgentManager extends EventEmitter {
             const channel = task.projectId ? `project-${task.projectId}` : 'general';
             this.emit('message', blueprint.id, channel,
               `still on it (${totalMins} min in)`);
+            // Auto-save progress note for long-running tasks
+            this.store.addTaskNote(task.id, blueprint.id, `Still working (${totalMins} min in)`).catch(() => {});
           }
         }
 
@@ -536,15 +538,34 @@ export class AgentManager extends EventEmitter {
       } catch { /* non-critical */ }
     }
 
+    // Inject progress notes from previous attempts (if any)
+    try {
+      const notes = await this.store.getTaskNotes(task.id);
+      if (notes.length > 0) {
+        parts.push(`## Previous Progress Notes`);
+        for (const note of notes.slice(-5)) { // last 5 notes
+          const who = this.blueprints.get(note.agentId)?.name ?? note.agentId;
+          parts.push(`- ${who}: ${note.content.slice(0, 200)}`);
+        }
+        parts.push('');
+      }
+    } catch { /* non-critical */ }
+
     // Cap description to avoid bloated prompts from long predecessor results / QA reports
     const cappedDescription = task.description.length > 2000
       ? task.description.slice(0, 2000) + '\n[...truncated]'
       : task.description;
 
+    // Deadline awareness
+    const deadlineNote = task.deadline
+      ? `\n**Deadline:** ${task.deadline.toISOString()} — prioritize accordingly.`
+      : '';
+
     parts.push(
       `## Current Task`,
       `**${task.title}**`,
       cappedDescription,
+      deadlineNote,
       ``,
       `Complete this task autonomously. Build/test/verify before saying done. Summarize in plain text. If blocked, say what you need.`,
     );
@@ -748,6 +769,7 @@ export class AgentManager extends EventEmitter {
       parentTaskId: null,
       dependsOn: null,
       priority: 5,
+      deadline: null,
       createdAt: new Date(),
       updatedAt: new Date(),
     };

@@ -39,6 +39,7 @@ export interface Task {
   parentTaskId: string | null;
   dependsOn: string | null;  // task ID this task waits for
   priority: number;
+  deadline: Date | null;
   createdAt: Date;
   updatedAt: Date;
 }

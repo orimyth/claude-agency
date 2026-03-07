@@ -384,6 +384,7 @@ export class APIServer {
           parentTaskId: null,
           dependsOn,
           priority: body.priority ?? 7,
+          deadline: null,
           createdAt: new Date(),
           updatedAt: new Date(),
         };
@@ -521,6 +522,125 @@ export class APIServer {
         await this.store.resolveApproval(approvalId, status, feedback);
       }
       this.json(res, { ok: true });
+      return;
+    }
+
+    // --- Agent Health Metrics ---
+    if (req.method === 'GET' && path === '/api/health') {
+      const metrics = await this.store.getAllAgentHealthMetrics();
+      this.json(res, metrics);
+      return;
+    }
+
+    if (req.method === 'GET' && path.match(/^\/api\/health\/[^/]+$/)) {
+      const agentId = path.split('/').pop()!;
+      const metrics = await this.store.getAgentHealthMetrics(agentId);
+      this.json(res, { agentId, ...metrics });
+      return;
+    }
+
+    // --- Task Deadline / SLA ---
+    if (req.method === 'POST' && path.match(/^\/api\/tasks\/[^/]+\/deadline$/)) {
+      const taskId = path.split('/')[3];
+      const body = JSON.parse(await this.readBody(req));
+      if (!body.deadline) {
+        this.json(res, { success: false, error: 'deadline (ISO string) is required' });
+        return;
+      }
+      await this.store.setTaskDeadline(taskId, new Date(body.deadline));
+      this.json(res, { success: true, taskId, deadline: body.deadline });
+      return;
+    }
+
+    if (req.method === 'GET' && path === '/api/tasks/overdue') {
+      const overdue = await this.store.getOverdueTasks();
+      this.json(res, overdue);
+      return;
+    }
+
+    if (req.method === 'GET' && path === '/api/tasks/near-deadline') {
+      const hours = parseInt(url.searchParams.get('hours') ?? '2', 10);
+      const tasks = await this.store.getTasksNearDeadline(hours);
+      this.json(res, tasks);
+      return;
+    }
+
+    // --- Daily Cost Digest ---
+    if (req.method === 'GET' && path === '/api/cost-digest') {
+      const hours = parseInt(url.searchParams.get('hours') ?? '24', 10);
+      const digest = await this.store.getCostDigest(hours);
+      this.json(res, digest);
+      return;
+    }
+
+    // --- Cascade Task Operations ---
+    if (req.method === 'POST' && path.match(/^\/api\/tasks\/[^/]+\/cancel$/)) {
+      const taskId = path.split('/')[3];
+      const cancelled = await this.store.cascadeCancelTask(taskId);
+      this.json(res, { success: true, cancelled, count: cancelled.length });
+      return;
+    }
+
+    if (req.method === 'POST' && path.match(/^\/api\/tasks\/[^/]+\/reassign$/)) {
+      const taskId = path.split('/')[3];
+      const body = JSON.parse(await this.readBody(req));
+      if (!body.agentId) {
+        this.json(res, { success: false, error: 'agentId is required' });
+        return;
+      }
+      const reassigned = await this.store.cascadeReassignTask(taskId, body.agentId, body.cascade ?? false);
+      this.json(res, { success: true, reassigned, count: reassigned.length });
+      return;
+    }
+
+    // --- Agent Workload Balancing ---
+    if (req.method === 'GET' && path === '/api/workload') {
+      const workloads = await this.store.getAgentWorkloads();
+      this.json(res, workloads);
+      return;
+    }
+
+    if (req.method === 'POST' && path === '/api/workload/rebalance') {
+      const body = JSON.parse(await this.readBody(req));
+      const { fromAgent, toAgent, count } = body;
+      if (!fromAgent || !toAgent) {
+        this.json(res, { success: false, error: 'fromAgent and toAgent are required' });
+        return;
+      }
+      const candidates = await this.store.getRebalanceCandidates(fromAgent, count ?? 1);
+      const moved: string[] = [];
+      for (const task of candidates) {
+        await this.store.cascadeReassignTask(task.id, toAgent, false);
+        moved.push(task.id);
+      }
+      this.json(res, { success: true, moved, count: moved.length });
+      return;
+    }
+
+    // --- Task Progress Notes ---
+    if (req.method === 'POST' && path.match(/^\/api\/tasks\/[^/]+\/notes$/)) {
+      const taskId = path.split('/')[3];
+      const body = JSON.parse(await this.readBody(req));
+      if (!body.agentId || !body.content) {
+        this.json(res, { success: false, error: 'agentId and content are required' });
+        return;
+      }
+      const noteId = await this.store.addTaskNote(taskId, body.agentId, body.content);
+      this.json(res, { success: true, noteId });
+      return;
+    }
+
+    if (req.method === 'GET' && path.match(/^\/api\/tasks\/[^/]+\/notes$/)) {
+      const taskId = path.split('/')[3];
+      const notes = await this.store.getTaskNotes(taskId);
+      this.json(res, notes);
+      return;
+    }
+
+    if (req.method === 'GET' && path === '/api/activity-feed') {
+      const limit = parseInt(url.searchParams.get('limit') ?? '20', 10);
+      const feed = await this.store.getRecentTaskNotes(limit);
+      this.json(res, feed);
       return;
     }
 

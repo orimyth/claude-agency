@@ -250,6 +250,22 @@ export class StateStore {
       try { await conn.query(`CREATE INDEX idx_depends_on ON tasks (depends_on)`); } catch { /* already exists */ }
       // Performance index on tasks.assigned_to for workload queries
       try { await conn.query(`CREATE INDEX idx_assigned_to ON tasks (assigned_to)`); } catch { /* already exists */ }
+
+      // Migration: add deadline column to tasks
+      try { await conn.query(`ALTER TABLE tasks ADD COLUMN deadline DATETIME NULL`); } catch { /* already exists */ }
+
+      // Task progress notes — intermediate updates agents post while working
+      await conn.query(`
+        CREATE TABLE IF NOT EXISTS task_notes (
+          id VARCHAR(64) PRIMARY KEY,
+          task_id VARCHAR(64) NOT NULL,
+          agent_id VARCHAR(64) NOT NULL,
+          content TEXT NOT NULL,
+          created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          INDEX idx_task (task_id),
+          INDEX idx_agent (agent_id)
+        )
+      `);
     } finally {
       conn.release();
     }
@@ -1397,6 +1413,327 @@ export class StateStore {
     };
   }
 
+  // --- Agent Health Metrics ---
+
+  /**
+   * Get comprehensive health metrics for an agent: success rate, avg response time,
+   * error frequency, uptime stats.
+   */
+  async getAgentHealthMetrics(agentId: string): Promise<{
+    successRate: number;
+    avgDurationMs: number;
+    avgCostPerTask: number;
+    totalTasks: number;
+    errorCount: number;
+    last7dCost: number;
+    last7dTasks: number;
+    cacheHitRate: number;
+  }> {
+    // Task success/failure
+    const [taskRows] = await this.pool.query<RowDataPacket[]>(
+      `SELECT
+        COUNT(*) as total,
+        SUM(CASE WHEN status IN ('done', 'review') THEN 1 ELSE 0 END) as success,
+        SUM(CASE WHEN status = 'blocked' THEN 1 ELSE 0 END) as errors
+      FROM tasks WHERE assigned_to = ?`,
+      [agentId]
+    );
+    const total = Number(taskRows[0].total);
+    const success = Number(taskRows[0].success);
+    const errors = Number(taskRows[0].errors);
+    const successRate = total > 0 ? (success / total) * 100 : 100;
+
+    // Usage stats
+    const [usageRows] = await this.pool.query<RowDataPacket[]>(
+      `SELECT
+        COALESCE(AVG(duration_ms), 0) as avg_dur,
+        COALESCE(AVG(cost_usd), 0) as avg_cost,
+        COALESCE(SUM(cache_read_tokens), 0) as cache_reads,
+        COALESCE(SUM(input_tokens), 0) as total_input
+      FROM usage_log WHERE agent_id = ? AND task_id IS NOT NULL`,
+      [agentId]
+    );
+    const cacheReads = Number(usageRows[0].cache_reads);
+    const totalInput = Number(usageRows[0].total_input);
+    const cacheHitRate = totalInput > 0 ? (cacheReads / (cacheReads + totalInput)) * 100 : 0;
+
+    // Last 7 days
+    const [recentRows] = await this.pool.query<RowDataPacket[]>(
+      `SELECT COALESCE(SUM(cost_usd), 0) as cost, COUNT(*) as tasks
+       FROM usage_log WHERE agent_id = ? AND task_id IS NOT NULL
+       AND recorded_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)`,
+      [agentId]
+    );
+
+    return {
+      successRate: Math.round(successRate * 10) / 10,
+      avgDurationMs: Math.round(Number(usageRows[0].avg_dur)),
+      avgCostPerTask: Math.round(Number(usageRows[0].avg_cost) * 1000000) / 1000000,
+      totalTasks: total,
+      errorCount: errors,
+      last7dCost: Number(recentRows[0].cost),
+      last7dTasks: Number(recentRows[0].tasks),
+      cacheHitRate: Math.round(cacheHitRate * 10) / 10,
+    };
+  }
+
+  /**
+   * Get health metrics for all agents at once.
+   */
+  async getAllAgentHealthMetrics(): Promise<Array<{ agentId: string } & Awaited<ReturnType<StateStore['getAgentHealthMetrics']>>>> {
+    const agents = await this.getAllAgents();
+    return Promise.all(agents.map(async a => ({
+      agentId: a.id,
+      ...(await this.getAgentHealthMetrics(a.id)),
+    })));
+  }
+
+  // --- Task Deadline / SLA ---
+
+  /**
+   * Set a deadline on a task.
+   */
+  async setTaskDeadline(taskId: string, deadline: Date): Promise<void> {
+    await this.pool.query(
+      'UPDATE tasks SET deadline = ? WHERE id = ?',
+      [deadline, taskId]
+    );
+  }
+
+  /**
+   * Get tasks that are past their deadline and not yet done.
+   */
+  async getOverdueTasks(): Promise<Array<Task & { deadline: Date }>> {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      `SELECT * FROM tasks
+       WHERE deadline IS NOT NULL AND deadline < NOW()
+       AND status NOT IN ('done', 'review')
+       ORDER BY deadline ASC`
+    );
+    return rows.map(r => ({ ...this.mapTask(r), deadline: new Date(r.deadline) }));
+  }
+
+  /**
+   * Get tasks approaching deadline (within N hours) that aren't done yet.
+   */
+  async getTasksNearDeadline(hoursThreshold = 2): Promise<Array<Task & { deadline: Date }>> {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      `SELECT * FROM tasks
+       WHERE deadline IS NOT NULL
+       AND deadline > NOW()
+       AND deadline < DATE_ADD(NOW(), INTERVAL ? HOUR)
+       AND status NOT IN ('done', 'review')
+       ORDER BY deadline ASC`,
+      [hoursThreshold]
+    );
+    return rows.map(r => ({ ...this.mapTask(r), deadline: new Date(r.deadline) }));
+  }
+
+  // --- Daily Cost Digest ---
+
+  /**
+   * Get cost breakdown for the last N hours, grouped by agent.
+   */
+  async getCostDigest(hours = 24): Promise<{
+    totalCost: number;
+    totalSessions: number;
+    byAgent: Array<{ agentId: string; cost: number; sessions: number; avgDuration: number }>;
+    topExpensiveTask: { taskId: string; title: string; cost: number } | null;
+  }> {
+    const [totalRows] = await this.pool.query<RowDataPacket[]>(
+      `SELECT COALESCE(SUM(cost_usd), 0) as cost, COUNT(*) as sessions
+       FROM usage_log WHERE recorded_at >= DATE_SUB(NOW(), INTERVAL ? HOUR)`,
+      [hours]
+    );
+
+    const [agentRows] = await this.pool.query<RowDataPacket[]>(
+      `SELECT agent_id, COALESCE(SUM(cost_usd), 0) as cost, COUNT(*) as sessions,
+       COALESCE(AVG(duration_ms), 0) as avg_dur
+       FROM usage_log WHERE recorded_at >= DATE_SUB(NOW(), INTERVAL ? HOUR)
+       GROUP BY agent_id ORDER BY cost DESC`,
+      [hours]
+    );
+
+    const [expensiveRows] = await this.pool.query<RowDataPacket[]>(
+      `SELECT u.task_id, t.title, SUM(u.cost_usd) as cost
+       FROM usage_log u
+       LEFT JOIN tasks t ON u.task_id = t.id
+       WHERE u.recorded_at >= DATE_SUB(NOW(), INTERVAL ? HOUR) AND u.task_id IS NOT NULL
+       GROUP BY u.task_id, t.title
+       ORDER BY cost DESC LIMIT 1`,
+      [hours]
+    );
+
+    return {
+      totalCost: Number(totalRows[0].cost),
+      totalSessions: Number(totalRows[0].sessions),
+      byAgent: agentRows.map(r => ({
+        agentId: r.agent_id,
+        cost: Number(r.cost),
+        sessions: Number(r.sessions),
+        avgDuration: Math.round(Number(r.avg_dur)),
+      })),
+      topExpensiveTask: expensiveRows.length > 0
+        ? { taskId: expensiveRows[0].task_id, title: expensiveRows[0].title ?? 'Unknown', cost: Number(expensiveRows[0].cost) }
+        : null,
+    };
+  }
+
+  // --- Cascade Task Operations ---
+
+  /**
+   * Cancel a task and all tasks that depend on it (cascade cancel).
+   * Returns the IDs of all cancelled tasks.
+   */
+  async cascadeCancelTask(taskId: string): Promise<string[]> {
+    const cancelled: string[] = [];
+    const queue = [taskId];
+
+    while (queue.length > 0) {
+      const currentId = queue.shift()!;
+      await this.pool.query(
+        `UPDATE tasks SET status = 'blocked' WHERE id = ? AND status NOT IN ('done', 'review')`,
+        [currentId]
+      );
+      cancelled.push(currentId);
+
+      // Find tasks that depend on this one
+      const [dependents] = await this.pool.query<RowDataPacket[]>(
+        `SELECT id FROM tasks WHERE depends_on = ? AND status NOT IN ('done', 'review', 'blocked')`,
+        [currentId]
+      );
+      for (const dep of dependents) {
+        queue.push(dep.id);
+      }
+    }
+
+    return cancelled;
+  }
+
+  /**
+   * Reassign a task and optionally cascade to dependent tasks.
+   */
+  async cascadeReassignTask(taskId: string, newAgentId: string, cascade = false): Promise<string[]> {
+    const reassigned: string[] = [];
+    const queue = [taskId];
+
+    while (queue.length > 0) {
+      const currentId = queue.shift()!;
+      await this.pool.query(
+        `UPDATE tasks SET assigned_to = ? WHERE id = ?`,
+        [newAgentId, currentId]
+      );
+      reassigned.push(currentId);
+
+      if (cascade) {
+        const [dependents] = await this.pool.query<RowDataPacket[]>(
+          `SELECT id FROM tasks WHERE depends_on = ? AND status NOT IN ('done', 'review')`,
+          [currentId]
+        );
+        for (const dep of dependents) {
+          queue.push(dep.id);
+        }
+      }
+    }
+
+    return reassigned;
+  }
+
+  // --- Agent Workload Balancing ---
+
+  /**
+   * Get the current workload for each agent: count of active + assigned tasks.
+   */
+  async getAgentWorkloads(): Promise<Array<{ agentId: string; activeTasks: number; queuedTasks: number; totalLoad: number }>> {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      `SELECT assigned_to as agent_id,
+        SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END) as active,
+        SUM(CASE WHEN status = 'assigned' THEN 1 ELSE 0 END) as queued
+      FROM tasks
+      WHERE assigned_to IS NOT NULL AND status IN ('in_progress', 'assigned')
+      GROUP BY assigned_to
+      ORDER BY (SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END) + SUM(CASE WHEN status = 'assigned' THEN 1 ELSE 0 END)) DESC`
+    );
+
+    return rows.map(r => ({
+      agentId: r.agent_id,
+      activeTasks: Number(r.active),
+      queuedTasks: Number(r.queued),
+      totalLoad: Number(r.active) + Number(r.queued),
+    }));
+  }
+
+  /**
+   * Find tasks that can be moved from an overloaded agent to an underloaded one.
+   * Only considers 'assigned' tasks (not in_progress — those are already running).
+   */
+  async getRebalanceCandidates(fromAgentId: string, limit = 3): Promise<Task[]> {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      `SELECT * FROM tasks
+       WHERE assigned_to = ? AND status = 'assigned'
+       ORDER BY priority ASC, created_at ASC
+       LIMIT ?`,
+      [fromAgentId, limit]
+    );
+    return rows.map(r => this.mapTask(r));
+  }
+
+  // --- Task Progress Notes ---
+
+  /**
+   * Add a progress note to a task.
+   */
+  async addTaskNote(taskId: string, agentId: string, content: string): Promise<string> {
+    const id = crypto.randomUUID();
+    await this.pool.query(
+      `INSERT INTO task_notes (id, task_id, agent_id, content) VALUES (?, ?, ?, ?)`,
+      [id, taskId, agentId, content]
+    );
+    return id;
+  }
+
+  /**
+   * Get all progress notes for a task, ordered chronologically.
+   */
+  async getTaskNotes(taskId: string): Promise<Array<{
+    id: string; taskId: string; agentId: string; content: string; createdAt: Date;
+  }>> {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      `SELECT * FROM task_notes WHERE task_id = ? ORDER BY created_at ASC`,
+      [taskId]
+    );
+    return rows.map(r => ({
+      id: r.id,
+      taskId: r.task_id,
+      agentId: r.agent_id,
+      content: r.content,
+      createdAt: new Date(r.created_at),
+    }));
+  }
+
+  /**
+   * Get recent notes across all tasks (for the activity feed).
+   */
+  async getRecentTaskNotes(limit = 20): Promise<Array<{
+    id: string; taskId: string; taskTitle: string; agentId: string; content: string; createdAt: Date;
+  }>> {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      `SELECT n.*, t.title as task_title
+       FROM task_notes n
+       LEFT JOIN tasks t ON n.task_id = t.id
+       ORDER BY n.created_at DESC LIMIT ?`,
+      [limit]
+    );
+    return rows.map(r => ({
+      id: r.id,
+      taskId: r.task_id,
+      taskTitle: r.task_title ?? 'Unknown',
+      agentId: r.agent_id,
+      content: r.content,
+      createdAt: new Date(r.created_at),
+    }));
+  }
+
   private mapTask(row: RowDataPacket): Task {
     return {
       id: row.id,
@@ -1409,6 +1746,7 @@ export class StateStore {
       parentTaskId: row.parent_task_id,
       dependsOn: row.depends_on ?? null,
       priority: row.priority,
+      deadline: row.deadline ? new Date(row.deadline) : null,
       createdAt: new Date(row.created_at),
       updatedAt: new Date(row.updated_at),
     };

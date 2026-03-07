@@ -181,6 +181,79 @@ export class Agency {
     // Webhook delivery loop — process queued events every 2 seconds
     setInterval(() => this.processWebhookQueue(), 2000);
 
+    // SLA monitoring — check for overdue/near-deadline tasks every 10 minutes
+    setInterval(async () => {
+      try {
+        const overdue = await this.store.getOverdueTasks();
+        for (const task of overdue) {
+          const agentName = task.assignedTo
+            ? (this.agentManager.getBlueprint(task.assignedTo)?.name ?? task.assignedTo)
+            : 'unassigned';
+          const channel = task.projectId ? `project-${task.projectId}` : 'leadership';
+          this.agentManager.notify('pm', channel,
+            `SLA breach: "${task.title}" (${agentName}) is past deadline`);
+          this.fireWebhook('sla:breach', { taskId: task.id, title: task.title, assignedTo: task.assignedTo, deadline: task.deadline });
+        }
+
+        const nearDeadline = await this.store.getTasksNearDeadline(2);
+        for (const task of nearDeadline) {
+          const channel = task.projectId ? `project-${task.projectId}` : 'leadership';
+          this.agentManager.notify('pm', channel,
+            `heads up: "${task.title}" deadline in <2 hours`);
+        }
+      } catch (err: any) {
+        console.error('[SLA monitor error]', err.message);
+      }
+    }, 10 * 60_000);
+
+    // Daily cost digest — send summary to leadership every 24 hours
+    setInterval(async () => {
+      try {
+        const digest = await this.store.getCostDigest(24);
+        if (digest.totalSessions > 0) {
+          const agentBreakdown = digest.byAgent.slice(0, 5)
+            .map(a => `${this.agentManager.getBlueprint(a.agentId)?.name ?? a.agentId}: $${a.cost.toFixed(4)}`)
+            .join(', ');
+          const topTask = digest.topExpensiveTask
+            ? ` | most expensive task: "${digest.topExpensiveTask.title}" ($${digest.topExpensiveTask.cost.toFixed(4)})`
+            : '';
+          const report = `daily cost report: $${digest.totalCost.toFixed(4)} across ${digest.totalSessions} sessions. ${agentBreakdown}${topTask}`;
+          this.agentManager.notify('ceo', 'leadership', report);
+          this.fireWebhook('cost:daily', digest);
+        }
+      } catch (err: any) {
+        console.error('[Cost digest error]', err.message);
+      }
+    }, 24 * 60 * 60_000);
+
+    // Workload balancing — check every 15 minutes for imbalanced agent loads
+    setInterval(async () => {
+      try {
+        const workloads = await this.store.getAgentWorkloads();
+        if (workloads.length < 2) return;
+
+        const maxLoad = workloads[0]; // sorted DESC by total load
+        const minLoad = workloads[workloads.length - 1];
+
+        // Only rebalance if one agent has 3+ more queued tasks than another with same role type
+        if (maxLoad.queuedTasks - minLoad.totalLoad >= 3) {
+          const maxBp = this.agentManager.getBlueprint(maxLoad.agentId);
+          const minBp = this.agentManager.getBlueprint(minLoad.agentId);
+          if (maxBp && minBp && maxBp.role === minBp.role) {
+            const candidates = await this.store.getRebalanceCandidates(maxLoad.agentId, 1);
+            for (const task of candidates) {
+              await this.store.cascadeReassignTask(task.id, minLoad.agentId, false);
+              const channel = task.projectId ? `project-${task.projectId}` : 'leadership';
+              this.agentManager.notify('pm', channel,
+                `rebalanced "${task.title}" from ${maxBp.name} → ${minBp.name} (workload balancing)`);
+            }
+          }
+        }
+      } catch (err: any) {
+        console.error('[Workload balance error]', err.message);
+      }
+    }, 15 * 60_000);
+
     // Seed default task templates
     await this.seedTaskTemplates();
 
@@ -308,6 +381,7 @@ export class Agency {
               parentTaskId: task.parentTaskId,
               dependsOn: null as string | null,
               priority: Math.min(task.priority + 1, 10), // bump priority for fixes
+              deadline: null,
               createdAt: new Date(),
               updatedAt: new Date(),
             };
@@ -359,6 +433,7 @@ export class Agency {
               parentTaskId: task.parentTaskId,
               dependsOn: taskId,
               priority: task.priority,
+              deadline: null,
               createdAt: new Date(),
               updatedAt: new Date(),
             };
@@ -424,6 +499,7 @@ export class Agency {
                 parentTaskId: task.parentTaskId,
                 dependsOn: null,
                 priority: Math.min(task.priority + 1, 10),
+                deadline: null,
                 createdAt: new Date(),
                 updatedAt: new Date(),
               });
@@ -466,6 +542,7 @@ export class Agency {
             parentTaskId: task.parentTaskId,
             dependsOn: taskId,
             priority: task.priority,
+            deadline: null,
             createdAt: new Date(),
             updatedAt: new Date(),
           };
@@ -573,6 +650,7 @@ export class Agency {
             parentTaskId: task.id,
             dependsOn: null,
             priority: Math.min(task.priority + 1, 10),
+            deadline: null,
             createdAt: new Date(),
             updatedAt: new Date(),
           });
@@ -982,6 +1060,7 @@ export class Agency {
       parentTaskId: null,
       dependsOn: null,
       priority: 8,
+      deadline: null,
       createdAt: new Date(),
       updatedAt: new Date(),
     };
@@ -1027,6 +1106,7 @@ export class Agency {
       parentTaskId: null,
       dependsOn: null,
       priority: 7,
+      deadline: null,
       createdAt: new Date(),
       updatedAt: new Date(),
     };

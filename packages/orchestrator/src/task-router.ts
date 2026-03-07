@@ -43,6 +43,7 @@ export class TaskRouter {
       parentTaskId: null,
       dependsOn: null,
       priority: 10,
+      deadline: null,
       createdAt: new Date(),
       updatedAt: new Date(),
     };
