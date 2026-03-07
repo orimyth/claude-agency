@@ -39,6 +39,8 @@ export class Agency {
   private slack: SlackBridge | null = null;
   /** Maps "channel:taskTitle" → Slack thread_ts for threaded replies */
   private taskThreads: Map<string, string> = new Map();
+  /** Webhook delivery queue — fire-and-forget */
+  private webhookQueue: Array<{ event: string; data: any }> = [];
 
   constructor() {
     this.store = new StateStore(agencyConfig.mysql);
@@ -150,6 +152,35 @@ export class Agency {
       }
     }, 5 * 60_000);
 
+    // Message retention — purge old messages daily
+    setInterval(async () => {
+      try {
+        const purged = await this.store.purgeOldMessages(agencyConfig.messageRetentionDays);
+        if (purged > 0) {
+          console.log(`[Retention] Purged ${purged} messages older than ${agencyConfig.messageRetentionDays} days`);
+        }
+      } catch (err: any) {
+        console.error('[Retention error]', err.message);
+      }
+    }, 24 * 60 * 60_000);
+
+    // Auto-deprioritize stale backlog tasks weekly
+    setInterval(async () => {
+      try {
+        const deprioritized = await this.store.deprioritizeStaleBacklog(14);
+        if (deprioritized > 0) {
+          console.log(`[Priority] Deprioritized ${deprioritized} stale backlog tasks`);
+          this.agentManager.notify('pm', 'leadership',
+            `auto-deprioritized ${deprioritized} stale backlog tasks (>14 days old)`);
+        }
+      } catch (err: any) {
+        console.error('[Priority rebalance error]', err.message);
+      }
+    }, 7 * 24 * 60 * 60_000); // weekly
+
+    // Webhook delivery loop — process queued events every 2 seconds
+    setInterval(() => this.processWebhookQueue(), 2000);
+
     // Seed default task templates
     await this.seedTaskTemplates();
 
@@ -209,6 +240,9 @@ export class Agency {
 
     this.agentManager.on('taskComplete', async (agentId: string, taskId: string, resultText?: string) => {
       this.wsServer.broadcast('task:update', { agentId, taskId, status: 'review' });
+
+      // Fire webhook for task completion
+      this.fireWebhook('task:done', { agentId, taskId });
 
       const task = await this.store.getTask(taskId);
       if (!task) return;
@@ -484,6 +518,9 @@ export class Agency {
     this.agentManager.on('taskFailed', async (agentId: string, taskId: string, error: string) => {
       this.wsServer.broadcast('task:update', { agentId, taskId, status: 'blocked', error });
 
+      // Fire webhook for blocked task
+      this.fireWebhook('agent:blocked', { agentId, taskId, error: error.slice(0, 200) });
+
       const task = await this.store.getTask(taskId);
       const blueprint = this.agentManager.getBlueprint(agentId);
       if (task && blueprint) {
@@ -563,6 +600,10 @@ export class Agency {
     // Real-time cost broadcasting to dashboard
     this.agentManager.on('usageUpdate', (snapshot: any) => {
       this.wsServer.broadcast('usage:update', snapshot);
+      // Fire webhook if cost is high (>80% of budget per task)
+      if (snapshot.costUsd >= agencyConfig.maxCostPerTask * 0.8) {
+        this.fireWebhook('budget:warning', snapshot);
+      }
     });
   }
 
@@ -694,6 +735,13 @@ export class Agency {
         });
 
         console.log(`[Intent] "${msg.text.slice(0, 50)}..." → ${intent.type}`);
+
+        // Audit log: record investor interaction with full context
+        await this.auditLog('investor:message', 'investor', 'ceo-investor', msg.text, {
+          intent: intent.type,
+          summary: intent.summary,
+          ceoResponse: response.slice(0, 200),
+        });
 
         switch (intent.type) {
           case 'project_idea':
@@ -1208,6 +1256,67 @@ export class Agency {
   getWorkflowEngine(): WorkflowEngine { return this.workflowEngine; }
   getMemoryManager(): MemoryManager { return this.memoryManager; }
   getSlack(): SlackBridge | null { return this.slack; }
+
+  /**
+   * Fire a webhook event — queued for async delivery.
+   */
+  private fireWebhook(event: string, data: any): void {
+    if (agencyConfig.webhooks.length > 0) {
+      this.webhookQueue.push({ event, data });
+    }
+  }
+
+  /**
+   * Process queued webhook events — delivers to all matching webhook URLs.
+   */
+  private async processWebhookQueue(): Promise<void> {
+    if (this.webhookQueue.length === 0 || agencyConfig.webhooks.length === 0) return;
+
+    const batch = this.webhookQueue.splice(0, 10); // process up to 10 at a time
+    for (const { event, data } of batch) {
+      for (const hook of agencyConfig.webhooks) {
+        if (hook.events.includes(event) || hook.events.includes('*')) {
+          try {
+            const payload = JSON.stringify({ event, data, timestamp: new Date().toISOString() });
+            // Fire-and-forget HTTP POST
+            const { request } = await import('http');
+            const url = new URL(hook.url);
+            const req = request({
+              hostname: url.hostname,
+              port: url.port,
+              path: url.pathname,
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(payload),
+                ...(hook.secret ? { 'X-Webhook-Secret': hook.secret } : {}),
+              },
+              timeout: 5000,
+            });
+            req.on('error', () => {}); // swallow errors
+            req.write(payload);
+            req.end();
+          } catch { /* non-critical */ }
+        }
+      }
+    }
+  }
+
+  /**
+   * Log an audit entry for investor interactions.
+   */
+  private async auditLog(eventType: string, actorId: string, channel: string, content: string, metadata: Record<string, any> = {}): Promise<void> {
+    try {
+      await this.store.saveAuditEntry({
+        id: crypto.randomUUID(),
+        eventType,
+        actorId,
+        channel,
+        content,
+        metadata,
+      });
+    } catch { /* non-critical */ }
+  }
 
   async shutdown(): Promise<void> {
     console.log('Shutting down...');

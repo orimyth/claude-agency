@@ -418,6 +418,80 @@ export class APIServer {
       return;
     }
 
+    // --- Task priority rebalancing ---
+    if (req.method === 'POST' && path === '/api/tasks/rebalance') {
+      const body = JSON.parse(await this.readBody(req));
+      const { updates } = body; // Array of { taskId, priority }
+      if (!Array.isArray(updates)) {
+        this.json(res, { success: false, error: 'updates array is required' });
+        return;
+      }
+      await this.store.rebalancePriorities(updates);
+      this.json(res, { success: true, updated: updates.length });
+      return;
+    }
+
+    // --- Task duration estimates ---
+    if (req.method === 'GET' && path === '/api/estimates') {
+      const estimates = await this.store.getTaskDurationEstimates();
+      this.json(res, estimates);
+      return;
+    }
+
+    if (req.method === 'GET' && path.match(/^\/api\/estimates\/[^/]+$/)) {
+      const agentId = path.split('/')[3];
+      const taskTitle = url.searchParams.get('title') ?? '';
+      const estimate = await this.store.estimateTaskDuration(agentId, taskTitle);
+      this.json(res, estimate ?? { estimatedMs: null, confidence: 'none' });
+      return;
+    }
+
+    // --- Skill matching ---
+    if (req.method === 'POST' && path === '/api/skill-match') {
+      const body = JSON.parse(await this.readBody(req));
+      const { title, description, exclude } = body;
+      if (!title) {
+        this.json(res, { success: false, error: 'title is required' });
+        return;
+      }
+      const blueprints = this.agentManager.getAllBlueprints();
+      const matches = this.store.findBestAgent(blueprints, title, description ?? '', exclude ?? []);
+      this.json(res, matches);
+      return;
+    }
+
+    // --- Audit log ---
+    if (req.method === 'GET' && path === '/api/audit') {
+      const channel = url.searchParams.get('channel') ?? 'ceo-investor';
+      const limit = parseInt(url.searchParams.get('limit') ?? '50', 10);
+      const entries = await this.store.getAuditLog(channel, limit);
+      this.json(res, entries);
+      return;
+    }
+
+    // --- Webhook management ---
+    if (req.method === 'GET' && path === '/api/webhooks') {
+      // Return configured webhooks (mask secrets)
+      const hooks = (this.agentManager as any).config?.webhooks ?? [];
+      this.json(res, hooks.map((h: any) => ({ url: h.url, events: h.events, hasSecret: !!h.secret })));
+      return;
+    }
+
+    if (req.method === 'POST' && path === '/api/webhooks') {
+      const body = JSON.parse(await this.readBody(req));
+      const { url: hookUrl, events, secret } = body;
+      if (!hookUrl || !events) {
+        this.json(res, { success: false, error: 'url and events are required' });
+        return;
+      }
+      const config = (this.agentManager as any).config;
+      if (config?.webhooks) {
+        config.webhooks.push({ url: hookUrl, events, secret });
+      }
+      this.json(res, { success: true });
+      return;
+    }
+
     // --- Investor request tracking ---
     if (req.method === 'GET' && path === '/api/investor-requests') {
       const requests = await this.store.getInvestorRequests();

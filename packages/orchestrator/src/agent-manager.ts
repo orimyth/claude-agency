@@ -89,6 +89,10 @@ export class AgentManager extends EventEmitter {
   private chatFailures: Map<string, number> = new Map();
   /** Track last activity time per agent for idle session recycling */
   private lastActivityAt: Map<string, number> = new Map();
+  /** Track task retry attempts: taskId → retryCount */
+  private taskRetries: Map<string, number> = new Map();
+  /** Max retries before marking task as blocked */
+  private static readonly MAX_TASK_RETRIES = 2;
   /** Idle session recycling interval */
   private idleRecycleTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -446,10 +450,29 @@ export class AgentManager extends EventEmitter {
       } else if (abortController.signal.aborted) {
         await this.store.updateAgentStatus(blueprint.id, 'paused');
       } else {
-        this.emit('error', blueprint.id, err);
-        this.emit('taskFailed', blueprint.id, task.id, err.message);
-        await this.store.updateTaskStatus(task.id, 'blocked');
-        await this.store.updateAgentStatus(blueprint.id, 'error');
+        // Retry with exponential backoff before giving up
+        const retryCount = this.taskRetries.get(task.id) ?? 0;
+        if (retryCount < AgentManager.MAX_TASK_RETRIES) {
+          this.taskRetries.set(task.id, retryCount + 1);
+          const backoffMs = Math.pow(2, retryCount) * 5000; // 5s, 10s
+          const channel = task.projectId ? `project-${task.projectId}` : 'general';
+          this.emit('message', blueprint.id, channel,
+            `hit an error, retrying in ${backoffMs / 1000}s (attempt ${retryCount + 2}/${AgentManager.MAX_TASK_RETRIES + 1})`);
+          await this.store.updateAgentStatus(blueprint.id, 'idle');
+          setTimeout(() => {
+            this.assignTask(blueprint.id, task).catch(retryErr => {
+              console.error(`[Retry] Failed retry for ${blueprint.id}: ${retryErr.message}`);
+            });
+          }, backoffMs);
+        } else {
+          // Exhausted retries — mark as blocked
+          this.taskRetries.delete(task.id);
+          this.emit('error', blueprint.id, err);
+          this.emit('taskFailed', blueprint.id, task.id, err.message);
+          await this.store.updateTaskStatus(task.id, 'blocked');
+          await this.store.updateAgentStatus(blueprint.id, 'error');
+          await this.store.recordKPI(blueprint.id, 'tasks_failed', 1);
+        }
       }
     } finally {
       this.activeSessions.delete(blueprint.id);

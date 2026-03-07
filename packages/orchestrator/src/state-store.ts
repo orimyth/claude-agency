@@ -1004,6 +1004,59 @@ export class StateStore {
     })));
   }
 
+  // --- Agent Skill Matching ---
+
+  /**
+   * Find the best agent for a task based on skills + file patterns overlap.
+   * Returns agents ranked by match score (higher = better match).
+   */
+  findBestAgent(
+    blueprints: AgentBlueprint[],
+    taskTitle: string,
+    taskDescription: string,
+    excludeIds: string[] = []
+  ): Array<{ agentId: string; name: string; score: number; matchedSkills: string[] }> {
+    const text = `${taskTitle} ${taskDescription}`.toLowerCase();
+    const results: Array<{ agentId: string; name: string; score: number; matchedSkills: string[] }> = [];
+
+    for (const bp of blueprints) {
+      if (excludeIds.includes(bp.id)) continue;
+
+      let score = 0;
+      const matchedSkills: string[] = [];
+
+      // Check skill keywords
+      for (const skill of bp.skills) {
+        const skillLower = skill.toLowerCase();
+        if (text.includes(skillLower)) {
+          score += 3;
+          matchedSkills.push(skill);
+        }
+      }
+
+      // Check file pattern hints (e.g., "*.tsx" → frontend work)
+      for (const pattern of bp.filePatterns) {
+        const ext = pattern.replace('*', '').toLowerCase();
+        if (text.includes(ext)) {
+          score += 1;
+        }
+      }
+
+      // Role keyword match
+      const roleLower = bp.role.toLowerCase();
+      if (text.includes(roleLower) || text.includes(bp.id)) {
+        score += 5;
+        matchedSkills.push(bp.role);
+      }
+
+      if (score > 0) {
+        results.push({ agentId: bp.id, name: bp.name, score, matchedSkills });
+      }
+    }
+
+    return results.sort((a, b) => b.score - a.score);
+  }
+
   // --- Deadlock Detection ---
 
   /**
@@ -1134,6 +1187,172 @@ export class StateStore {
       [rootTaskId, rootTaskId, rootTaskId, rootTaskId]
     );
     return rows.map(r => this.mapTask(r));
+  }
+
+  // --- Message Retention Policy ---
+
+  /**
+   * Purge messages older than `days` days. Returns count of deleted messages.
+   */
+  async purgeOldMessages(days = 7): Promise<number> {
+    const [result] = await this.pool.query<ResultSetHeader>(
+      `DELETE FROM messages WHERE timestamp < DATE_SUB(NOW(), INTERVAL ? DAY)`,
+      [days]
+    );
+    return result.affectedRows ?? 0;
+  }
+
+  // --- Task Priority Rebalancing ---
+
+  /**
+   * Bulk-update task priorities. Input: array of { taskId, priority }.
+   */
+  async rebalancePriorities(updates: Array<{ taskId: string; priority: number }>): Promise<void> {
+    if (updates.length === 0) return;
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      for (const { taskId, priority } of updates) {
+        await conn.query('UPDATE tasks SET priority = ? WHERE id = ?', [priority, taskId]);
+      }
+      await conn.commit();
+    } catch (err) {
+      await conn.rollback();
+      throw err;
+    } finally {
+      conn.release();
+    }
+  }
+
+  /**
+   * Auto-deprioritize stale backlog tasks (older than `days` days in backlog, drop priority by 1).
+   */
+  async deprioritizeStaleBacklog(days = 14): Promise<number> {
+    const [result] = await this.pool.query<ResultSetHeader>(
+      `UPDATE tasks SET priority = GREATEST(priority - 1, 1)
+       WHERE status = 'backlog' AND priority > 1
+         AND updated_at < DATE_SUB(NOW(), INTERVAL ? DAY)`,
+      [days]
+    );
+    return result.affectedRows ?? 0;
+  }
+
+  // --- Task Duration Estimation ---
+
+  /**
+   * Get average task duration per agent, grouped by task type heuristic (QA, Fix, Code Review, other).
+   */
+  async getTaskDurationEstimates(): Promise<Array<{
+    agentId: string;
+    taskType: string;
+    avgDurationMs: number;
+    sampleCount: number;
+  }>> {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      `SELECT
+        u.agent_id,
+        CASE
+          WHEN t.title LIKE 'QA Review:%' THEN 'qa_review'
+          WHEN t.title LIKE 'Fix bugs:%' THEN 'bug_fix'
+          WHEN t.title LIKE 'Code Review:%' THEN 'code_review'
+          WHEN t.title LIKE 'Code review fixes:%' THEN 'code_review_fix'
+          WHEN t.title LIKE 'Help %' THEN 'handoff'
+          WHEN t.title LIKE 'Design:%' THEN 'design'
+          WHEN t.title LIKE 'Frontend:%' THEN 'frontend'
+          WHEN t.title LIKE 'Backend:%' THEN 'backend'
+          WHEN t.title LIKE 'Security%' THEN 'security'
+          WHEN t.title LIKE 'Architecture:%' THEN 'architecture'
+          ELSE 'general'
+        END as task_type,
+        AVG(u.duration_ms) as avg_duration,
+        COUNT(*) as sample_count
+      FROM usage_log u
+      INNER JOIN tasks t ON u.task_id = t.id
+      WHERE u.task_id IS NOT NULL AND u.duration_ms > 0
+      GROUP BY u.agent_id, task_type
+      ORDER BY u.agent_id, avg_duration DESC`
+    );
+
+    return rows.map(r => ({
+      agentId: r.agent_id,
+      taskType: r.task_type,
+      avgDurationMs: Math.round(Number(r.avg_duration)),
+      sampleCount: Number(r.sample_count),
+    }));
+  }
+
+  /**
+   * Estimate duration for a specific task based on historical data.
+   */
+  async estimateTaskDuration(agentId: string, taskTitle: string): Promise<{ estimatedMs: number; confidence: string } | null> {
+    // Determine task type from title
+    let taskType = 'general';
+    if (taskTitle.startsWith('QA Review:')) taskType = 'qa_review';
+    else if (taskTitle.startsWith('Fix bugs:')) taskType = 'bug_fix';
+    else if (taskTitle.startsWith('Code Review:')) taskType = 'code_review';
+    else if (taskTitle.startsWith('Design:')) taskType = 'design';
+    else if (taskTitle.startsWith('Frontend:')) taskType = 'frontend';
+    else if (taskTitle.startsWith('Backend:')) taskType = 'backend';
+
+    const estimates = await this.getTaskDurationEstimates();
+    // Try specific agent + task type
+    const specific = estimates.find(e => e.agentId === agentId && e.taskType === taskType);
+    if (specific && specific.sampleCount >= 2) {
+      return { estimatedMs: specific.avgDurationMs, confidence: specific.sampleCount >= 5 ? 'high' : 'medium' };
+    }
+    // Fall back to agent average
+    const agentAvg = estimates.filter(e => e.agentId === agentId);
+    if (agentAvg.length > 0) {
+      const totalDur = agentAvg.reduce((s, e) => s + e.avgDurationMs * e.sampleCount, 0);
+      const totalSamples = agentAvg.reduce((s, e) => s + e.sampleCount, 0);
+      return { estimatedMs: Math.round(totalDur / totalSamples), confidence: 'low' };
+    }
+    return null;
+  }
+
+  // --- Conversation Audit Log ---
+
+  /**
+   * Save a full audit trail entry for investor interactions.
+   */
+  async saveAuditEntry(entry: {
+    id: string;
+    eventType: string;
+    actorId: string;
+    channel: string;
+    content: string;
+    metadata: Record<string, any>;
+  }): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO messages (id, from_agent_id, to_agent_id, channel, content, timestamp)
+       VALUES (?, ?, NULL, ?, ?, NOW())`,
+      [entry.id, entry.actorId, `audit:${entry.channel}`, JSON.stringify({ eventType: entry.eventType, content: entry.content, ...entry.metadata })]
+    );
+  }
+
+  /**
+   * Get audit log entries for a channel.
+   */
+  async getAuditLog(channel: string, limit = 50): Promise<Array<{
+    id: string; eventType: string; actorId: string; content: string;
+    metadata: Record<string, any>; timestamp: Date;
+  }>> {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      `SELECT * FROM messages WHERE channel = ? ORDER BY timestamp DESC LIMIT ?`,
+      [`audit:${channel}`, limit]
+    );
+    return rows.map(r => {
+      let parsed: any = {};
+      try { parsed = JSON.parse(r.content); } catch { parsed = { content: r.content }; }
+      return {
+        id: r.id,
+        eventType: parsed.eventType ?? 'unknown',
+        actorId: r.from_agent_id ?? 'system',
+        content: parsed.content ?? r.content,
+        metadata: parsed,
+        timestamp: new Date(r.timestamp),
+      };
+    });
   }
 
   // Settings

@@ -139,4 +139,14 @@ export interface AgencyConfig {
   maxCostPerTask: number;
   /** Emergency pause — when true, no new tasks are started. Default: false */
   emergencyPause: boolean;
+  /** Webhook URLs to notify on key events. Default: [] */
+  webhooks: WebhookConfig[];
+  /** Message retention in days. Messages older than this are auto-purged. Default: 7 */
+  messageRetentionDays: number;
+}
+
+export interface WebhookConfig {
+  url: string;
+  events: string[]; // e.g., ['task:done', 'agent:blocked', 'budget:exceeded']
+  secret?: string;
 }
