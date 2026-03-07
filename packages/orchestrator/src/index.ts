@@ -643,20 +643,31 @@ export class Agency {
     type: 'project_idea' | 'simple_task' | 'hire_request' | 'question' | 'chat';
     summary: string;
   }> {
+    const lower = text.toLowerCase().trim();
+
+    // Zero-cost heuristic for obvious cases — no model call needed
+    const CHAT_PATTERNS = /^(hey|hi|hello|thanks|thank you|good morning|good evening|gm|ok|okay|cool|nice|great|lol|haha|sure|np|bye|cheers|yo)\b/i;
+    if (lower.length < 20 && CHAT_PATTERNS.test(lower)) {
+      return { type: 'chat', summary: text };
+    }
+
+    const QUESTION_PATTERNS = /^(how|what|when|where|why|who|is |are |can |could |do |does |did |will |would |should |status|update)\b/i;
+    if (QUESTION_PATTERNS.test(lower) && lower.endsWith('?')) {
+      return { type: 'question', summary: text.slice(0, 100) };
+    }
+
+    const HIRE_PATTERNS = /\b(hire|recruit|need a |add a |find a |new role|new position|team member)\b/i;
+    if (HIRE_PATTERNS.test(lower)) {
+      return { type: 'hire_request', summary: text.slice(0, 100) };
+    }
+
+    // Only call Claude for genuinely ambiguous messages
     try {
       const prompt = [
-        `Classify this message from a company investor/owner. Respond with ONLY a JSON object, nothing else.`,
-        ``,
+        `Classify this investor message. Respond with ONLY JSON, nothing else.`,
         `Message: "${text}"`,
-        ``,
-        `Categories:`,
-        `- "project_idea": A new product, app, feature, or initiative that needs planning (e.g. "let's build a recipe app", "I want a new SaaS product")`,
-        `- "simple_task": A concrete, actionable request that can be done quickly (e.g. "fix the login bug", "add a dark mode toggle", "update the README")`,
-        `- "hire_request": Wants to hire/add a new team member or role (e.g. "we need a security expert", "hire a data scientist")`,
-        `- "question": Asking for information, status, or opinions (e.g. "how's the project going?", "what tech stack should we use?")`,
-        `- "chat": Casual conversation, greetings, or non-actionable messages (e.g. "hey", "good morning", "thanks")`,
-        ``,
-        `{"type":"<category>","summary":"<1 sentence summary of what they want>"}`,
+        `Categories: "project_idea" (new app/product/initiative), "simple_task" (quick fix/change), "question", "chat"`,
+        `{"type":"<category>","summary":"<1 sentence>"}`,
       ].join('\n');
 
       const stream = query({
@@ -684,10 +695,9 @@ export class Agency {
         if (parsed.type && parsed.summary) return parsed;
       }
     } catch {
-      // Fallback to simple heuristic if classification fails
+      // Fallback to heuristic
     }
 
-    // Fallback: short messages are chat, longer ones are probably tasks
     if (text.length < 30) return { type: 'chat', summary: text };
     return { type: 'simple_task', summary: text.slice(0, 100) };
   }
@@ -709,70 +719,35 @@ export class Agency {
       );
     } catch { /* non-critical */ }
 
-    // Create a PM task with full context and API access
-    const apiUrl = `http://localhost:${agencyConfig.wsPort + 1}`;
     const agents = this.agentManager.getAllBlueprints();
     const agentList = agents.filter(a => !['ceo', 'hr'].includes(a.id))
       .map(a => `- ${a.id}: ${a.name} (${a.role})`).join('\n');
 
+    // API instructions are already in PM's system prompt (cached).
+    // Only include task-specific context here to minimize input tokens.
     const task = {
       id: crypto.randomUUID(),
       title: `Plan & execute: ${summary.slice(0, 100)}`,
       description: [
         `The investor wants: "${investorMessage}"`,
         ``,
-        `You are Diana, the PM/Tech Lead. Your job:`,
-        `1. Evaluate the complexity of this request`,
-        `2. If it's a complex project, create a project and consult Charlie (architect) first`,
-        `3. If it's straightforward, go ahead and break it into tasks`,
-        `4. Assign tasks to the right agents using the API`,
-        `5. If repos are needed, ask the investor or create them via API`,
+        `Your job:`,
+        `1. Evaluate complexity`,
+        `2. Complex project → create project via API, consult Charlie (architect) first`,
+        `3. Straightforward → break into tasks and assign directly`,
+        `4. If repos are needed, create them via API`,
         ``,
         `## Available Team`,
         agentList,
         ``,
-        `## Agency API (use via curl)`,
-        `- Create project: curl -s -X POST ${apiUrl}/api/agency/projects -H 'Content-Type: application/json' -d '{"name":"...","description":"..."}'`,
-        `- Add repo: curl -s -X POST ${apiUrl}/api/agency/repositories -H 'Content-Type: application/json' -d '{"projectId":"...","repoUrl":"..."}'`,
-        `- Clone repo: curl -s -X POST ${apiUrl}/api/agency/repositories/{repoId}/clone`,
-        `- Create & assign task: curl -s -X POST ${apiUrl}/api/agency/tasks -H 'Content-Type: application/json' -d '{"projectId":"...","title":"...","description":"...","assignTo":"developer","priority":7}'`,
-        `- Create task with dependency: curl -s -X POST ${apiUrl}/api/agency/tasks -H 'Content-Type: application/json' -d '{"projectId":"...","title":"...","description":"...","assignTo":"frontend-developer","priority":7,"dependsOn":"<taskId>"}'`,
-        `- List agents: curl -s ${apiUrl}/api/agents`,
-        `- List projects: curl -s ${apiUrl}/api/projects`,
+        `## Rules`,
+        `- Each task → exactly ONE agent. Frontend → Maya, Backend → Eve/Alex, Design → Frank.`,
+        `- Design + frontend: create design task first, chain frontend with "dependsOn".`,
+        `- QA is automatic — don't create QA tasks manually.`,
+        `- Task descriptions must be specific: WHAT, HOW, WHERE, ACCEPTANCE CRITERIA.`,
+        `- Use the Agency API (in your system prompt) to create projects, repos, and tasks.`,
         ``,
-        `## IMPORTANT RULES`,
-        `- Each task is assigned to EXACTLY ONE agent. Never give the same task to two people.`,
-        `- Frontend work → "frontend-developer" (Maya). Backend → "developer" (Eve) or "backend-developer". NEVER mix.`,
-        `- If a feature needs design + frontend: create design task for "designer" FIRST, get its taskId, then create frontend task with "dependsOn" set to that taskId. The frontend task auto-starts when design is done.`,
-        `- QA review is automatic — when any worker finishes, Nina (QA) gets a review task. You don't create QA tasks.`,
-        `- Use "dependsOn" to enforce correct order. Tasks with dependencies wait automatically.`,
-        ``,
-        `## Decision Guide`,
-        `- Need architecture review? → Create a task for "architect" first`,
-        `- Need UI/design? → Create a task for "designer", then chain dependent frontend tasks`,
-        `- Need research? → Create a task for "researcher"`,
-        `- Pure frontend? → "frontend-developer"`,
-        `- Pure backend? → "developer" or "backend-developer"`,
-        `- Full-stack feature? → Separate backend + frontend tasks, with frontend depending on backend`,
-        `- Simple enough for one person? → Create just one task for the right specialist`,
-        `- Complex? → Create multiple subtasks with correct dependencies and assign to different specialists`,
-        ``,
-        `## TASK DESCRIPTION TEMPLATE — every task MUST follow this format:`,
-        `Each task description you create must be specific and actionable. Include:`,
-        `1. WHAT to build/change (specific components, files, endpoints)`,
-        `2. HOW it should work (exact behavior, inputs/outputs, edge cases)`,
-        `3. WHERE in the codebase (which directory, which files to modify/create)`,
-        `4. ACCEPTANCE CRITERIA (how to know it's done — what should work when tested)`,
-        ``,
-        `BAD: "Build the frontend for the recipe app"`,
-        `GOOD: "Create the recipe list page at /recipes using React + Tailwind. Show recipes as cards in a responsive grid (3 cols desktop, 1 col mobile). Each card shows: title, image, cooking time, difficulty badge. Data comes from GET /api/recipes. Include loading skeleton and empty state. Acceptance: page renders with mock data, responsive layout works, no console errors."`,
-        ``,
-        `## Git workflow`,
-        `- Agents push to feature branches automatically (never directly to main)`,
-        `- After QA passes, use merge API to merge feature branch to main`,
-        `- Merge endpoint: curl -s -X POST ${apiUrl}/api/agency/repositories/{repoId}/merge -H 'Content-Type: application/json' -d '{"featureBranch":"feature/..."}'`,
-        ``,
-        `Take action now. Use curl to create the project and tasks via the API.`,
+        `Take action now.`,
       ].join('\n'),
       status: 'assigned' as const,
       projectId: null,
@@ -794,30 +769,21 @@ export class Agency {
    * For very simple things PM might just assign to one developer directly.
    */
   private async delegateSimpleTask(investorMessage: string, summary: string): Promise<void> {
-    const apiUrl = `http://localhost:${agencyConfig.wsPort + 1}`;
     const agents = this.agentManager.getAllBlueprints();
     const agentList = agents.filter(a => !['ceo', 'hr'].includes(a.id))
       .map(a => `- ${a.id}: ${a.name} (${a.role})`).join('\n');
 
+    // API instructions are already in PM's system prompt (cached).
     const task = {
       id: crypto.randomUUID(),
       title: summary.slice(0, 120),
       description: [
         `Investor request: "${investorMessage}"`,
         ``,
-        `You are Diana, the PM. This is a simple/direct request.`,
-        `Figure out who should do it and assign it via the API.`,
+        `Simple/direct request. Figure out who should do it and assign via the Agency API.`,
+        `Frontend → Maya, Backend → Eve/Alex, Design → Frank. QA is automatic.`,
         ``,
-        `## Available Team`,
-        agentList,
-        ``,
-        `## API`,
-        `- Create & assign task: curl -s -X POST ${apiUrl}/api/agency/tasks -H 'Content-Type: application/json' -d '{"title":"...","description":"...","assignTo":"developer","priority":7}'`,
-        `- With dependency: add "dependsOn":"<taskId>" to chain tasks`,
-        `- List agents: curl -s ${apiUrl}/api/agents`,
-        ``,
-        `Assign to the right specialist. Frontend → "frontend-developer", backend → "developer" or "backend-developer", design → "designer".`,
-        `Each task goes to exactly one agent. QA review happens automatically.`,
+        `Team: ${agentList}`,
       ].join('\n'),
       status: 'assigned' as const,
       projectId: null,

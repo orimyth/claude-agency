@@ -47,6 +47,8 @@ const ROLE_CATEGORIES: Record<string, string[]> = {
 
 export class MemoryManager {
   private store: StateStore;
+  /** Fast flag to skip DB queries when no memories exist yet. */
+  private hasMemories = false;
 
   constructor(store: StateStore) {
     this.store = store;
@@ -64,6 +66,7 @@ export class MemoryManager {
     importance?: number;
     createdBy?: string;
   }): Promise<string> {
+    this.hasMemories = true;
     const id = crypto.randomUUID();
     await this.store.saveMemory({
       id,
@@ -90,6 +93,9 @@ export class MemoryManager {
    * Stays within token budget.
    */
   async buildContext(agentId: string, projectId?: string | null): Promise<string> {
+    // Skip DB query entirely when no memories have been saved yet
+    if (!this.hasMemories) return '';
+
     const categories = ROLE_CATEGORIES[agentId] ?? ['general'];
 
     // Scopes to search: always include company, optionally include project

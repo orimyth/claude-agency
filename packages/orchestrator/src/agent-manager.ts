@@ -106,7 +106,8 @@ export class AgentManager extends EventEmitter {
    */
   private enrichSystemPrompt(blueprint: AgentBlueprint): string {
     const apiUrl = `http://localhost:${this.config.wsPort + 1}`;
-    let extra = '';
+    // Language instruction goes in system prompt so it's cached across all calls
+    let extra = `\n\n${this.getLanguageInstruction()}`;
 
     if (MANAGEMENT_ROLES.has(blueprint.id)) {
       extra = [
@@ -380,11 +381,8 @@ export class AgentManager extends EventEmitter {
   }
 
   private async buildTaskPrompt(blueprint: AgentBlueprint, task: Task): Promise<string> {
-    // Identity is already in the system prompt — don't repeat it here.
-    const parts = [
-      this.getLanguageInstruction(),
-      ``,
-    ];
+    // Identity + language are already in the system prompt — don't repeat here.
+    const parts: string[] = [];
 
     // Inject organizational memory context
     if (this.memoryManager) {
@@ -423,37 +421,32 @@ export class AgentManager extends EventEmitter {
       parts.push(`**Your task ID for git push:** ${task.id}`, '');
     }
 
-    // Inject active sibling tasks for context isolation
+    // Inject sibling task titles for context isolation (limit to 5 to save tokens)
     if (task.projectId) {
       try {
         const projectTasks = await this.store.getTasksByProject(task.projectId);
         const siblingTasks = projectTasks.filter(t =>
           t.id !== task.id && t.assignedTo && t.assignedTo !== blueprint.id &&
           ['assigned', 'in_progress'].includes(t.status)
-        );
+        ).slice(0, 5);
         if (siblingTasks.length > 0) {
-          parts.push(`## Other Active Tasks (DO NOT work on these — other agents handle them)`);
-          for (const st of siblingTasks) {
-            const assigneeBp = this.blueprints.get(st.assignedTo!);
-            const assigneeName = assigneeBp ? `${assigneeBp.name} (${assigneeBp.role})` : st.assignedTo;
-            parts.push(`- "${st.title}" → assigned to ${assigneeName}`);
-          }
-          parts.push(`Only work on YOUR task below. Do not duplicate work from the tasks above.`);
-          parts.push('');
+          const siblings = siblingTasks.map(st => `"${st.title}" (${st.assignedTo})`).join(', ');
+          parts.push(`**Other active tasks (don't touch):** ${siblings}`, '');
         }
       } catch { /* non-critical */ }
     }
 
+    // Cap description to avoid bloated prompts from long predecessor results / QA reports
+    const cappedDescription = task.description.length > 2000
+      ? task.description.slice(0, 2000) + '\n[...truncated]'
+      : task.description;
+
     parts.push(
       `## Current Task`,
       `**${task.title}**`,
-      task.description,
+      cappedDescription,
       ``,
-      `## Instructions`,
-      `- Complete this task autonomously`,
-      `- BEFORE saying done: build the project, run tests, verify it actually works`,
-      `- When done, summarize what you did and how you verified it. Plain text only, no markdown, no bold, no headers — write like a Slack message`,
-      `- If you're blocked, say exactly what you need`,
+      `Complete this task autonomously. Build/test/verify before saying done. Summarize in plain text. If blocked, say what you need.`,
     );
 
     return parts.join('\n');
@@ -524,11 +517,10 @@ export class AgentManager extends EventEmitter {
     // Mark agent as active while chatting
     await this.store.updateAgentStatus(agentId, 'active');
 
-    const langRule = this.getLanguageInstruction();
-
+    // Language instruction is in system prompt already (cached).
     const prompt = context
-      ? `${langRule}\n\n${context}`
-      : `${langRule}\n\nThe investor (your boss) just sent you this message on Slack:\n\n"${message}"\n\nRespond naturally. If they're asking you to build or do something, say you'll get the team on it. If it's casual chat, just be friendly and human. Keep it short — 1-3 sentences max, like a real Slack message.`;
+      ? context
+      : `The investor (your boss) just sent you this message on Slack:\n\n"${message}"\n\nRespond naturally. If they're asking you to build or do something, say you'll get the team on it. If it's casual chat, just be friendly and human. Keep it short — 1-3 sentences max, like a real Slack message.`;
 
     // Resume chat session if available — keyed by agent+channel for isolation.
     // This means Alice's investor DM session stays separate from her #leadership chats.
