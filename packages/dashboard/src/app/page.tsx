@@ -7,10 +7,11 @@ import { ActivityFeed } from "@/components/activity-feed";
 import { SubmitIdea } from "@/components/submit-idea";
 import { SkeletonKPI, SkeletonAgentCard, SkeletonTaskRow } from "@/components/skeleton";
 import { EmptyState } from "@/components/empty-state";
+import { useToast } from "@/components/toast";
 import { taskStyle } from "@/lib/status-colors";
 import { fetchAgents, fetchTasks, fetchApprovals, submitIdea } from "@/lib/api";
 import type { Agent, Task } from "@/lib/api";
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:3001";
 
@@ -56,6 +57,7 @@ const STATUS_ORDER: Array<Task["status"]> = ["in_progress", "review", "assigned"
 
 export default function Dashboard() {
   const { connected, events, on } = useWebSocket(WS_URL);
+  const { addToast } = useToast();
   const [agents, setAgents] = useState<Agent[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [approvalCount, setApprovalCount] = useState(0);
@@ -63,13 +65,14 @@ export default function Dashboard() {
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(
     new Set(["in_progress", "review", "assigned", "blocked"])
   );
+  const initialLoadDone = useRef(false);
 
   useEffect(() => {
     Promise.all([
       fetchAgents().then((data) => setAgents(Array.isArray(data) ? data : [])).catch(() => {}),
       fetchTasks().then((data) => setTasks(Array.isArray(data) ? data : [])).catch(() => {}),
       fetchApprovals().then((data) => setApprovalCount(Array.isArray(data) ? data.length : 0)).catch(() => {}),
-    ]).finally(() => setLoading(false));
+    ]).finally(() => { setLoading(false); initialLoadDone.current = true; });
   }, []);
 
   useEffect(() => {
@@ -115,6 +118,14 @@ export default function Dashboard() {
           updatedAt: new Date().toISOString(),
         }];
       });
+      // Toast for task completions and blocks
+      if (initialLoadDone.current) {
+        if (data.status === "done") {
+          addToast({ type: "success", title: "Task completed", message: data.title || data.taskId?.slice(0, 8) });
+        } else if (data.status === "blocked") {
+          addToast({ type: "error", title: "Task blocked", message: data.title || data.taskId?.slice(0, 8) });
+        }
+      }
     });
 
     const unsub3 = on("break:start", (data) => {
@@ -133,7 +144,12 @@ export default function Dashboard() {
       );
     });
 
-    const unsub5 = on("approval:new", () => setApprovalCount((p) => p + 1));
+    const unsub5 = on("approval:new", (data) => {
+      setApprovalCount((p) => p + 1);
+      if (initialLoadDone.current) {
+        addToast({ type: "warning", title: "Approval needed", message: data.title, duration: 8000 });
+      }
+    });
     const unsub6 = on("approval:resolved", () => setApprovalCount((p) => Math.max(0, p - 1)));
 
     return () => { unsub1(); unsub2(); unsub3(); unsub4(); unsub5(); unsub6(); };
