@@ -7,16 +7,7 @@ import type { StateStore } from './state-store.js';
 import type { PermissionEngine } from './permission-engine.js';
 import type { MemoryManager } from './memory-manager.js';
 import type { AgentToolHandler } from './agent-tools.js';
-
-// Build an env with node's directory in PATH for the Claude Code SDK.
-const nodeDir = dirname(process.execPath);
-const sdkEnv: Record<string, string> = {};
-for (const [k, v] of Object.entries(process.env)) {
-  if (v !== undefined) sdkEnv[k] = v;
-}
-if (!sdkEnv.PATH?.includes(nodeDir)) {
-  sdkEnv.PATH = `${nodeDir}:${sdkEnv.PATH || ''}`;
-}
+import { sdkEnv } from './sdk-util.js';
 
 /** Roles that get agency management tools (can create projects, tasks, etc.) */
 const MANAGEMENT_ROLES = new Set(['ceo', 'pm', 'architect', 'hr']);

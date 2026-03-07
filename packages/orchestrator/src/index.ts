@@ -13,20 +13,10 @@ import { DashboardWSServer } from './ws-server.js';
 import { MemoryManager } from './memory-manager.js';
 import { AgentToolHandler } from './agent-tools.js';
 import { APIServer } from './api-server.js';
-import { query, type SDKResultMessage } from '@anthropic-ai/claude-code';
 import { SlackBridge, type InvestorMessage } from 'slack-bridge';
 import { dirname, resolve } from 'path';
 import { fileURLToPath } from 'url';
-
-// PATH fix for SDK calls in this module
-const _nodeDir = dirname(process.execPath);
-const _classifyEnv: Record<string, string> = {};
-for (const [k, v] of Object.entries(process.env)) {
-  if (v !== undefined) _classifyEnv[k] = v;
-}
-if (!_classifyEnv.PATH?.includes(_nodeDir)) {
-  _classifyEnv.PATH = `${_nodeDir}:${_classifyEnv.PATH || ''}`;
-}
+import { quickQuery } from './sdk-util.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -670,24 +660,7 @@ export class Agency {
         `{"type":"<category>","summary":"<1 sentence>"}`,
       ].join('\n');
 
-      const stream = query({
-        prompt,
-        options: {
-          model: UTILITY_MODEL,
-          allowedTools: [],
-          maxTurns: 1,
-          permissionMode: 'bypassPermissions',
-          env: _classifyEnv,
-        },
-      });
-
-      let result = '';
-      for await (const msg of stream) {
-        if (msg.type === 'result') {
-          const r = msg as SDKResultMessage;
-          if (r.subtype === 'success') result = r.result;
-        }
-      }
+      const result = await quickQuery(prompt, UTILITY_MODEL);
 
       const match = result.match(/\{[\s\S]*\}/);
       if (match) {
@@ -710,14 +683,9 @@ export class Agency {
    * and create subtasks assigned to the right agents.
    */
   private async delegateTopm(investorMessage: string, summary: string): Promise<void> {
-    // Alice tells Diana in #leadership
-    try {
-      await this.agentManager.agentToAgentChat(
-        'ceo', 'pm',
-        `new project from the investor: "${summary}". take point on this — figure out what we need and get the team moving`,
-        'leadership'
-      );
-    } catch { /* non-critical */ }
+    // One-way announcement — no model call needed (Diana gets the full context in her task)
+    this.agentManager.notify('ceo', 'leadership',
+      `new project from the investor: "${summary}". passing to diana`);
 
     const agents = this.agentManager.getAllBlueprints();
     const agentList = agents.filter(a => !['ceo', 'hr'].includes(a.id))

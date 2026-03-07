@@ -1,16 +1,5 @@
-import { query, type SDKResultMessage } from '@anthropic-ai/claude-code';
 import type { StateStore } from './state-store.js';
-import { dirname } from 'path';
-
-// Same PATH fix as other modules
-const nodeDir = dirname(process.execPath);
-const memEnv: Record<string, string> = {};
-for (const [k, v] of Object.entries(process.env)) {
-  if (v !== undefined) memEnv[k] = v;
-}
-if (!memEnv.PATH?.includes(nodeDir)) {
-  memEnv.PATH = `${nodeDir}:${memEnv.PATH || ''}`;
-}
+import { quickQuery } from './sdk-util.js';
 
 /** Max tokens of memory context to inject per agent call */
 const MAX_CONTEXT_TOKENS = 2000;
@@ -159,24 +148,7 @@ export class MemoryManager {
         'Only output the JSON array, nothing else.',
       ].join('\n');
 
-      const stream = query({
-        prompt,
-        options: {
-          model: UTILITY_MODEL,
-          allowedTools: [],
-          maxTurns: 1,
-          permissionMode: 'bypassPermissions',
-          env: memEnv,
-        },
-      });
-
-      let result = '';
-      for await (const msg of stream) {
-        if (msg.type === 'result') {
-          const r = msg as SDKResultMessage;
-          if (r.subtype === 'success') result = r.result;
-        }
-      }
+      const result = await quickQuery(prompt, UTILITY_MODEL);
 
       // Parse learnings
       const match = result.match(/\[[\s\S]*\]/);
@@ -237,18 +209,7 @@ export class MemoryManager {
         'Only output the JSON array.',
       ].join('\n');
 
-      const stream = query({
-        prompt,
-        options: { model: UTILITY_MODEL, allowedTools: [], maxTurns: 1, permissionMode: 'bypassPermissions', env: memEnv },
-      });
-
-      let result = '';
-      for await (const msg of stream) {
-        if (msg.type === 'result') {
-          const r = msg as SDKResultMessage;
-          if (r.subtype === 'success') result = r.result;
-        }
-      }
+      const result = await quickQuery(prompt, UTILITY_MODEL);
 
       const match = result.match(/\[[\s\S]*\]/);
       if (!match) return;
