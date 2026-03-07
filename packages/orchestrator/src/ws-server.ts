@@ -10,7 +10,10 @@ export type WSEventType =
   | 'break:end'
   | 'kpi:update'
   | 'agent:new'
-  | 'usage:update';
+  | 'usage:update'
+  | 'emergency:pause'
+  | 'emergency:resume'
+  | 'deadlock:detected';
 
 export interface WSEvent {
   type: WSEventType;

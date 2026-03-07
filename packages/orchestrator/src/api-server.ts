@@ -308,6 +308,137 @@ export class APIServer {
       return;
     }
 
+    // --- Performance scoring ---
+    if (req.method === 'GET' && path === '/api/performance') {
+      const performance = await this.store.getAllAgentPerformance();
+      this.json(res, performance);
+      return;
+    }
+
+    if (req.method === 'GET' && path.match(/^\/api\/performance\/[^/]+$/)) {
+      const agentId = path.split('/').pop()!;
+      const perf = await this.store.getAgentPerformance(agentId);
+      this.json(res, { agentId, ...perf });
+      return;
+    }
+
+    // --- Deadlock detection ---
+    if (req.method === 'GET' && path === '/api/deadlocks') {
+      const cycles = await this.store.detectDeadlocks();
+      this.json(res, { deadlocks: cycles, count: cycles.length });
+      return;
+    }
+
+    // --- Task templates ---
+    if (req.method === 'GET' && path === '/api/templates') {
+      const templates = await this.store.getAllTaskTemplates();
+      this.json(res, templates);
+      return;
+    }
+
+    if (req.method === 'GET' && path.match(/^\/api\/templates\/[^/]+$/)) {
+      const id = path.split('/').pop()!;
+      const template = await this.store.getTaskTemplate(id);
+      if (!template) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Template not found' }));
+        return;
+      }
+      this.json(res, template);
+      return;
+    }
+
+    // Instantiate a template → creates tasks from it
+    if (req.method === 'POST' && path.match(/^\/api\/templates\/[^/]+\/instantiate$/) && this.toolHandler) {
+      const templateId = path.split('/')[3];
+      const template = await this.store.getTaskTemplate(templateId);
+      if (!template) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Template not found' }));
+        return;
+      }
+      const body = JSON.parse(await this.readBody(req));
+      const { name, projectId } = body;
+      if (!name) {
+        this.json(res, { success: false, error: 'name is required' });
+        return;
+      }
+
+      // Create tasks from template steps, substituting {name}
+      const createdTasks: any[] = [];
+      const stepTaskIds: string[] = [];
+      for (let i = 0; i < template.steps.length; i++) {
+        const step = template.steps[i];
+        const taskId = crypto.randomUUID();
+        stepTaskIds.push(taskId);
+
+        const dependsOn = step.dependsOnStep !== undefined ? stepTaskIds[step.dependsOnStep] : null;
+        const task = {
+          id: taskId,
+          title: step.title.replace(/\{name\}/g, name),
+          description: step.description.replace(/\{name\}/g, name),
+          status: (step.assignTo && !dependsOn) ? 'assigned' as const : 'backlog' as const,
+          projectId: projectId ?? null,
+          assignedTo: step.assignTo ?? null,
+          createdBy: body.agentId ?? 'system',
+          parentTaskId: null,
+          dependsOn,
+          priority: body.priority ?? 7,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+        await this.store.createTask(task);
+        createdTasks.push({ taskId, title: task.title, assignedTo: task.assignedTo, dependsOn });
+
+        // Start tasks that have no dependencies
+        if (step.assignTo && !dependsOn && this.agentManager.getBlueprint(step.assignTo)) {
+          this.agentManager.assignTask(step.assignTo, task).catch(() => {});
+        }
+      }
+
+      this.json(res, { success: true, data: { templateId, tasks: createdTasks } });
+      return;
+    }
+
+    // --- Emergency pause ---
+    if (req.method === 'POST' && path === '/api/emergency/pause') {
+      const aborted = await this.agentManager.pauseAll();
+      this.json(res, { success: true, paused: true, abortedAgents: aborted });
+      return;
+    }
+
+    if (req.method === 'POST' && path === '/api/emergency/resume') {
+      await this.agentManager.resumeAll();
+      this.json(res, { success: true, paused: false });
+      return;
+    }
+
+    if (req.method === 'GET' && path === '/api/emergency/status') {
+      this.json(res, { paused: this.agentManager.isEmergencyPaused() });
+      return;
+    }
+
+    // --- Investor request tracking ---
+    if (req.method === 'GET' && path === '/api/investor-requests') {
+      const requests = await this.store.getInvestorRequests();
+      // Enrich with task progress
+      const enriched = await Promise.all(requests.map(async r => {
+        let tasks: any[] = [];
+        if (r.rootTaskId) {
+          tasks = await this.store.getInvestorRequestTasks(r.rootTaskId);
+        }
+        const taskSummary = {
+          total: tasks.length,
+          done: tasks.filter(t => t.status === 'done').length,
+          inProgress: tasks.filter(t => t.status === 'in_progress').length,
+          blocked: tasks.filter(t => t.status === 'blocked').length,
+        };
+        return { ...r, taskSummary, tasks: tasks.map(t => ({ id: t.id, title: t.title, status: t.status, assignedTo: t.assignedTo })) };
+      }));
+      this.json(res, enriched);
+      return;
+    }
+
     if (req.method === 'POST' && path.startsWith('/api/approvals/')) {
       const approvalId = path.split('/').pop();
       const body = await this.readBody(req);

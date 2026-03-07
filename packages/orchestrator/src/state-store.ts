@@ -217,6 +217,39 @@ export class StateStore {
           INDEX idx_recorded (recorded_at)
         )
       `);
+
+      // Task templates — reusable task patterns (e.g., "New Feature" → design → frontend → backend → QA)
+      await conn.query(`
+        CREATE TABLE IF NOT EXISTS task_templates (
+          id VARCHAR(64) PRIMARY KEY,
+          name VARCHAR(255) NOT NULL,
+          description TEXT,
+          steps_json TEXT NOT NULL,
+          created_by VARCHAR(64) NULL,
+          created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+
+      // Investor task tracking — links investor messages to spawned tasks
+      await conn.query(`
+        CREATE TABLE IF NOT EXISTS investor_requests (
+          id VARCHAR(64) PRIMARY KEY,
+          investor_message TEXT NOT NULL,
+          intent VARCHAR(64) NOT NULL,
+          summary VARCHAR(512) NOT NULL,
+          root_task_id VARCHAR(64) NULL,
+          status ENUM('received','delegated','in_progress','completed','failed') NOT NULL DEFAULT 'received',
+          created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          completed_at DATETIME NULL,
+          INDEX idx_status (status),
+          INDEX idx_root_task (root_task_id)
+        )
+      `);
+
+      // Performance index on tasks.depends_on for dependency chain queries
+      try { await conn.query(`CREATE INDEX idx_depends_on ON tasks (depends_on)`); } catch { /* already exists */ }
+      // Performance index on tasks.assigned_to for workload queries
+      try { await conn.query(`CREATE INDEX idx_assigned_to ON tasks (assigned_to)`); } catch { /* already exists */ }
     } finally {
       conn.release();
     }
@@ -909,6 +942,198 @@ export class StateStore {
       currentId = task.dependsOn;
     }
     return count;
+  }
+
+  // --- Agent Performance Scoring ---
+
+  /**
+   * Get performance metrics for an agent: tasks completed, bugs introduced (fix tasks created from their work),
+   * rework % (fix tasks / total tasks), avg task duration.
+   */
+  async getAgentPerformance(agentId: string): Promise<{
+    tasksCompleted: number;
+    tasksBlocked: number;
+    bugsIntroduced: number;
+    reworkPercent: number;
+    avgDurationMs: number;
+    totalCostUsd: number;
+  }> {
+    const [taskRows] = await this.pool.query<RowDataPacket[]>(
+      `SELECT status, COUNT(*) as cnt FROM tasks WHERE assigned_to = ? GROUP BY status`,
+      [agentId]
+    );
+    const counts: Record<string, number> = {};
+    for (const r of taskRows) counts[r.status] = Number(r.cnt);
+    const completed = (counts['done'] ?? 0) + (counts['review'] ?? 0);
+    const blocked = counts['blocked'] ?? 0;
+
+    // Count "Fix bugs:" tasks that were created because QA found bugs in this agent's work
+    const [bugRows] = await this.pool.query<RowDataPacket[]>(
+      `SELECT COUNT(*) as cnt FROM tasks WHERE assigned_to = ? AND title LIKE 'Fix bugs:%'`,
+      [agentId]
+    );
+    const bugsIntroduced = Number(bugRows[0].cnt);
+    const total = completed + blocked + (counts['in_progress'] ?? 0);
+    const reworkPercent = total > 0 ? (bugsIntroduced / total) * 100 : 0;
+
+    // Avg duration from usage_log
+    const [usageRows] = await this.pool.query<RowDataPacket[]>(
+      `SELECT COALESCE(AVG(duration_ms), 0) as avg_dur, COALESCE(SUM(cost_usd), 0) as total_cost
+       FROM usage_log WHERE agent_id = ? AND task_id IS NOT NULL`,
+      [agentId]
+    );
+
+    return {
+      tasksCompleted: completed,
+      tasksBlocked: blocked,
+      bugsIntroduced,
+      reworkPercent: Math.round(reworkPercent * 10) / 10,
+      avgDurationMs: Math.round(Number(usageRows[0].avg_dur)),
+      totalCostUsd: Number(usageRows[0].total_cost),
+    };
+  }
+
+  /**
+   * Get performance for all agents at once.
+   */
+  async getAllAgentPerformance(): Promise<Array<{ agentId: string } & Awaited<ReturnType<StateStore['getAgentPerformance']>>>> {
+    const agents = await this.getAllAgents();
+    return Promise.all(agents.map(async a => ({
+      agentId: a.id,
+      ...(await this.getAgentPerformance(a.id)),
+    })));
+  }
+
+  // --- Deadlock Detection ---
+
+  /**
+   * Detect circular dependencies in task chains.
+   * Returns array of task IDs forming the cycle, or empty if no cycle.
+   */
+  async detectDeadlocks(): Promise<string[][]> {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      `SELECT id, depends_on FROM tasks WHERE depends_on IS NOT NULL AND status NOT IN ('done', 'review')`
+    );
+
+    // Build adjacency: task → depends_on
+    const deps = new Map<string, string>();
+    for (const r of rows) {
+      deps.set(r.id, r.depends_on);
+    }
+
+    const cycles: string[][] = [];
+    const visited = new Set<string>();
+
+    for (const startId of deps.keys()) {
+      if (visited.has(startId)) continue;
+      const path: string[] = [];
+      const pathSet = new Set<string>();
+      let current: string | undefined = startId;
+
+      while (current && !visited.has(current)) {
+        if (pathSet.has(current)) {
+          // Found a cycle — extract it
+          const cycleStart = path.indexOf(current);
+          cycles.push(path.slice(cycleStart));
+          break;
+        }
+        path.push(current);
+        pathSet.add(current);
+        current = deps.get(current);
+      }
+
+      for (const id of path) visited.add(id);
+    }
+
+    return cycles;
+  }
+
+  // --- Task Templates ---
+
+  async saveTaskTemplate(template: {
+    id: string;
+    name: string;
+    description: string;
+    steps: Array<{ title: string; description: string; assignTo: string; dependsOnStep?: number }>;
+    createdBy: string | null;
+  }): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO task_templates (id, name, description, steps_json, created_by) VALUES (?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE name = VALUES(name), description = VALUES(description), steps_json = VALUES(steps_json)`,
+      [template.id, template.name, template.description, JSON.stringify(template.steps), template.createdBy]
+    );
+  }
+
+  async getTaskTemplate(id: string): Promise<{
+    id: string; name: string; description: string;
+    steps: Array<{ title: string; description: string; assignTo: string; dependsOnStep?: number }>;
+  } | null> {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      'SELECT * FROM task_templates WHERE id = ?', [id]
+    );
+    if (rows.length === 0) return null;
+    const r = rows[0];
+    return { id: r.id, name: r.name, description: r.description, steps: JSON.parse(r.steps_json) };
+  }
+
+  async getAllTaskTemplates(): Promise<Array<{ id: string; name: string; description: string; stepCount: number }>> {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      'SELECT id, name, description, steps_json FROM task_templates ORDER BY created_at DESC'
+    );
+    return rows.map(r => ({
+      id: r.id, name: r.name, description: r.description,
+      stepCount: JSON.parse(r.steps_json).length,
+    }));
+  }
+
+  // --- Investor Request Tracking ---
+
+  async saveInvestorRequest(req: {
+    id: string;
+    investorMessage: string;
+    intent: string;
+    summary: string;
+    rootTaskId: string | null;
+  }): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO investor_requests (id, investor_message, intent, summary, root_task_id, status) VALUES (?, ?, ?, ?, ?, 'delegated')`,
+      [req.id, req.investorMessage, req.intent, req.summary, req.rootTaskId]
+    );
+  }
+
+  async updateInvestorRequestStatus(id: string, status: string): Promise<void> {
+    const extra = status === 'completed' ? ', completed_at = NOW()' : '';
+    await this.pool.query(
+      `UPDATE investor_requests SET status = ?${extra} WHERE id = ?`,
+      [status, id]
+    );
+  }
+
+  async getInvestorRequests(limit = 20): Promise<Array<{
+    id: string; investorMessage: string; intent: string; summary: string;
+    rootTaskId: string | null; status: string; createdAt: Date; completedAt: Date | null;
+  }>> {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      'SELECT * FROM investor_requests ORDER BY created_at DESC LIMIT ?', [limit]
+    );
+    return rows.map(r => ({
+      id: r.id, investorMessage: r.investor_message, intent: r.intent,
+      summary: r.summary, rootTaskId: r.root_task_id, status: r.status,
+      createdAt: new Date(r.created_at), completedAt: r.completed_at ? new Date(r.completed_at) : null,
+    }));
+  }
+
+  /**
+   * Get all tasks spawned from an investor request (via the root task and its children).
+   */
+  async getInvestorRequestTasks(rootTaskId: string): Promise<Task[]> {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      `SELECT * FROM tasks WHERE id = ? OR parent_task_id = ? OR created_by IN (
+         SELECT assigned_to FROM tasks WHERE id = ? OR parent_task_id = ?
+       ) ORDER BY created_at ASC`,
+      [rootTaskId, rootTaskId, rootTaskId, rootTaskId]
+    );
+    return rows.map(r => this.mapTask(r));
   }
 
   // Settings

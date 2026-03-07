@@ -137,4 +137,6 @@ export interface AgencyConfig {
   wsPort: number;
   /** Max cost in USD per single task execution. Agent is aborted if exceeded. Default: 2.00 */
   maxCostPerTask: number;
+  /** Emergency pause — when true, no new tasks are started. Default: false */
+  emergencyPause: boolean;
 }

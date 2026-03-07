@@ -235,6 +235,13 @@ export class AgentManager extends EventEmitter {
       return;
     }
 
+    // Emergency pause — queue the task but don't start it
+    if (this.config.emergencyPause) {
+      await this.store.updateTaskStatus(task.id, 'assigned', agentId);
+      this.emit('message', agentId, 'system', `emergency pause active — task queued`);
+      return;
+    }
+
     if (this.activeCount >= this.config.maxConcurrency) {
       await this.store.updateTaskStatus(task.id, 'assigned', agentId);
       this.emit('message', agentId, 'system', `task queued, waiting for a slot to open up`);
@@ -735,7 +742,41 @@ export class AgentManager extends EventEmitter {
     this.emit('message', fromId, channel, message);
   }
 
+  /**
+   * Emergency pause — abort all active agents and prevent new tasks from starting.
+   */
+  async pauseAll(): Promise<number> {
+    this.config.emergencyPause = true;
+    let aborted = 0;
+    for (const [agentId, controller] of this.activeSessions.entries()) {
+      controller.abort();
+      await this.store.updateAgentStatus(agentId, 'paused');
+      aborted++;
+    }
+    console.log(`[EmergencyPause] Paused ${aborted} active agents`);
+    return aborted;
+  }
+
+  /**
+   * Resume from emergency pause — allow agents to pick up queued tasks.
+   */
+  async resumeAll(): Promise<void> {
+    this.config.emergencyPause = false;
+    const agents = await this.store.getAllAgents();
+    for (const agent of agents) {
+      if (agent.status === 'paused') {
+        await this.store.updateAgentStatus(agent.id, 'idle');
+        this.pickUpNextTask(agent.id).catch(() => {});
+      }
+    }
+    console.log(`[EmergencyPause] Resumed all agents`);
+  }
+
   getActiveCount(): number {
     return this.activeCount;
+  }
+
+  isEmergencyPaused(): boolean {
+    return this.config.emergencyPause;
   }
 }

@@ -126,6 +126,33 @@ export class Agency {
       });
     }, 6 * 60 * 60_000);
 
+    // Deadlock detection every 5 minutes
+    setInterval(async () => {
+      try {
+        const cycles = await this.store.detectDeadlocks();
+        for (const cycle of cycles) {
+          console.warn(`[Deadlock] Circular dependency detected: ${cycle.join(' → ')}`);
+          // Auto-resolve by breaking the cycle: unblock the first task
+          const firstTaskId = cycle[0];
+          const firstTask = await this.store.getTask(firstTaskId);
+          if (firstTask) {
+            await this.store.updateTaskStatus(firstTaskId, 'assigned');
+            // Clear the dependency to break the cycle
+            await this.store.updateTaskDescription(firstTaskId,
+              (firstTask.description ?? '') + '\n\n[Deadlock auto-resolved: dependency cycle broken by system]');
+            const channel = firstTask.projectId ? `project-${firstTask.projectId}` : 'leadership';
+            this.agentManager.notify('pm', channel,
+              `broke a deadlock cycle: "${firstTask.title}" was in a circular dependency. unblocked it`);
+          }
+        }
+      } catch (err: any) {
+        console.error('[Deadlock detection error]', err.message);
+      }
+    }, 5 * 60_000);
+
+    // Seed default task templates
+    await this.seedTaskTemplates();
+
     // Wire project creation → Slack channel creation
     this.toolHandler.setOnProjectCreated(async (projectId: string, projectName: string) => {
       if (this.slack) {
@@ -264,14 +291,113 @@ export class Agency {
             console.error(`[QA Fix Loop] Error: ${err.message}`);
           }
         } else {
-          // QA passed → simple notification to PM (no Claude call needed), mark original task as done
+          // QA passed → create architect code review before final merge
           this.agentManager.notify('qa', notifyChannel,
-            `QA passed for "${cleanTitle.replace('QA Review: ', '')}". tested and good to ship`);
+            `QA passed for "${cleanTitle.replace('QA Review: ', '')}". sending to Charlie for code review`);
+
           try {
-            if (task.dependsOn) {
-              await this.store.updateTaskStatus(task.dependsOn, 'done');
+            const originalTaskId = task.dependsOn;
+            const originalTask = originalTaskId ? await this.store.getTask(originalTaskId) : null;
+
+            const reviewTaskId = crypto.randomUUID();
+            const reviewTask = {
+              id: reviewTaskId,
+              title: `Code Review: ${cleanTitle.replace('QA Review: ', '')}`,
+              description: [
+                `QA passed. Review the code changes for architecture, patterns, and quality.`,
+                ``,
+                originalTask ? `Original task: "${originalTask.title}" by ${originalTask.assignedTo}` : '',
+                resultText ? `## QA Report\n${resultText.slice(0, 400)}` : '',
+                ``,
+                `Check:`,
+                `1. Code follows established patterns and architecture`,
+                `2. No unnecessary complexity or over-engineering`,
+                `3. Proper error handling at system boundaries`,
+                `4. No security issues (injection, XSS, etc.)`,
+                `5. Good naming, clear intent`,
+                ``,
+                `If approved, mark as done. If changes needed, list them specifically.`,
+              ].filter(Boolean).join('\n'),
+              status: 'assigned' as const,
+              projectId: task.projectId,
+              assignedTo: 'architect',
+              createdBy: 'system',
+              parentTaskId: task.parentTaskId,
+              dependsOn: taskId,
+              priority: task.priority,
+              createdAt: new Date(),
+              updatedAt: new Date(),
+            };
+            await this.store.createTask(reviewTask);
+            await this.agentManager.assignTask('architect', reviewTask);
+          } catch (err: any) {
+            console.error(`[Code Review] Failed to create review task: ${err.message}`);
+            // Fallback: mark original task as done directly
+            try {
+              if (task.dependsOn) {
+                await this.store.updateTaskStatus(task.dependsOn, 'done');
+              }
+            } catch { /* non-critical */ }
+          }
+        }
+      } else if (agentId === 'architect' && cleanTitle.startsWith('Code Review: ')) {
+        // Architect finished code review → check if approved
+        const reviewResult = (resultText ?? '').toLowerCase();
+        const approved = reviewResult.includes('approved') || reviewResult.includes('lgtm') ||
+          reviewResult.includes('looks good') || reviewResult.includes('good to merge') ||
+          reviewResult.includes('no issues');
+
+        const notifyChannel2 = task.projectId ? `project-${task.projectId}` : 'leadership';
+        if (approved) {
+          this.agentManager.notify('architect', notifyChannel2,
+            `code review approved: "${cleanTitle.replace('Code Review: ', '')}". merging`);
+          // Walk the dependency chain back to mark the original dev task as done
+          try {
+            let depId = task.dependsOn; // QA task
+            if (depId) {
+              const qaTask = await this.store.getTask(depId);
+              if (qaTask?.dependsOn) {
+                await this.store.updateTaskStatus(qaTask.dependsOn, 'done');
+              }
+              await this.store.updateTaskStatus(depId, 'done');
             }
           } catch { /* non-critical */ }
+        } else {
+          // Architect wants changes → send back to original dev
+          this.agentManager.notify('architect', notifyChannel2,
+            `code review needs changes: "${cleanTitle.replace('Code Review: ', '')}"`);
+          try {
+            const qaTaskId = task.dependsOn;
+            const qaTask = qaTaskId ? await this.store.getTask(qaTaskId) : null;
+            const originalTaskId = qaTask?.dependsOn;
+            const originalTask = originalTaskId ? await this.store.getTask(originalTaskId) : null;
+            if (originalTask?.assignedTo) {
+              const fixTaskId = crypto.randomUUID();
+              await this.store.createTask({
+                id: fixTaskId,
+                title: `Code review fixes: ${cleanTitle.replace('Code Review: ', '')}`,
+                description: [
+                  `Architect review requested changes:`,
+                  ``,
+                  resultText?.slice(0, 800) ?? 'See review feedback',
+                  ``,
+                  `Apply the requested changes, then verify build/test.`,
+                ].join('\n'),
+                status: 'assigned' as const,
+                projectId: task.projectId,
+                assignedTo: originalTask.assignedTo,
+                createdBy: 'architect',
+                parentTaskId: task.parentTaskId,
+                dependsOn: null,
+                priority: Math.min(task.priority + 1, 10),
+                createdAt: new Date(),
+                updatedAt: new Date(),
+              });
+              this.agentManager.assignTask(originalTask.assignedTo, await this.store.getTask(fixTaskId) as any).catch(() => {});
+            }
+          } catch (err: any) {
+            console.error(`[Code Review] Failed to create fix task: ${err.message}`);
+          }
         }
       } else if (WORKER_ROLES.has(agentId) || WORKER_ROLES.has(agentId.replace(/-\d+$/, ''))) {
         // Worker done → auto-create QA review task
@@ -358,12 +484,66 @@ export class Agency {
     this.agentManager.on('taskFailed', async (agentId: string, taskId: string, error: string) => {
       this.wsServer.broadcast('task:update', { agentId, taskId, status: 'blocked', error });
 
-      // Notify PM and CEO when a task is blocked
       const task = await this.store.getTask(taskId);
       const blueprint = this.agentManager.getBlueprint(agentId);
       if (task && blueprint) {
         const blockMsg = `blocked on "${task.title.replace('[Investor Idea] ', '')}": ${error.slice(0, 100)}`;
         this.agentManager.emit('message', agentId, 'general', blockMsg);
+
+        // --- Agent Handoff Protocol ---
+        // If a worker is blocked, try to find a relevant agent to help
+        const errorLower = error.toLowerCase();
+        let handoffTo: string | null = null;
+
+        if (errorLower.includes('api') || errorLower.includes('backend') || errorLower.includes('endpoint')) {
+          if (agentId !== 'backend-developer') handoffTo = 'backend-developer';
+        } else if (errorLower.includes('frontend') || errorLower.includes('ui') || errorLower.includes('component')) {
+          if (agentId !== 'frontend-developer') handoffTo = 'frontend-developer';
+        } else if (errorLower.includes('design') || errorLower.includes('layout') || errorLower.includes('css')) {
+          if (agentId !== 'designer') handoffTo = 'designer';
+        } else if (errorLower.includes('deploy') || errorLower.includes('docker') || errorLower.includes('ci')) {
+          handoffTo = 'devops';
+        } else if (errorLower.includes('security') || errorLower.includes('auth') || errorLower.includes('permission')) {
+          handoffTo = 'security';
+        } else if (errorLower.includes('architecture') || errorLower.includes('design decision')) {
+          handoffTo = 'architect';
+        }
+
+        if (handoffTo && this.agentManager.getBlueprint(handoffTo)) {
+          const channel = task.projectId ? `project-${task.projectId}` : 'general';
+          const handoffName = this.agentManager.getBlueprint(handoffTo)?.name ?? handoffTo;
+          this.agentManager.notify(agentId, channel,
+            `need help from ${handoffName} — ${error.slice(0, 80)}`);
+
+          // Create a handoff task for the helper agent
+          const handoffTaskId = crypto.randomUUID();
+          await this.store.createTask({
+            id: handoffTaskId,
+            title: `Help ${blueprint.name}: ${task.title.slice(0, 80)}`,
+            description: [
+              `${blueprint.name} (${blueprint.role}) is blocked on "${task.title}" and needs your help.`,
+              ``,
+              `Error: ${error.slice(0, 500)}`,
+              ``,
+              `Original task: ${task.description?.slice(0, 300) ?? 'N/A'}`,
+              ``,
+              `Help resolve the blocker. Focus only on what's needed to unblock them.`,
+            ].join('\n'),
+            status: 'assigned',
+            projectId: task.projectId,
+            assignedTo: handoffTo,
+            createdBy: agentId,
+            parentTaskId: task.id,
+            dependsOn: null,
+            priority: Math.min(task.priority + 1, 10),
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          });
+
+          this.agentManager.assignTask(handoffTo, await this.store.getTask(handoffTaskId) as any).catch(err => {
+            console.error(`[Handoff] Failed to assign help task: ${err.message}`);
+          });
+        }
       }
     });
 
@@ -760,6 +940,15 @@ export class Agency {
 
     await this.store.createTask(task);
     await this.agentManager.assignTask('pm', task);
+
+    // Track investor request
+    await this.store.saveInvestorRequest({
+      id: crypto.randomUUID(),
+      investorMessage,
+      intent: 'project_idea',
+      summary,
+      rootTaskId: task.id,
+    });
   }
 
   /**
@@ -796,6 +985,15 @@ export class Agency {
 
     await this.store.createTask(task);
     await this.agentManager.assignTask('pm', task);
+
+    // Track investor request
+    await this.store.saveInvestorRequest({
+      id: crypto.randomUUID(),
+      investorMessage,
+      intent: 'simple_task',
+      summary,
+      rootTaskId: task.id,
+    });
   }
 
   /**
@@ -940,6 +1138,63 @@ export class Agency {
         if (val > 0) agencyConfig.maxConcurrency = val;
       }
     } catch { /* settings table may not exist yet on first run */ }
+  }
+
+  /**
+   * Seed default task templates — reusable patterns for common workflows.
+   */
+  private async seedTaskTemplates(): Promise<void> {
+    const templates = [
+      {
+        id: 'new-feature',
+        name: 'New Feature',
+        description: 'Full feature workflow: design → frontend → backend → QA',
+        steps: [
+          { title: 'Design: {name}', description: 'Create UI/UX design for {name}. Include wireframes, component structure, and visual specs.', assignTo: 'designer' },
+          { title: 'Frontend: {name}', description: 'Implement the frontend for {name} based on the design. Build components, pages, and client-side logic.', assignTo: 'frontend-developer', dependsOnStep: 0 },
+          { title: 'Backend: {name}', description: 'Implement backend API and logic for {name}. Create endpoints, database models, and business logic.', assignTo: 'backend-developer' },
+        ],
+        createdBy: 'system',
+      },
+      {
+        id: 'bug-fix',
+        name: 'Bug Fix',
+        description: 'Fix → QA verification workflow',
+        steps: [
+          { title: 'Fix: {name}', description: 'Investigate and fix the bug: {name}. Write a test to prevent regression.', assignTo: 'developer' },
+        ],
+        createdBy: 'system',
+      },
+      {
+        id: 'security-audit',
+        name: 'Security Audit',
+        description: 'Security review → fix → re-audit workflow',
+        steps: [
+          { title: 'Security Audit: {name}', description: 'Perform a security audit on {name}. Check for OWASP top 10, auth issues, injection, XSS.', assignTo: 'security' },
+          { title: 'Fix Security Issues: {name}', description: 'Fix security issues found in the audit for {name}.', assignTo: 'developer', dependsOnStep: 0 },
+        ],
+        createdBy: 'system',
+      },
+      {
+        id: 'full-stack-feature',
+        name: 'Full-Stack Feature with Architecture Review',
+        description: 'Architecture → design → frontend + backend (parallel) → integration',
+        steps: [
+          { title: 'Architecture: {name}', description: 'Design the architecture for {name}. Define data models, API contracts, component structure.', assignTo: 'architect' },
+          { title: 'Design: {name}', description: 'Create UI/UX design based on architecture. Follow the defined component structure.', assignTo: 'designer', dependsOnStep: 0 },
+          { title: 'Frontend: {name}', description: 'Implement frontend based on design and architecture specs.', assignTo: 'frontend-developer', dependsOnStep: 1 },
+          { title: 'Backend: {name}', description: 'Implement backend API following the architecture spec. Create endpoints and data layer.', assignTo: 'backend-developer', dependsOnStep: 0 },
+        ],
+        createdBy: 'system',
+      },
+    ];
+
+    for (const t of templates) {
+      try {
+        await this.store.saveTaskTemplate(t);
+      } catch { /* may already exist */ }
+    }
+    console.log(`  Seeded ${templates.length} task templates`);
   }
 
   async submitIdea(title: string, description: string) {
