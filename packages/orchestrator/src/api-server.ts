@@ -5,6 +5,7 @@ import type { TaskRouter } from './task-router.js';
 import type { TaskBoard } from './task-board.js';
 import type { MemoryManager } from './memory-manager.js';
 import type { AgentToolHandler } from './agent-tools.js';
+import type { DashboardWSServer } from './ws-server.js';
 import { getSDKMetrics } from './sdk-util.js';
 
 /**
@@ -18,6 +19,7 @@ export class APIServer {
   private taskBoard: TaskBoard;
   private memoryManager: MemoryManager | null = null;
   private toolHandler: AgentToolHandler | null = null;
+  private wsServer: DashboardWSServer | null = null;
   private server: ReturnType<typeof createServer> | null = null;
   private onSettingsChanged: (() => Promise<void>) | null = null;
 
@@ -34,6 +36,10 @@ export class APIServer {
 
   setToolHandler(handler: AgentToolHandler): void {
     this.toolHandler = handler;
+  }
+
+  setWSServer(ws: DashboardWSServer): void {
+    this.wsServer = ws;
   }
 
   setOnSettingsChanged(cb: () => Promise<void>): void {
@@ -577,6 +583,12 @@ export class APIServer {
     // --- SDK Metrics (in-process quickQuery stats) ---
     if (req.method === 'GET' && path === '/api/sdk-metrics') {
       this.json(res, getSDKMetrics());
+      return;
+    }
+
+    // --- WebSocket connection stats ---
+    if (req.method === 'GET' && path === '/api/ws-stats') {
+      this.json(res, this.wsServer ? this.wsServer.getStats() : { error: 'WS server not configured' });
       return;
     }
 

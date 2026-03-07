@@ -268,6 +268,7 @@ export class Agency {
     // Start API server
     this.apiServer.setMemoryManager(this.memoryManager);
     this.apiServer.setToolHandler(this.toolHandler);
+    this.apiServer.setWSServer(this.wsServer);
     this.apiServer.setOnSettingsChanged(() => this.loadSettings());
     this.apiServer.start(agencyConfig.wsPort + 1);
 
