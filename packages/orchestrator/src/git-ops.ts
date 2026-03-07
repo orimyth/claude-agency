@@ -1,7 +1,13 @@
-import { execSync } from 'child_process';
+import { execSync, type ExecSyncOptions } from 'child_process';
 import { existsSync, mkdirSync } from 'fs';
 import { resolve, dirname } from 'path';
 import type { ProjectRepository } from './types.js';
+import { gitEnv } from './git-env.js';
+
+/** execSync with git credential env always injected */
+function git(cmd: string, opts: ExecSyncOptions = {}): string | Buffer {
+  return execSync(cmd, { env: gitEnv, stdio: 'pipe', ...opts });
+}
 
 export interface WorktreeInfo {
   path: string;
@@ -57,10 +63,7 @@ export class GitOps {
 
     // Fetch latest from origin
     try {
-      execSync(`git -C "${repo.localPath}" fetch origin`, {
-        timeout: 30000,
-        stdio: 'pipe',
-      });
+      git(`git -C "${repo.localPath}" fetch origin`, { timeout: 30000 });
     } catch {
       // Fetch failure is non-fatal — we'll branch from local main
     }
@@ -69,27 +72,23 @@ export class GitOps {
     const mainBranch = repo.defaultBranch || 'main';
     let base = `origin/${mainBranch}`;
     try {
-      execSync(`git -C "${repo.localPath}" rev-parse ${base}`, {
-        timeout: 5000,
-        stdio: 'pipe',
-      });
+      git(`git -C "${repo.localPath}" rev-parse ${base}`, { timeout: 5000 });
     } catch {
       base = mainBranch;
     }
 
     // Create worktree with new branch
-    execSync(
+    git(
       `git -C "${repo.localPath}" worktree add -b "${branchName}" "${worktreeDir}" ${base}`,
-      { timeout: 30000, stdio: 'pipe' },
+      { timeout: 30000 },
     );
 
     // Install dependencies if package.json exists
     if (existsSync(resolve(worktreeDir, 'package.json'))) {
       try {
-        execSync('npm install --prefer-offline', {
+        git('npm install --prefer-offline', {
           cwd: worktreeDir,
           timeout: 120000,
-          stdio: 'pipe',
         });
       } catch {
         // Non-fatal — agent can install if needed
@@ -109,18 +108,14 @@ export class GitOps {
     if (!existsSync(worktreeDir)) return;
 
     try {
-      execSync(`git -C "${repo.localPath}" worktree remove "${worktreeDir}" --force`, {
+      git(`git -C "${repo.localPath}" worktree remove "${worktreeDir}" --force`, {
         timeout: 15000,
-        stdio: 'pipe',
       });
     } catch {
       // If worktree remove fails, try manual cleanup
       try {
         execSync(`rm -rf "${worktreeDir}"`, { timeout: 10000, stdio: 'pipe' });
-        execSync(`git -C "${repo.localPath}" worktree prune`, {
-          timeout: 10000,
-          stdio: 'pipe',
-        });
+        git(`git -C "${repo.localPath}" worktree prune`, { timeout: 10000 });
       } catch {
         // Best effort — log but don't fail
       }
@@ -135,40 +130,31 @@ export class GitOps {
     commitMessage: string,
   ): Promise<{ pushed: boolean; branch: string; noChanges: boolean }> {
     // Stage all changes
-    execSync(`git -C "${worktreeDir}" add -A`, { timeout: 30000, stdio: 'pipe' });
+    git(`git -C "${worktreeDir}" add -A`, { timeout: 30000 });
 
     // Check for changes
-    const status = execSync(`git -C "${worktreeDir}" status --porcelain`, {
-      timeout: 10000,
-      encoding: 'utf-8',
-    }).trim();
+    const status = (git(`git -C "${worktreeDir}" status --porcelain`, {
+      timeout: 10000, encoding: 'utf-8',
+    }) as string).trim();
 
     if (!status) {
-      const branch = execSync(`git -C "${worktreeDir}" branch --show-current`, {
-        timeout: 5000,
-        encoding: 'utf-8',
-      }).trim();
+      const branch = (git(`git -C "${worktreeDir}" branch --show-current`, {
+        timeout: 5000, encoding: 'utf-8',
+      }) as string).trim();
       return { pushed: false, branch, noChanges: true };
     }
 
     // Commit
     const safeMsg = commitMessage.replace(/"/g, '\\"');
-    execSync(`git -C "${worktreeDir}" commit -m "${safeMsg}"`, {
-      timeout: 30000,
-      stdio: 'pipe',
-    });
+    git(`git -C "${worktreeDir}" commit -m "${safeMsg}"`, { timeout: 30000 });
 
     // Get branch name
-    const branch = execSync(`git -C "${worktreeDir}" branch --show-current`, {
-      timeout: 5000,
-      encoding: 'utf-8',
-    }).trim();
+    const branch = (git(`git -C "${worktreeDir}" branch --show-current`, {
+      timeout: 5000, encoding: 'utf-8',
+    }) as string).trim();
 
     // Push
-    execSync(`git -C "${worktreeDir}" push -u origin "${branch}"`, {
-      timeout: 60000,
-      stdio: 'pipe',
-    });
+    git(`git -C "${worktreeDir}" push -u origin "${branch}"`, { timeout: 60000 });
 
     return { pushed: true, branch, noChanges: false };
   }
@@ -183,27 +169,18 @@ export class GitOps {
 
     try {
       // Switch to main and pull latest
-      execSync(`git -C "${cwd}" checkout "${mainBranch}"`, { timeout: 10000, stdio: 'pipe' });
-      execSync(`git -C "${cwd}" pull origin "${mainBranch}"`, { timeout: 30000, stdio: 'pipe' });
+      git(`git -C "${cwd}" checkout "${mainBranch}"`, { timeout: 10000 });
+      git(`git -C "${cwd}" pull origin "${mainBranch}"`, { timeout: 30000 });
 
       // Squash merge the feature branch
-      execSync(`git -C "${cwd}" merge --squash "${featureBranch}"`, {
-        timeout: 30000,
-        stdio: 'pipe',
-      });
+      git(`git -C "${cwd}" merge --squash "${featureBranch}"`, { timeout: 30000 });
 
       // Commit the squash
       const commitMsg = `Merge ${featureBranch} (squash)`;
-      execSync(`git -C "${cwd}" commit -m "${commitMsg}"`, {
-        timeout: 30000,
-        stdio: 'pipe',
-      });
+      git(`git -C "${cwd}" commit -m "${commitMsg}"`, { timeout: 30000 });
 
       // Push to main
-      execSync(`git -C "${cwd}" push origin "${mainBranch}"`, {
-        timeout: 60000,
-        stdio: 'pipe',
-      });
+      git(`git -C "${cwd}" push origin "${mainBranch}"`, { timeout: 60000 });
 
       return { success: true, merged: true, conflicted: false };
     } catch (err: any) {
@@ -214,16 +191,16 @@ export class GitOps {
         // Get conflicted files
         let conflictFiles: string[] = [];
         try {
-          const conflictOutput = execSync(
+          const conflictOutput = (git(
             `git -C "${cwd}" diff --name-only --diff-filter=U`,
             { timeout: 10000, encoding: 'utf-8' },
-          ).trim();
+          ) as string).trim();
           conflictFiles = conflictOutput.split('\n').filter(Boolean);
         } catch { /* ignore */ }
 
         // Abort the merge
         try {
-          execSync(`git -C "${cwd}" merge --abort`, { timeout: 10000, stdio: 'pipe' });
+          git(`git -C "${cwd}" merge --abort`, { timeout: 10000 });
         } catch { /* ignore */ }
 
         return { success: false, merged: false, conflicted: true, conflictFiles, error: errMsg };
@@ -245,10 +222,9 @@ export class GitOps {
     const mainBranch = repo.defaultBranch || 'main';
 
     // Ensure we're on main
-    const currentBranch = execSync(`git -C "${cwd}" branch --show-current`, {
-      timeout: 5000,
-      encoding: 'utf-8',
-    }).trim();
+    const currentBranch = (git(`git -C "${cwd}" branch --show-current`, {
+      timeout: 5000, encoding: 'utf-8',
+    }) as string).trim();
 
     if (currentBranch !== mainBranch) {
       return { verified: false, rolledBack: false, error: `Not on ${mainBranch} branch` };
@@ -261,8 +237,8 @@ export class GitOps {
 
     // Checks failed — revert the last commit
     try {
-      execSync(`git -C "${cwd}" revert HEAD --no-edit`, { timeout: 30000, stdio: 'pipe' });
-      execSync(`git -C "${cwd}" push origin "${mainBranch}"`, { timeout: 60000, stdio: 'pipe' });
+      git(`git -C "${cwd}" revert HEAD --no-edit`, { timeout: 30000 });
+      git(`git -C "${cwd}" push origin "${mainBranch}"`, { timeout: 60000 });
       return { verified: false, rolledBack: true, error: result.error };
     } catch (revertErr: any) {
       return {
@@ -279,13 +255,10 @@ export class GitOps {
   async deleteFeatureBranch(repo: ProjectRepository, branchName: string): Promise<void> {
     const cwd = repo.localPath;
     try {
-      execSync(`git -C "${cwd}" branch -D "${branchName}"`, { timeout: 10000, stdio: 'pipe' });
+      git(`git -C "${cwd}" branch -D "${branchName}"`, { timeout: 10000 });
     } catch { /* branch may not exist locally */ }
     try {
-      execSync(`git -C "${cwd}" push origin --delete "${branchName}"`, {
-        timeout: 30000,
-        stdio: 'pipe',
-      });
+      git(`git -C "${cwd}" push origin --delete "${branchName}"`, { timeout: 30000 });
     } catch { /* remote branch may not exist */ }
   }
 
@@ -295,20 +268,16 @@ export class GitOps {
   async getWorktreeDiff(worktreeDir: string): Promise<string> {
     try {
       // Diff against the merge base with main
-      const diff = execSync(`git -C "${worktreeDir}" diff origin/main...HEAD`, {
-        timeout: 30000,
-        encoding: 'utf-8',
-        maxBuffer: 1024 * 1024 * 5, // 5MB
+      const diff = git(`git -C "${worktreeDir}" diff origin/main...HEAD`, {
+        timeout: 30000, encoding: 'utf-8', maxBuffer: 1024 * 1024 * 5,
       });
-      return diff;
+      return diff as string;
     } catch {
       // Fallback: diff against HEAD~1
       try {
-        return execSync(`git -C "${worktreeDir}" diff HEAD~1`, {
-          timeout: 30000,
-          encoding: 'utf-8',
-          maxBuffer: 1024 * 1024 * 5,
-        });
+        return git(`git -C "${worktreeDir}" diff HEAD~1`, {
+          timeout: 30000, encoding: 'utf-8', maxBuffer: 1024 * 1024 * 5,
+        }) as string;
       } catch {
         return '';
       }
@@ -320,10 +289,9 @@ export class GitOps {
    */
   async getChangedFiles(worktreeDir: string): Promise<string[]> {
     try {
-      const output = execSync(`git -C "${worktreeDir}" diff --name-only origin/main...HEAD`, {
-        timeout: 10000,
-        encoding: 'utf-8',
-      }).trim();
+      const output = (git(`git -C "${worktreeDir}" diff --name-only origin/main...HEAD`, {
+        timeout: 10000, encoding: 'utf-8',
+      }) as string).trim();
       return output ? output.split('\n') : [];
     } catch {
       return [];

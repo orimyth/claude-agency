@@ -4,6 +4,7 @@ import { resolve, basename } from 'path';
 import type { StateStore } from './state-store.js';
 import type { AgentManager } from './agent-manager.js';
 import type { Task, Project, ProjectRepository } from './types.js';
+import { gitEnv } from './git-env.js';
 
 /**
  * Tools that agents can call during task execution.
@@ -202,7 +203,7 @@ export class AgentToolHandler {
     if (existsSync(repo.localPath)) {
       // Already cloned — pull instead
       try {
-        execSync(`git -C "${repo.localPath}" pull --ff-only`, { timeout: 60000 });
+        execSync(`git -C "${repo.localPath}" pull --ff-only`, { timeout: 60000, stdio: 'pipe', env: gitEnv });
         await this.store.updateRepositorySync(repo.id, repo.defaultBranch);
         return { success: true, data: { localPath: repo.localPath, action: 'pulled' } };
       } catch (err: any) {
@@ -211,7 +212,7 @@ export class AgentToolHandler {
     }
 
     try {
-      execSync(`git clone "${repo.repoUrl}" "${repo.localPath}"`, { timeout: 120000 });
+      execSync(`git clone "${repo.repoUrl}" "${repo.localPath}"`, { timeout: 120000, stdio: 'pipe', env: gitEnv });
       await this.store.updateRepositorySync(repo.id, repo.defaultBranch);
       return { success: true, data: { localPath: repo.localPath, action: 'cloned' } };
     } catch (err: any) {
