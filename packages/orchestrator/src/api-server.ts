@@ -5,6 +5,7 @@ import type { TaskRouter } from './task-router.js';
 import type { TaskBoard } from './task-board.js';
 import type { MemoryManager } from './memory-manager.js';
 import type { AgentToolHandler } from './agent-tools.js';
+import { getSDKMetrics } from './sdk-util.js';
 
 /**
  * Simple HTTP API for the dashboard.
@@ -570,6 +571,12 @@ export class APIServer {
       const hours = parseInt(url.searchParams.get('hours') ?? '24', 10);
       const digest = await this.store.getCostDigest(hours);
       this.json(res, digest);
+      return;
+    }
+
+    // --- SDK Metrics (in-process quickQuery stats) ---
+    if (req.method === 'GET' && path === '/api/sdk-metrics') {
+      this.json(res, getSDKMetrics());
       return;
     }
 

@@ -1,6 +1,7 @@
 import { EventEmitter } from 'events';
 import type { AgentManager } from './agent-manager.js';
 import type { StateStore } from './state-store.js';
+import { getSDKMetrics } from './sdk-util.js';
 
 export class Scheduler extends EventEmitter {
   private store: StateStore;
@@ -96,6 +97,7 @@ export class Scheduler extends EventEmitter {
           tasksBlocked: blocked.length,
           tasksPending: pending.length,
         },
+        sdkMetrics: getSDKMetrics(),
         activeDetails: active.map(a => ({
           id: a.id,
           name: this.agentManager.getBlueprint(a.id)?.name ?? a.id,
