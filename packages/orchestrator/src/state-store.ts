@@ -362,6 +362,20 @@ export class StateStore {
     return rows.map(r => this.mapTask(r));
   }
 
+  /**
+   * Get recent non-completed tasks for duplicate detection.
+   * Only returns id, title, description to keep it lightweight.
+   */
+  async getActiveTasksForDedup(): Promise<Array<{ id: string; title: string; description: string | null }>> {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      `SELECT id, title, description FROM tasks
+       WHERE status NOT IN ('done', 'blocked')
+         AND created_at > DATE_SUB(NOW(), INTERVAL 30 DAY)
+       ORDER BY created_at DESC LIMIT 200`
+    );
+    return rows.map(r => ({ id: r.id, title: r.title, description: r.description }));
+  }
+
   async getTasksByProject(projectId: string): Promise<Task[]> {
     const [rows] = await this.pool.query<RowDataPacket[]>(
       'SELECT * FROM tasks WHERE project_id = ? ORDER BY priority DESC, created_at ASC', [projectId]
