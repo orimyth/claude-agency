@@ -740,7 +740,7 @@ function computePositions(agents: Agent[], tasks: Task[]): AgentPosition[] {
       roomId,
       x: room.x + slot.x,
       y: room.y + slot.y,
-      direction: (slotIdx % 2 === 0 ? "right" : "left") as const,
+      direction: slotIdx % 2 === 0 ? ("right" as const) : ("left" as const),
       task: currentTask,
     };
   });

@@ -152,8 +152,8 @@ async function executeQuery(
         maxTurns: 1,
         permissionMode: 'bypassPermissions',
         env,
+        abortController,
       },
-      abortController,
     });
 
     let result = '';

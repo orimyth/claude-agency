@@ -105,7 +105,7 @@ export function ActivityFeed({ events, maxItems = 20, loading = false }: Activit
           recent.map((event, i) => {
             const text = formatEvent(event);
             const iconInfo = EVENT_ICONS[event.type] ?? DEFAULT_ICON;
-            const ago = timeAgo(event.timestamp);
+            const ago = timeAgo(new Date(event.timestamp).getTime());
 
             return (
               <div

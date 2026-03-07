@@ -7,7 +7,12 @@ import type { StateStore } from './state-store.js';
 import type { PermissionEngine } from './permission-engine.js';
 import type { MemoryManager } from './memory-manager.js';
 import type { AgentToolHandler } from './agent-tools.js';
+import type { NotificationService } from './notification.js';
 import { sdkEnv } from './sdk-util.js';
+import { createPermissionHook } from './permission-hook.js';
+import { runMechanicalChecks, formatCheckFailures } from './verification.js';
+import { GitOps } from './git-ops.js';
+import { CircuitBreaker } from './circuit-breaker.js';
 
 /** Roles that get agency management tools (can create projects, tasks, etc.) */
 const MANAGEMENT_ROLES = new Set(['ceo', 'pm', 'architect', 'hr']);
@@ -85,6 +90,9 @@ export class AgentManager extends EventEmitter {
   private languageOverride: string | null = null;
   private memoryManager: MemoryManager | null = null;
   private toolHandler: AgentToolHandler | null = null;
+  private notifications: NotificationService | null = null;
+  private gitOps: GitOps | null = null;
+  private circuitBreaker: CircuitBreaker;
   /** Track consecutive chat failures per agent for adaptive model promotion */
   private chatFailures: Map<string, number> = new Map();
   /** Track last activity time per agent for idle session recycling */
@@ -104,6 +112,19 @@ export class AgentManager extends EventEmitter {
 
     // Recycle idle agent sessions every 10 min to free resources
     this.idleRecycleTimer = setInterval(() => this.recycleIdleSessions(), 10 * 60_000);
+
+    // Circuit breaker for Anthropic API
+    this.circuitBreaker = new CircuitBreaker({
+      failureThreshold: 5,
+      resetTimeoutMs: 60_000,
+      onStateChange: (state) => {
+        if (state === 'open') {
+          this.notifications?.systemAlert('Circuit breaker OPEN — Anthropic API failures detected. Pausing new agent tasks.');
+        } else if (state === 'closed') {
+          this.notifications?.systemAlert('Circuit breaker CLOSED — API recovered. Resuming normal operation.');
+        }
+      },
+    });
   }
 
   /**
@@ -136,6 +157,14 @@ export class AgentManager extends EventEmitter {
 
   setToolHandler(handler: AgentToolHandler): void {
     this.toolHandler = handler;
+  }
+
+  setNotifications(notifications: NotificationService): void {
+    this.notifications = notifications;
+  }
+
+  setGitOps(gitOps: GitOps): void {
+    this.gitOps = gitOps;
   }
 
   setLanguage(lang: string | null): void {
@@ -235,20 +264,27 @@ export class AgentManager extends EventEmitter {
     if (!agent) throw new Error(`Agent ${agentId} not found in store`);
 
     if (agent.status === 'on_break') {
-      await this.store.updateTaskStatus(task.id, 'assigned', agentId);
+      await this.store.updateTaskStatus(task.id, 'queued', agentId);
       return;
     }
 
     // Emergency pause — queue the task but don't start it
     if (this.config.emergencyPause) {
-      await this.store.updateTaskStatus(task.id, 'assigned', agentId);
+      await this.store.updateTaskStatus(task.id, 'queued', agentId);
       this.emit('message', agentId, 'system', `emergency pause active — task queued`);
       return;
     }
 
     if (this.activeCount >= this.config.maxConcurrency) {
-      await this.store.updateTaskStatus(task.id, 'assigned', agentId);
+      await this.store.updateTaskStatus(task.id, 'queued', agentId);
       this.emit('message', agentId, 'system', `task queued, waiting for a slot to open up`);
+      return;
+    }
+
+    // Circuit breaker — don't start tasks if API is failing
+    if (!this.circuitBreaker.canExecute()) {
+      await this.store.updateTaskStatus(task.id, 'queued', agentId);
+      this.emit('message', agentId, 'system', `API circuit breaker open — task queued until service recovers`);
       return;
     }
 
@@ -266,19 +302,26 @@ export class AgentManager extends EventEmitter {
 
   /**
    * Determine the working directory for a task.
-   * If the task has a project with repos, use the first repo's local path.
+   * If the task has a project with repos, create a git worktree for isolation.
+   * Each task gets its own branch + directory so concurrent agents don't conflict.
    */
-  private async resolveTaskWorkDir(task: Task): Promise<string> {
-    if (task.projectId) {
+  private async resolveTaskWorkDir(task: Task, agentId: string): Promise<{ workDir: string; worktreeCreated: boolean }> {
+    if (task.projectId && this.gitOps) {
       const repos = await this.store.getProjectRepositories(task.projectId);
       if (repos.length > 0 && repos[0].localPath) {
         const { existsSync } = await import('fs');
         if (existsSync(repos[0].localPath)) {
-          return repos[0].localPath;
+          try {
+            const worktree = await this.gitOps.createTaskWorktree(repos[0], task.id, agentId);
+            return { workDir: worktree.path, worktreeCreated: true };
+          } catch (err: any) {
+            console.warn(`[Worktree] Failed to create worktree for task ${task.id}: ${err.message}. Falling back to shared repo.`);
+            return { workDir: repos[0].localPath, worktreeCreated: false };
+          }
         }
       }
     }
-    return this.resolveWorkDir();
+    return { workDir: this.resolveWorkDir(), worktreeCreated: false };
   }
 
   private async runAgent(blueprint: AgentBlueprint, task: Task): Promise<void> {
@@ -286,7 +329,7 @@ export class AgentManager extends EventEmitter {
     this.activeSessions.set(blueprint.id, abortController);
     this.activeCount++;
 
-    const workDir = await this.resolveTaskWorkDir(task);
+    const { workDir, worktreeCreated } = await this.resolveTaskWorkDir(task, blueprint.id);
     const prompt = await this.buildTaskPrompt(blueprint, task);
 
     // Inject AGENCY_API_URL so agents can call the API via curl/Bash
@@ -300,6 +343,17 @@ export class AgentManager extends EventEmitter {
       // This means the agent remembers previous work, decisions, and codebase knowledge.
       const existingSession = this.agentSessionIds.get(blueprint.id);
 
+      // Create permission hook for this agent's role
+      const permHook = createPermissionHook(
+        blueprint.id,
+        blueprint.role ?? blueprint.id,
+        undefined, // default blacklist
+        (agentId, toolName, reason) => {
+          console.warn(`[PermHook] Blocked ${agentId} from ${toolName}: ${reason}`);
+          this.notifications?.systemAlert(`Permission blocked: ${agentId} tried ${toolName} — ${reason}`);
+        },
+      );
+
       const queryOptions: Record<string, any> = {
         model: selectTaskModel(blueprint.id, task),
         customSystemPrompt: blueprint.systemPrompt,
@@ -309,6 +363,9 @@ export class AgentManager extends EventEmitter {
         permissionMode: 'bypassPermissions',
         maxTurns: 50,
         env: agentEnv,
+        hooks: {
+          preToolUse: [permHook],
+        },
       };
 
       // If we have a previous session, resume it to maintain context
@@ -403,7 +460,11 @@ export class AgentManager extends EventEmitter {
         .replace(/`([^`]+)`/g, '$1');      // strip inline code
       const channel = task.projectId ? `project-${task.projectId}` : 'general';
       this.emit('message', blueprint.id, channel, summary);
-      this.emit('taskComplete', blueprint.id, task.id, resultText);
+
+      // Save completion summary
+      if (resultText) {
+        await this.store.setTaskCompletionSummary(task.id, resultText.slice(0, 5000));
+      }
 
       // Record usage + broadcast to dashboard
       if (lastResult) {
@@ -432,10 +493,52 @@ export class AgentManager extends EventEmitter {
         } satisfies UsageSnapshot);
       }
       this.lastActivityAt.set(blueprint.id, Date.now());
+      this.circuitBreaker.recordSuccess();
 
-      await this.store.updateTaskStatus(task.id, 'review');
+      // Mechanical verification for worker roles (build/test/lint/typecheck)
+      const isWorker = WORKER_ROLES.has(blueprint.id);
+      let verificationPassed = true;
+
+      if (isWorker) {
+        try {
+          await this.store.updateTaskStatus(task.id, 'verifying');
+          const checkResult = await runMechanicalChecks(workDir);
+          if (!checkResult.allPassed) {
+            verificationPassed = false;
+            const failures = formatCheckFailures(checkResult);
+            this.notifications?.verificationFailed(task.id, task.title, failures);
+            this.emit('message', blueprint.id, channel, `checks failed — retrying`);
+
+            // Retry: feed failures back to the agent
+            const retryCount = await this.store.incrementTaskRetry(task.id);
+            if (retryCount <= AgentManager.MAX_TASK_RETRIES) {
+              await this.store.updateTaskStatus(task.id, 'in_progress', blueprint.id);
+              // Re-run agent with failure context
+              const retryTask = {
+                ...task,
+                description: `${task.description}\n\n---\nVERIFICATION FAILED (attempt ${retryCount + 1}):\n${failures}`,
+              };
+              this.runAgent(blueprint, retryTask).catch(err => this.emit('error', blueprint.id, err));
+              return; // Don't continue to completion flow
+            }
+          }
+        } catch (err: any) {
+          console.warn(`[Verification] Failed to run checks for ${task.id}: ${err.message}`);
+          // Don't block on verification infrastructure errors
+        }
+      }
+
+      // Determine final status: review gating
+      const needsReview = task.needsReview && verificationPassed;
+      const finalStatus = needsReview ? 'review' : 'done';
+      await this.store.updateTaskStatus(task.id, finalStatus);
       await this.store.updateAgentStatus(blueprint.id, 'idle');
       await this.store.recordKPI(blueprint.id, 'tasks_completed', 1);
+      this.emit('taskComplete', blueprint.id, task.id, resultText);
+
+      if (verificationPassed) {
+        this.notifications?.taskCompleted(blueprint.id, task.id, task.title, task.projectId ?? undefined);
+      }
 
       // Extract learnings — skip for QA reviews and short results (they're derivative, not worth the model call)
       const isQAReview = task.title.startsWith('QA Review:') || task.title.startsWith('Fix bugs:');
@@ -444,9 +547,28 @@ export class AgentManager extends EventEmitter {
           .catch(() => { /* non-critical */ });
       }
 
+      // Clean up worktree after task completion (commit + push first if needed)
+      if (worktreeCreated && this.gitOps && task.projectId) {
+        try {
+          const repos = await this.store.getProjectRepositories(task.projectId);
+          if (repos.length > 0) {
+            // Commit and push any remaining changes from worktree
+            const pushResult = await this.gitOps.commitAndPush(workDir, `Task complete: ${task.title}`);
+            if (pushResult.pushed) {
+              this.emit('message', blueprint.id, channel, `pushed to ${pushResult.branch}`);
+            }
+            // Clean up the worktree
+            await this.gitOps.cleanupWorktree(repos[0], task.id);
+          }
+        } catch (err: any) {
+          console.warn(`[Worktree] Cleanup failed for task ${task.id}: ${err.message}`);
+        }
+      }
+
       // Autonomous loop: pick up next task
       await this.pickUpNextTask(blueprint.id);
     } catch (err: any) {
+      this.circuitBreaker.recordFailure();
       if (this.isRateLimitError(err)) {
         await this.handleRateLimit(blueprint.id, err);
       } else if (abortController.signal.aborted) {
@@ -758,11 +880,11 @@ export class AgentManager extends EventEmitter {
     this.emit('message', fromId, channel,
       `hey ${to.name.toLowerCase()}, handing this off to you: ${title}`);
 
-    const task = {
+    const task: Task = {
       id: crypto.randomUUID(),
       title,
       description: `${from.name} (${from.role}) handed this off:\n\n${description}`,
-      status: 'assigned' as const,
+      status: 'queued',
       projectId: null,
       assignedTo: toId,
       createdBy: fromId,
@@ -770,6 +892,13 @@ export class AgentManager extends EventEmitter {
       dependsOn: null,
       priority: 5,
       deadline: null,
+      completionSummary: null,
+      retryCount: 0,
+      needsReview: false,
+      groupId: null,
+      phase: null,
+      cancelledAt: null,
+      cancelledBy: null,
       createdAt: new Date(),
       updatedAt: new Date(),
     };

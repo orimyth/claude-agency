@@ -14,6 +14,12 @@ import { MemoryManager } from './memory-manager.js';
 import { AgentToolHandler } from './agent-tools.js';
 import { APIServer } from './api-server.js';
 import { SlackBridge, type InvestorMessage } from 'slack-bridge';
+import { NotificationService } from './notification.js';
+import { Watchdog } from './watchdog.js';
+import { CEOLoop } from './ceo-loop.js';
+import { HRLoop } from './hr-loop.js';
+import { runMigrations } from './migrate.js';
+import { GitOps } from './git-ops.js';
 import { dirname, resolve } from 'path';
 import { fileURLToPath } from 'url';
 import { quickQuery } from './sdk-util.js';
@@ -37,6 +43,11 @@ export class Agency {
   private toolHandler: AgentToolHandler;
   private apiServer: APIServer;
   private slack: SlackBridge | null = null;
+  private notifications: NotificationService;
+  private watchdog: Watchdog;
+  private ceoLoop: CEOLoop;
+  private hrLoop: HRLoop;
+  private gitOps: GitOps;
   /** Maps "channel:taskTitle" → Slack thread_ts for threaded replies */
   private taskThreads: Map<string, string> = new Map();
   /** Webhook delivery queue — fire-and-forget */
@@ -56,6 +67,13 @@ export class Agency {
     this.taskRouter = new TaskRouter(this.store, this.agentManager);
     this.taskBoard = new TaskBoard(this.store);
     this.wsServer = new DashboardWSServer(agencyConfig.wsPort);
+    this.notifications = new NotificationService(this.wsServer);
+    this.watchdog = new Watchdog(this.store, this.notifications);
+    this.ceoLoop = new CEOLoop(this.store, this.agentManager, this.notifications);
+    this.hrLoop = new HRLoop(this.store, this.agentManager, this.notifications);
+    this.gitOps = new GitOps();
+    this.agentManager.setNotifications(this.notifications);
+    this.agentManager.setGitOps(this.gitOps);
     this.apiServer = new APIServer(this.store, this.agentManager, this.taskRouter, this.taskBoard);
   }
 
@@ -65,6 +83,14 @@ export class Agency {
     // Initialize database
     await this.store.initialize();
     console.log('Database initialized');
+
+    // Run pending migrations
+    try {
+      await runMigrations(agencyConfig.mysql);
+      console.log('Migrations applied');
+    } catch (err: any) {
+      console.warn(`Migration warning: ${err.message}`);
+    }
 
     // Seed default blueprints into MySQL (only inserts if not already there)
     for (const blueprint of defaultBlueprints) {
@@ -122,6 +148,12 @@ export class Agency {
     this.scheduler.start();
     this.setupSchedulerEvents();
     console.log('Scheduler started');
+
+    // Start system watchdog and autonomous loops
+    this.watchdog.start();
+    this.ceoLoop.start();
+    this.hrLoop.start();
+    console.log('Watchdog + CEO/HR loops started');
 
     // Register all background loops with tracked timers for clean shutdown
     this.registerBackgroundLoops();
@@ -185,7 +217,8 @@ export class Agency {
     });
 
     this.agentManager.on('taskComplete', async (agentId: string, taskId: string, resultText?: string) => {
-      this.wsServer.broadcast('task:update', { agentId, taskId, status: 'review' });
+      const currentTask = await this.store.getTask(taskId);
+      this.wsServer.broadcast('task:update', { agentId, taskId, status: currentTask?.status ?? 'done' });
 
       // Fire webhook for task completion
       this.fireWebhook('task:done', { agentId, taskId });
@@ -1439,6 +1472,9 @@ export class Agency {
     this.backgroundTimers.length = 0;
 
     this.scheduler.stop();
+    this.watchdog.stop();
+    this.ceoLoop.stop();
+    this.hrLoop.stop();
 
     // Gracefully shut down agent manager (abort active sessions, clear timers)
     await this.agentManager.shutdown();

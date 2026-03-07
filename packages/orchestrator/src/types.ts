@@ -1,5 +1,5 @@
 export type AgentStatus = 'active' | 'idle' | 'paused' | 'on_break' | 'error';
-export type TaskStatus = 'backlog' | 'assigned' | 'in_progress' | 'review' | 'done' | 'blocked';
+export type TaskStatus = 'backlog' | 'queued' | 'assigned' | 'in_progress' | 'verifying' | 'review' | 'done' | 'blocked' | 'cancelled';
 export type ApprovalStatus = 'pending' | 'approved' | 'rejected' | 'modified';
 
 export interface AgentBlueprint {
@@ -37,9 +37,16 @@ export interface Task {
   assignedTo: string | null;
   createdBy: string;
   parentTaskId: string | null;
-  dependsOn: string | null;  // task ID this task waits for
+  dependsOn: string | null;  // legacy single dependency (kept for backwards compat)
   priority: number;
   deadline: Date | null;
+  completionSummary?: string | null;
+  retryCount?: number;
+  needsReview?: boolean;
+  groupId?: string | null;
+  phase?: number | null;
+  cancelledAt?: Date | null;
+  cancelledBy?: string | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -51,7 +58,9 @@ export interface Project {
   slackChannel: string | null;
   createdAt: Date;
   updatedAt: Date;
-  status: 'active' | 'paused' | 'completed' | 'archived';
+  status: 'created' | 'active' | 'paused' | 'completed' | 'cancelled' | 'archived';
+  budgetUsd?: number | null;
+  spentUsd?: number;
 }
 
 export interface ProjectRepository {

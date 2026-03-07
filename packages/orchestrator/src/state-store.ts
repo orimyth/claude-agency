@@ -3,9 +3,15 @@ import type { AgentState, Task, Project, ProjectRepository, Message, Approval, A
 
 export class StateStore {
   private pool: Pool;
+  private config: AgencyConfig['mysql'];
 
   constructor(config: AgencyConfig['mysql']) {
-    this.pool = mysql.createPool({
+    this.config = config;
+    this.pool = this.createPool(config);
+  }
+
+  private createPool(config: AgencyConfig['mysql']): Pool {
+    return mysql.createPool({
       host: config.host,
       port: config.port,
       user: config.user,
@@ -13,10 +19,39 @@ export class StateStore {
       database: config.database,
       waitForConnections: true,
       connectionLimit: 10,
-      connectTimeout: 10_000,    // 10s to establish connection
+      connectTimeout: 10_000,
       enableKeepAlive: true,
-      keepAliveInitialDelay: 30_000, // TCP keepalive after 30s idle
+      keepAliveInitialDelay: 30_000,
     });
+  }
+
+  /**
+   * Execute a query with automatic retry on connection errors.
+   * Uses exponential backoff: 1s, 2s, 4s.
+   */
+  private async withRetry<T>(fn: () => Promise<T>, maxRetries = 3): Promise<T> {
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        return await fn();
+      } catch (err: any) {
+        const isConnectionError = err.code === 'ECONNREFUSED' || err.code === 'ECONNRESET' ||
+          err.code === 'PROTOCOL_CONNECTION_LOST' || err.code === 'ER_CON_COUNT_ERROR' ||
+          err.message?.includes('Connection lost');
+
+        if (!isConnectionError || attempt === maxRetries - 1) throw err;
+
+        const backoffMs = Math.pow(2, attempt) * 1000;
+        console.warn(`[DB] Connection error (attempt ${attempt + 1}/${maxRetries}), retrying in ${backoffMs}ms: ${err.code ?? err.message}`);
+        await new Promise(resolve => setTimeout(resolve, backoffMs));
+
+        // Recreate pool on persistent connection failures
+        if (attempt >= 1) {
+          try { await this.pool.end(); } catch { /* ignore */ }
+          this.pool = this.createPool(this.config);
+        }
+      }
+    }
+    throw new Error('Unreachable');
   }
 
   async initialize(): Promise<void> {
@@ -42,7 +77,7 @@ export class StateStore {
           slack_channel VARCHAR(128) NULL,
           created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
           updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-          status ENUM('active','paused','completed','archived') NOT NULL DEFAULT 'active'
+          status ENUM('created','active','paused','completed','cancelled','archived') NOT NULL DEFAULT 'active'
         )
       `);
 
@@ -97,7 +132,7 @@ export class StateStore {
           id VARCHAR(64) PRIMARY KEY,
           title VARCHAR(512) NOT NULL,
           description TEXT,
-          status ENUM('backlog','assigned','in_progress','review','done','blocked') NOT NULL DEFAULT 'backlog',
+          status ENUM('backlog','queued','assigned','in_progress','verifying','review','done','blocked','cancelled') NOT NULL DEFAULT 'backlog',
           project_id VARCHAR(64) NULL,
           assigned_to VARCHAR(64) NULL,
           created_by VARCHAR(64) NOT NULL,
@@ -276,6 +311,14 @@ export class StateStore {
     }
   }
 
+  // Generic query (for watchdog and other infrastructure)
+  async query(sql: string, params?: unknown[]): Promise<RowDataPacket[]> {
+    return this.withRetry(async () => {
+      const [rows] = await this.pool.query<RowDataPacket[]>(sql, params);
+      return rows;
+    });
+  }
+
   // Agent operations
   async getAgent(id: string): Promise<AgentState | null> {
     const [rows] = await this.pool.query<RowDataPacket[]>(
@@ -369,7 +412,7 @@ export class StateStore {
   async getActiveTasksForDedup(): Promise<Array<{ id: string; title: string; description: string | null }>> {
     const [rows] = await this.pool.query<RowDataPacket[]>(
       `SELECT id, title, description FROM tasks
-       WHERE status NOT IN ('done', 'blocked')
+       WHERE status NOT IN ('done', 'blocked', 'cancelled')
          AND created_at > DATE_SUB(NOW(), INTERVAL 30 DAY)
        ORDER BY created_at DESC LIMIT 200`
     );
@@ -391,12 +434,20 @@ export class StateStore {
   }
 
   async getNextAvailableTask(agentId: string): Promise<Task | null> {
-    // Only pick up tasks whose dependencies are done (or have no dependency)
+    // Pick up queued tasks whose ALL dependencies (junction table + legacy) are satisfied.
+    // A task is ready when:
+    //   1. No rows in task_dependencies for it, OR all dependent tasks are done
+    //   2. Legacy depends_on is NULL or the referenced task is done
     const [rows] = await this.pool.query<RowDataPacket[]>(
       `SELECT t.* FROM tasks t
-       LEFT JOIN tasks dep ON t.depends_on = dep.id
-       WHERE t.assigned_to = ? AND t.status = 'assigned'
-         AND (t.depends_on IS NULL OR dep.status IN ('done', 'review'))
+       LEFT JOIN tasks legacy_dep ON t.depends_on = legacy_dep.id
+       WHERE t.assigned_to = ? AND t.status IN ('queued', 'assigned')
+         AND (t.depends_on IS NULL OR legacy_dep.status = 'done')
+         AND NOT EXISTS (
+           SELECT 1 FROM task_dependencies td
+           JOIN tasks dep ON td.depends_on_task_id = dep.id
+           WHERE td.task_id = t.id AND dep.status != 'done'
+         )
        ORDER BY t.priority DESC, t.created_at ASC LIMIT 1`,
       [agentId]
     );
@@ -406,13 +457,29 @@ export class StateStore {
 
   /**
    * Unblock tasks that were waiting on a now-completed dependency.
-   * Returns tasks that are ready to be assigned/started.
+   * Checks both legacy depends_on and junction table.
+   * Returns tasks that are ready (ALL their dependencies are now done).
    */
   async getUnblockedTasks(completedTaskId: string): Promise<Task[]> {
+    // Find tasks that depend on the completed task (via either mechanism)
+    // and now have ALL dependencies satisfied
     const [rows] = await this.pool.query<RowDataPacket[]>(
-      `SELECT * FROM tasks WHERE depends_on = ? AND status = 'assigned'
-       ORDER BY priority DESC`,
-      [completedTaskId]
+      `SELECT DISTINCT t.* FROM tasks t
+       WHERE t.status IN ('queued', 'assigned', 'blocked')
+         AND (
+           t.depends_on = ?
+           OR t.id IN (SELECT td.task_id FROM task_dependencies td WHERE td.depends_on_task_id = ?)
+         )
+         AND (t.depends_on IS NULL OR EXISTS (
+           SELECT 1 FROM tasks dep WHERE dep.id = t.depends_on AND dep.status = 'done'
+         ))
+         AND NOT EXISTS (
+           SELECT 1 FROM task_dependencies td
+           JOIN tasks dep ON td.depends_on_task_id = dep.id
+           WHERE td.task_id = t.id AND dep.status != 'done'
+         )
+       ORDER BY t.priority DESC`,
+      [completedTaskId, completedTaskId]
     );
     return rows.map(r => this.mapTask(r));
   }
@@ -436,6 +503,52 @@ export class StateStore {
       'UPDATE tasks SET description = ? WHERE id = ?',
       [description, id]
     );
+  }
+
+  async setTaskCompletionSummary(id: string, summary: string): Promise<void> {
+    await this.pool.query(
+      'UPDATE tasks SET completion_summary = ? WHERE id = ?',
+      [summary, id]
+    );
+  }
+
+  async cancelTask(id: string, cancelledBy: string): Promise<void> {
+    await this.pool.query(
+      `UPDATE tasks SET status = 'cancelled', cancelled_at = NOW(), cancelled_by = ? WHERE id = ?`,
+      [cancelledBy, id]
+    );
+  }
+
+  async incrementTaskRetry(id: string): Promise<number> {
+    await this.pool.query(
+      'UPDATE tasks SET retry_count = retry_count + 1 WHERE id = ?',
+      [id]
+    );
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      'SELECT retry_count FROM tasks WHERE id = ?', [id]
+    );
+    return rows[0]?.retry_count ?? 0;
+  }
+
+  /**
+   * Add a dependency between tasks using the junction table.
+   */
+  async addTaskDependency(taskId: string, dependsOnTaskId: string): Promise<void> {
+    await this.pool.query(
+      `INSERT IGNORE INTO task_dependencies (task_id, depends_on_task_id) VALUES (?, ?)`,
+      [taskId, dependsOnTaskId]
+    );
+  }
+
+  /**
+   * Get all dependency task IDs for a given task.
+   */
+  async getTaskDependencies(taskId: string): Promise<string[]> {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      'SELECT depends_on_task_id FROM task_dependencies WHERE task_id = ?',
+      [taskId]
+    );
+    return rows.map(r => r.depends_on_task_id);
   }
 
   // Project operations
@@ -1345,6 +1458,49 @@ export class StateStore {
     return null;
   }
 
+  /**
+   * Get raw task completion data for the estimator (duration + cost per task).
+   */
+  async getTaskCompletionHistory(): Promise<Array<{
+    agentId: string;
+    taskType: string;
+    durationMs: number;
+    costUsd: number;
+  }>> {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      `SELECT
+        u.agent_id,
+        t.title,
+        u.duration_ms,
+        u.total_cost_usd
+      FROM usage_log u
+      INNER JOIN tasks t ON u.task_id = t.id
+      WHERE u.task_id IS NOT NULL AND u.duration_ms > 0
+      ORDER BY u.created_at DESC
+      LIMIT 1000`
+    );
+
+    return rows.map(r => {
+      const title = (r.title ?? '').toLowerCase();
+      let taskType = 'general';
+      if (title.startsWith('qa review:')) taskType = 'qa_review';
+      else if (title.startsWith('fix bugs:')) taskType = 'bug_fix';
+      else if (title.startsWith('code review:')) taskType = 'code_review';
+      else if (title.includes('design')) taskType = 'design';
+      else if (title.includes('frontend') || title.includes('ui')) taskType = 'frontend';
+      else if (title.includes('backend') || title.includes('api')) taskType = 'backend';
+      else if (title.includes('test')) taskType = 'testing';
+      else if (title.includes('deploy') || title.includes('ci/cd')) taskType = 'devops';
+
+      return {
+        agentId: r.agent_id,
+        taskType,
+        durationMs: Number(r.duration_ms),
+        costUsd: Number(r.total_cost_usd ?? 0),
+      };
+    });
+  }
+
   // --- Conversation Audit Log ---
 
   /**
@@ -1814,6 +1970,13 @@ export class StateStore {
       dependsOn: row.depends_on ?? null,
       priority: row.priority,
       deadline: row.deadline ? new Date(row.deadline) : null,
+      completionSummary: row.completion_summary ?? null,
+      retryCount: row.retry_count ?? 0,
+      needsReview: row.needs_review === 1 || row.needs_review === true,
+      groupId: row.group_id ?? null,
+      phase: row.phase ?? null,
+      cancelledAt: row.cancelled_at ? new Date(row.cancelled_at) : null,
+      cancelledBy: row.cancelled_by ?? null,
       createdAt: new Date(row.created_at),
       updatedAt: new Date(row.updated_at),
     };
@@ -1828,6 +1991,8 @@ export class StateStore {
       createdAt: new Date(row.created_at),
       updatedAt: new Date(row.updated_at),
       status: row.status,
+      budgetUsd: row.budget_usd ?? null,
+      spentUsd: row.spent_usd ?? 0,
     };
   }
 

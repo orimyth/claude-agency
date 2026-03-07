@@ -1,13 +1,9 @@
-import { query } from '@anthropic-ai/claude-code';
 import type { AgentManager } from './agent-manager.js';
 import type { StateStore } from './state-store.js';
 import type { TaskBoard } from './task-board.js';
 import { HRManager } from './hr-manager.js';
 import type { AgentBlueprint, Task, AgencyConfig } from './types.js';
 import { EventEmitter } from 'events';
-import { dirname, resolve } from 'path';
-import { fileURLToPath } from 'url';
-import { sdkEnv } from './sdk-util.js';
 
 /**
  * Handles complex multi-agent workflows:
@@ -36,94 +32,6 @@ export class WorkflowEngine extends EventEmitter {
     this.taskBoard = taskBoard;
     this.hrManager = hrManager;
     this.config = config;
-  }
-
-  private resolveWorkDir(): string {
-    let workDir = this.config.workspace;
-    if (!workDir.startsWith('/')) {
-      workDir = resolve(dirname(fileURLToPath(import.meta.url)), '../../..', workDir);
-    }
-    return workDir;
-  }
-
-  /**
-   * CEO evaluates a new idea.
-   * Now the CEO gets agency tools so they can create projects/tasks directly,
-   * rather than us parsing JSON from their output.
-   */
-  async evaluateIdea(task: Task): Promise<void> {
-    const ceoBlueprint = this.agentManager.getBlueprint('ceo');
-    if (!ceoBlueprint) return;
-
-    // Get the list of available agents for the CEO
-    const agents = this.agentManager.getAllBlueprints();
-    const agentList = agents
-      .filter(a => a.id !== 'ceo')
-      .map(a => `- ${a.id}: ${a.name} (${a.role})`)
-      .join('\n');
-
-    const apiUrl = `http://localhost:${this.config.wsPort + 1}`;
-
-    const evaluationPrompt = [
-      `You are ${ceoBlueprint.name}, the ${ceoBlueprint.role}.`,
-      ``,
-      `A new idea has been submitted by the investor:`,
-      `Title: ${task.title}`,
-      `Description: ${task.description}`,
-      ``,
-      `## Available Team Members`,
-      agentList,
-      ``,
-      `## Agency API (use via curl in Bash)`,
-      `- Create project: curl -s -X POST ${apiUrl}/api/agency/projects -H 'Content-Type: application/json' -d '{"name":"...","description":"..."}'`,
-      `- Add repo: curl -s -X POST ${apiUrl}/api/agency/repositories -H 'Content-Type: application/json' -d '{"projectId":"...","repoUrl":"..."}'`,
-      `- Clone repo: curl -s -X POST ${apiUrl}/api/agency/repositories/{repoId}/clone`,
-      `- Create task: curl -s -X POST ${apiUrl}/api/agency/tasks -H 'Content-Type: application/json' -d '{"projectId":"...","title":"...","description":"...","assignTo":"developer","priority":7}'`,
-      `- List agents: curl -s ${apiUrl}/api/agents`,
-      ``,
-      `## Your Job`,
-      `Evaluate this idea and take action:`,
-      `1. Create a project via the API`,
-      `2. Break it down into tasks and assign to the right agents via the API`,
-      `3. For complex projects, create an architecture task for Charlie first`,
-      `4. For simple tasks, assign directly to the right developer/designer`,
-      ``,
-      `Take action now. Use curl to call the Agency API.`,
-    ].join('\n');
-
-    try {
-      const stream = query({
-        prompt: evaluationPrompt,
-        options: {
-          model: 'claude-opus-4-6',
-          customSystemPrompt: ceoBlueprint.systemPrompt,
-          cwd: this.resolveWorkDir(),
-          allowedTools: ['Bash'],
-          maxTurns: 15,
-          permissionMode: 'bypassPermissions',
-          env: sdkEnv,
-        },
-      });
-
-      let resultText = '';
-      for await (const message of stream) {
-        if (message.type === 'result' && message.subtype === 'success') {
-          resultText = (message as any).result;
-        }
-      }
-
-      // Announce completion
-      if (resultText) {
-        this.emit('message', 'ceo', 'leadership', resultText.slice(0, 300));
-      }
-
-      // Mark the original idea task as done
-      await this.store.updateTaskStatus(task.id, 'done');
-    } catch (err: any) {
-      this.emit('error', 'ceo', err);
-      // Fallback: assign directly to PM
-      await this.assignToPM(task);
-    }
   }
 
   /**
@@ -170,17 +78,6 @@ export class WorkflowEngine extends EventEmitter {
 
     await this.store.createTask(pmTask);
     await this.agentManager.assignTask('pm', pmTask);
-  }
-
-  /**
-   * Fallback: assign task directly to PM for breakdown.
-   */
-  private async assignToPM(task: Task): Promise<void> {
-    await this.store.updateTaskStatus(task.id, 'assigned', 'pm');
-    const pmAgent = await this.store.getAgent('pm');
-    if (pmAgent) {
-      await this.agentManager.assignTask('pm', task);
-    }
   }
 
   /**

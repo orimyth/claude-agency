@@ -84,7 +84,7 @@ export class Scheduler extends EventEmitter {
       const inProgress = tasks.filter(t => t.status === 'in_progress');
       const completed = tasks.filter(t => t.status === 'done' || t.status === 'review');
       const blocked = tasks.filter(t => t.status === 'blocked');
-      const pending = tasks.filter(t => t.status === 'backlog' || t.status === 'assigned');
+      const pending = tasks.filter(t => t.status === 'backlog' || t.status === 'queued');
 
       this.emit('statusReport', {
         agents,

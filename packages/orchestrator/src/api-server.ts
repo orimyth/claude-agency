@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'http';
+import crypto from 'crypto';
 import type { StateStore } from './state-store.js';
 import type { AgentManager } from './agent-manager.js';
 import type { TaskRouter } from './task-router.js';
@@ -7,6 +8,11 @@ import type { MemoryManager } from './memory-manager.js';
 import type { AgentToolHandler } from './agent-tools.js';
 import type { DashboardWSServer } from './ws-server.js';
 import { getSDKMetrics } from './sdk-util.js';
+import { Logger } from './logger.js';
+import { AgentScoringEngine } from './agent-scoring.js';
+import { TaskEstimator } from './task-estimator.js';
+
+const log = new Logger({ component: 'api-server' });
 
 // ---------------------------------------------------------------------------
 // Validation helpers
@@ -87,6 +93,13 @@ const MAX_BODY_SIZE = 256 * 1024;
  * Simple HTTP API for the dashboard.
  * Runs on the same port as the WebSocket server + 1 (e.g., 3002).
  */
+export interface APIServerOptions {
+  /** API key for authentication. If set, all requests must include Bearer token. */
+  apiKey?: string;
+  /** Allowed CORS origins. Defaults to '*'. Use comma-separated list for multiple. */
+  corsOrigins?: string;
+}
+
 export class APIServer {
   private store: StateStore;
   private agentManager: AgentManager;
@@ -98,16 +111,39 @@ export class APIServer {
   private server: ReturnType<typeof createServer> | null = null;
   private onSettingsChanged: (() => Promise<void>) | null = null;
 
+  // Security
+  private apiKeyHash: string | null = null;
+  private corsOrigins: string;
+  private scoringEngine: AgentScoringEngine;
+  private taskEstimator: TaskEstimator;
+
   // Rate limiters: mutation endpoints are stricter
   private mutationLimiter = new RateLimiter(30, 60_000);   // 30 req/min
   private readLimiter = new RateLimiter(120, 60_000);       // 120 req/min
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
-  constructor(store: StateStore, agentManager: AgentManager, taskRouter: TaskRouter, taskBoard: TaskBoard) {
+  constructor(
+    store: StateStore,
+    agentManager: AgentManager,
+    taskRouter: TaskRouter,
+    taskBoard: TaskBoard,
+    options: APIServerOptions = {},
+  ) {
     this.store = store;
     this.agentManager = agentManager;
     this.taskRouter = taskRouter;
     this.taskBoard = taskBoard;
+    this.scoringEngine = new AgentScoringEngine(store);
+    this.taskEstimator = new TaskEstimator(store);
+
+    // API key auth — store hash to avoid keeping key in memory
+    const key = options.apiKey ?? process.env.AGENCY_API_KEY;
+    if (key) {
+      this.apiKeyHash = crypto.createHash('sha256').update(key).digest('hex');
+      log.info('API key authentication enabled');
+    }
+
+    this.corsOrigins = options.corsOrigins ?? process.env.AGENCY_CORS_ORIGINS ?? '*';
 
     // Clean up rate limiter buckets every 5 min
     this.cleanupTimer = setInterval(() => {
@@ -134,10 +170,22 @@ export class APIServer {
 
   start(port: number): void {
     this.server = createServer(async (req, res) => {
-      // CORS
-      res.setHeader('Access-Control-Allow-Origin', '*');
+      const startMs = Date.now();
+      const url = new URL(req.url ?? '/', `http://${req.headers.host}`);
+
+      // CORS — configurable origins
+      const origin = req.headers.origin ?? '*';
+      if (this.corsOrigins === '*') {
+        res.setHeader('Access-Control-Allow-Origin', '*');
+      } else {
+        const allowed = this.corsOrigins.split(',').map(s => s.trim());
+        if (allowed.includes(origin)) {
+          res.setHeader('Access-Control-Allow-Origin', origin);
+          res.setHeader('Vary', 'Origin');
+        }
+      }
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, OPTIONS');
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
       if (req.method === 'OPTIONS') {
         res.writeHead(204);
@@ -146,30 +194,64 @@ export class APIServer {
       }
 
       try {
+        // API key authentication
+        if (this.apiKeyHash) {
+          const authHeader = req.headers.authorization;
+          if (!authHeader || !authHeader.startsWith('Bearer ')) {
+            res.writeHead(401, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Missing or invalid Authorization header' }));
+            return;
+          }
+          const token = authHeader.slice(7);
+          const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+          if (!crypto.timingSafeEqual(Buffer.from(tokenHash), Buffer.from(this.apiKeyHash))) {
+            log.warn('Authentication failed', { ip: req.socket.remoteAddress, path: url.pathname });
+            res.writeHead(403, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Invalid API key' }));
+            return;
+          }
+        }
+
         // Rate limiting
         const clientIp = req.socket.remoteAddress ?? 'unknown';
         const isMutation = req.method === 'POST' || req.method === 'PUT';
         const limiter = isMutation ? this.mutationLimiter : this.readLimiter;
         if (!limiter.allow(clientIp)) {
+          log.warn('Rate limited', { ip: clientIp, path: url.pathname });
           res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '60' });
           res.end(JSON.stringify({ error: 'Too many requests' }));
           return;
         }
 
         await this.route(req, res);
+
+        // Audit trail for mutations
+        if (isMutation) {
+          const durationMs = Date.now() - startMs;
+          log.info('API mutation', {
+            method: req.method,
+            path: url.pathname,
+            ip: clientIp,
+            status: res.statusCode,
+            durationMs,
+          });
+        }
       } catch (err: any) {
+        const durationMs = Date.now() - startMs;
         if (err instanceof ValidationError) {
+          log.warn('Validation error', { path: url.pathname, error: err.message, durationMs });
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: err.message }));
         } else {
+          log.error('Request error', { path: url.pathname, error: err.message, durationMs });
           res.writeHead(500, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: err.message }));
+          res.end(JSON.stringify({ error: 'Internal server error' }));
         }
       }
     });
 
     this.server.listen(port, () => {
-      console.log(`API server running on port ${port}`);
+      log.info('API server started', { port, auth: !!this.apiKeyHash, cors: this.corsOrigins });
     });
   }
 
@@ -394,6 +476,82 @@ export class APIServer {
       return;
     }
 
+    // Retire an agent — pause it and mark as retired
+    if (req.method === 'POST' && path === '/api/agency/retire') {
+      const body = await this.parseBody(req);
+      const agentId = requireString(body.agentId, 'agentId');
+      const blueprint = this.agentManager.getBlueprint(agentId);
+      if (!blueprint) {
+        this.json(res, { success: false, error: `Agent '${agentId}' not found` });
+        return;
+      }
+      // Pause the agent to stop active work
+      await this.agentManager.pauseAgent(agentId);
+      // Reassign any active tasks back to backlog
+      const tasks = await this.store.getTasksByAgent(agentId);
+      let reassigned = 0;
+      for (const task of tasks) {
+        if (['queued', 'assigned', 'in_progress'].includes(task.status)) {
+          await this.store.updateTaskStatus(task.id, 'backlog');
+          reassigned++;
+        }
+      }
+      this.json(res, {
+        success: true,
+        data: { agentId, status: 'retired', tasksReassigned: reassigned },
+      });
+      return;
+    }
+
+    // Direct task — send a message/task directly to an agent (investor override)
+    if (req.method === 'POST' && path === '/api/agency/direct') {
+      const body = await this.parseBody(req);
+      const agentId = requireString(body.agentId, 'agentId');
+      const message = requireString(body.message, 'message');
+      const blueprint = this.agentManager.getBlueprint(agentId);
+      if (!blueprint) {
+        this.json(res, { success: false, error: `Agent '${agentId}' not found` });
+        return;
+      }
+      if (body.asTask) {
+        // Create and assign as a task
+        const taskId = crypto.randomUUID();
+        const task = {
+          id: taskId,
+          title: message.slice(0, 100),
+          description: message,
+          status: 'assigned' as const,
+          projectId: body.projectId ?? null,
+          assignedTo: agentId,
+          createdBy: 'investor',
+          parentTaskId: null,
+          dependsOn: null,
+          priority: body.priority ?? 8,
+          deadline: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+        await this.store.createTask(task);
+        await this.agentManager.assignTask(agentId, task);
+        this.json(res, { success: true, data: { taskId, agentId, mode: 'task' } });
+      } else {
+        // Chat mode — get a response
+        const response = await this.agentManager.chat(agentId, message);
+        this.json(res, { success: true, data: { agentId, response, mode: 'chat' } });
+      }
+      return;
+    }
+
+    // Cancel a task
+    if (req.method === 'POST' && path.match(/^\/api\/tasks\/[^/]+\/cancel$/)) {
+      const taskId = path.split('/')[3];
+      const body = await this.parseBody(req);
+      const cancelledBy = body.cancelledBy ?? 'investor';
+      await this.store.cancelTask(taskId, cancelledBy);
+      this.json(res, { success: true, data: { taskId, status: 'cancelled' } });
+      return;
+    }
+
     if (req.method === 'POST' && path === '/api/agency/tasks' && this.toolHandler) {
       const body = await this.parseBody(req);
       // Support batch task creation: { tasks: [...] } — limit to 20 per request
@@ -425,6 +583,25 @@ export class APIServer {
       const agentId = path.split('/').pop()!;
       const perf = await this.store.getAgentPerformance(agentId);
       this.json(res, { agentId, ...perf });
+      return;
+    }
+
+    // --- Agent Scoring ---
+    if (req.method === 'GET' && path === '/api/scores') {
+      const blueprints = this.agentManager.getAllBlueprints();
+      const scores = await this.scoringEngine.scoreAll(blueprints);
+      this.json(res, scores);
+      return;
+    }
+
+    if (req.method === 'POST' && path === '/api/route-task') {
+      const body = await this.parseBody(req);
+      const title = requireString(body.title, 'title');
+      const description = typeof body.description === 'string' ? body.description : '';
+      const exclude = Array.isArray(body.exclude) ? body.exclude : [];
+      const blueprints = this.agentManager.getAllBlueprints();
+      const ranked = await this.scoringEngine.routeTask(blueprints, title, description, exclude);
+      this.json(res, ranked);
       return;
     }
 
@@ -529,7 +706,7 @@ export class APIServer {
       return;
     }
 
-    // --- Task duration estimates ---
+    // --- Task duration estimates (enhanced with confidence intervals) ---
     if (req.method === 'GET' && path === '/api/estimates') {
       const estimates = await this.store.getTaskDurationEstimates();
       this.json(res, estimates);
@@ -539,8 +716,36 @@ export class APIServer {
     if (req.method === 'GET' && path.match(/^\/api\/estimates\/[^/]+$/)) {
       const agentId = path.split('/')[3];
       const taskTitle = url.searchParams.get('title') ?? '';
-      const estimate = await this.store.estimateTaskDuration(agentId, taskTitle);
-      this.json(res, estimate ?? { estimatedMs: null, confidence: 'none' });
+      const estimate = await this.taskEstimator.estimate(agentId, taskTitle);
+      this.json(res, estimate);
+      return;
+    }
+
+    // Estimate entire project completion
+    if (req.method === 'GET' && path.match(/^\/api\/projects\/[^/]+\/estimate$/)) {
+      const projectId = path.split('/')[3];
+      const estimate = await this.taskEstimator.estimateProject(projectId);
+      this.json(res, estimate);
+      return;
+    }
+
+    // Bulk estimate for multiple tasks
+    if (req.method === 'POST' && path === '/api/estimates/bulk') {
+      const body = await this.parseBody(req);
+      if (!Array.isArray(body.tasks)) {
+        throw new ValidationError('tasks array is required');
+      }
+      if (body.tasks.length > 50) {
+        throw new ValidationError('Maximum 50 tasks per bulk estimate');
+      }
+      const results = await Promise.all(
+        body.tasks.map(async (t: { agentId?: string; title: string }) => ({
+          title: t.title,
+          agentId: t.agentId ?? null,
+          estimate: await this.taskEstimator.estimate(t.agentId ?? null, t.title),
+        }))
+      );
+      this.json(res, results);
       return;
     }
 
@@ -614,7 +819,7 @@ export class APIServer {
         throw new ValidationError('status must be "approved" or "rejected"');
       }
       if (approvalId) {
-        await this.store.resolveApproval(approvalId, status, body.feedback);
+        await this.store.resolveApproval(approvalId, status as 'approved' | 'rejected', body.feedback);
       }
       this.json(res, { ok: true });
       return;

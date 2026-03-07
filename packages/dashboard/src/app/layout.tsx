@@ -5,6 +5,8 @@ import { Sidebar } from "@/components/sidebar";
 import { ThemeProvider } from "@/components/theme-provider";
 import { ToastProvider } from "@/components/toast";
 import { CommandPaletteProvider } from "@/components/command-palette";
+import { EmergencyBanner } from "@/components/emergency-banner";
+import { WSProvider } from "@/components/ws-provider";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -33,12 +35,17 @@ export default function RootLayout({
       >
         <ThemeProvider>
           <ToastProvider>
-            <CommandPaletteProvider>
-              <div className="flex min-h-screen">
-                <Sidebar />
-                <main className="flex-1 p-8 overflow-auto">{children}</main>
-              </div>
-            </CommandPaletteProvider>
+            <WSProvider>
+              <CommandPaletteProvider>
+                <div className="flex min-h-screen">
+                  <Sidebar />
+                  <div className="flex-1 flex flex-col overflow-auto">
+                    <EmergencyBanner />
+                    <main className="flex-1 p-8">{children}</main>
+                  </div>
+                </div>
+              </CommandPaletteProvider>
+            </WSProvider>
           </ToastProvider>
         </ThemeProvider>
       </body>

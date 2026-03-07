@@ -1,7 +1,8 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { fetchProjects, fetchProject } from "@/lib/api";
+import { fetchProjects, fetchProject, fetchProjectEstimate } from "@/lib/api";
+import type { ProjectEstimate } from "@/lib/api";
 import { EmptyState } from "@/components/empty-state";
 import { SkeletonLine } from "@/components/skeleton";
 import { projectStyle, taskStyle } from "@/lib/status-colors";
@@ -111,18 +112,20 @@ function ProjectDetail({
   onBack: () => void;
 }) {
   const [project, setProject] = useState<Project | null>(null);
+  const [estimate, setEstimate] = useState<ProjectEstimate | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     setLoading(true);
-    fetchProject(projectId)
-      .then(setProject)
-      .catch(() => {})
-      .finally(() => setLoading(false));
+    Promise.all([
+      fetchProject(projectId).then(setProject).catch(() => {}),
+      fetchProjectEstimate(projectId).then(setEstimate).catch(() => {}),
+    ]).finally(() => setLoading(false));
 
     const interval = setInterval(() => {
       fetchProject(projectId).then(setProject).catch(() => {});
-    }, 10000);
+      fetchProjectEstimate(projectId).then(setEstimate).catch(() => {});
+    }, 15000);
     return () => clearInterval(interval);
   }, [projectId]);
 
@@ -185,6 +188,84 @@ function ProjectDetail({
           </div>
         )}
       </div>
+
+      {/* Estimated Completion */}
+      {estimate && estimate.tasks.length > 0 && estimate.confidence !== "none" && (
+        <div className="bg-white dark:bg-gray-900 rounded-xl shadow-sm border border-gray-100 dark:border-gray-800 p-6">
+          <h2 className="text-sm font-semibold text-gray-900 dark:text-gray-100 uppercase tracking-wide mb-3">
+            Estimated Completion
+          </h2>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+            <div>
+              <p className="text-xs text-gray-400 uppercase tracking-wide">Remaining</p>
+              <p className="text-lg font-bold text-gray-900 dark:text-white mt-0.5">
+                {estimate.totalRemainingMs < 60_000
+                  ? `${Math.round(estimate.totalRemainingMs / 1000)}s`
+                  : estimate.totalRemainingMs < 3600_000
+                    ? `${Math.round(estimate.totalRemainingMs / 60_000)}m`
+                    : `${(estimate.totalRemainingMs / 3600_000).toFixed(1)}h`}
+              </p>
+            </div>
+            <div>
+              <p className="text-xs text-gray-400 uppercase tracking-wide">ETA</p>
+              <p className="text-lg font-bold text-gray-900 dark:text-white mt-0.5">
+                {estimate.estimatedCompletionAt
+                  ? new Date(estimate.estimatedCompletionAt).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })
+                  : "—"}
+              </p>
+            </div>
+            <div>
+              <p className="text-xs text-gray-400 uppercase tracking-wide">Parallelism</p>
+              <p className="text-lg font-bold text-gray-900 dark:text-white mt-0.5">
+                {estimate.parallelism} agent{estimate.parallelism !== 1 ? "s" : ""}
+              </p>
+            </div>
+            <div>
+              <p className="text-xs text-gray-400 uppercase tracking-wide">Confidence</p>
+              <p className={`text-lg font-bold mt-0.5 ${
+                estimate.confidence === "high" ? "text-emerald-600" :
+                estimate.confidence === "medium" ? "text-amber-600" : "text-red-500"
+              }`}>
+                {estimate.confidence.charAt(0).toUpperCase() + estimate.confidence.slice(1)}
+              </p>
+            </div>
+          </div>
+
+          {/* Per-task estimates */}
+          {estimate.tasks.length > 0 && (
+            <div className="mt-4 space-y-1.5">
+              {estimate.tasks.slice(0, 10).map((t) => (
+                <div key={t.taskId} className="flex items-center gap-3 text-xs">
+                  <span className="flex-1 truncate text-gray-700 dark:text-gray-300">{t.title}</span>
+                  {t.assignedTo && (
+                    <span className="text-gray-400 flex-shrink-0">{t.assignedTo}</span>
+                  )}
+                  <span className="text-gray-500 dark:text-gray-400 tabular-nums flex-shrink-0 w-16 text-right">
+                    {t.estimate.estimatedMs > 0
+                      ? t.estimate.estimatedMs < 60_000
+                        ? `~${Math.round(t.estimate.estimatedMs / 1000)}s`
+                        : `~${Math.round(t.estimate.estimatedMs / 60_000)}m`
+                      : "—"}
+                  </span>
+                  {t.estimate.estimatedCostUsd !== null && t.estimate.estimatedCostUsd > 0 && (
+                    <span className="text-gray-400 tabular-nums flex-shrink-0 w-14 text-right">
+                      ${t.estimate.estimatedCostUsd < 0.01 ? t.estimate.estimatedCostUsd.toFixed(4) : t.estimate.estimatedCostUsd.toFixed(2)}
+                    </span>
+                  )}
+                  <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
+                    t.estimate.confidence === "high" ? "bg-emerald-500" :
+                    t.estimate.confidence === "medium" ? "bg-amber-500" :
+                    t.estimate.confidence === "low" ? "bg-red-400" : "bg-gray-300"
+                  }`} title={`${t.estimate.confidence} confidence (${t.estimate.sampleCount} samples)`} />
+                </div>
+              ))}
+              {estimate.tasks.length > 10 && (
+                <p className="text-xs text-gray-400 text-center mt-2">+ {estimate.tasks.length - 10} more tasks</p>
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Repositories */}
       {repos.length > 0 && (

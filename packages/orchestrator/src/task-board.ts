@@ -5,12 +5,15 @@ import type { Task, TaskStatus } from './types.js';
  * Valid state transitions for tasks.
  */
 const VALID_TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
-  backlog: ['assigned', 'done'],
-  assigned: ['in_progress', 'backlog', 'blocked'],
-  in_progress: ['review', 'blocked', 'assigned'],
-  review: ['done', 'in_progress', 'assigned'],
+  backlog: ['assigned', 'queued', 'done', 'cancelled'],
+  queued: ['in_progress', 'backlog', 'blocked', 'cancelled'],
+  assigned: ['in_progress', 'queued', 'backlog', 'blocked', 'cancelled'],
+  in_progress: ['verifying', 'review', 'done', 'blocked', 'assigned', 'cancelled'],
+  verifying: ['review', 'done', 'in_progress', 'blocked'],
+  review: ['done', 'in_progress', 'assigned', 'cancelled'],
   done: [],
-  blocked: ['assigned', 'backlog', 'in_progress'],
+  blocked: ['assigned', 'queued', 'backlog', 'in_progress', 'cancelled'],
+  cancelled: ['backlog'],
 };
 
 export class TaskBoard {
@@ -65,11 +68,14 @@ export class TaskBoard {
     const tasks = await this.store.getTasksByProject(projectId);
     const board: Record<TaskStatus, Task[]> = {
       backlog: [],
+      queued: [],
       assigned: [],
       in_progress: [],
+      verifying: [],
       review: [],
       done: [],
       blocked: [],
+      cancelled: [],
     };
     for (const task of tasks) {
       board[task.status].push(task);
@@ -81,7 +87,7 @@ export class TaskBoard {
     const tasks = await this.store.getTasksByAgent(agentId);
     return {
       active: tasks.filter(t => t.status === 'in_progress').length,
-      queued: tasks.filter(t => t.status === 'assigned').length,
+      queued: tasks.filter(t => t.status === 'assigned' || t.status === 'queued').length,
       completed: tasks.filter(t => t.status === 'done').length,
     };
   }

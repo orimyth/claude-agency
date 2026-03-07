@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
+import { useGlobalWS } from "@/components/ws-provider";
 import { fetchTasks, fetchAgents, fetchProjects, fetchProjectRepositories } from "@/lib/api";
 import { taskStyle } from "@/lib/status-colors";
 import { mapTaskBranches, type TaskBranchInfo } from "@/lib/branch-utils";
@@ -255,6 +256,7 @@ function KanbanColumn({
 // ---------------------------------------------------------------------------
 
 export default function KanbanPage() {
+  const { on } = useGlobalWS();
   const [tasks, setTasks] = useState<Task[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
@@ -291,9 +293,38 @@ export default function KanbanPage() {
 
     const interval = setInterval(() => {
       fetchTasks().then((d) => { if (Array.isArray(d)) setTasks(d); }).catch(() => {});
-    }, 8000);
+    }, 15000);
     return () => clearInterval(interval);
   }, []);
+
+  // Real-time task updates via WebSocket
+  useEffect(() => {
+    const unsub = on("task:update", (data) => {
+      setTasks((prev) => {
+        const existing = prev.find((t) => t.id === data.taskId);
+        if (existing) {
+          return prev.map((t) =>
+            t.id === data.taskId ? { ...t, status: data.status as TaskStatus, assignedTo: data.assignedTo ?? t.assignedTo } : t
+          );
+        }
+        return [...prev, {
+          id: data.taskId,
+          title: data.title || "",
+          description: "",
+          status: data.status as TaskStatus,
+          projectId: data.projectId || null,
+          assignedTo: data.assignedTo || null,
+          createdBy: "",
+          parentTaskId: null,
+          dependsOn: data.dependsOn || null,
+          priority: 0,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        }];
+      });
+    });
+    return unsub;
+  }, [on]);
 
   // Handle "drop" — local optimistic update
   const handleDrop = (taskId: string, newStatus: TaskStatus) => {

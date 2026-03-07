@@ -1,6 +1,6 @@
 "use client";
 
-import { useWebSocket } from "@/lib/ws-client";
+import { useGlobalWS } from "@/components/ws-provider";
 import { KPICard } from "@/components/kpi-card";
 import { AgentCard } from "@/components/agent-card";
 import { ActivityFeed } from "@/components/activity-feed";
@@ -8,12 +8,13 @@ import { SubmitIdea } from "@/components/submit-idea";
 import { SkeletonKPI, SkeletonAgentCard, SkeletonTaskRow } from "@/components/skeleton";
 import { EmptyState } from "@/components/empty-state";
 import { useToast } from "@/components/toast";
+import { SystemHealth } from "@/components/system-health";
+import { AgentCollabGraph } from "@/components/agent-graph";
 import { taskStyle } from "@/lib/status-colors";
 import { fetchAgents, fetchTasks, fetchApprovals, submitIdea } from "@/lib/api";
 import type { Agent, Task } from "@/lib/api";
+import { useRouter } from "next/navigation";
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
-
-const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:3001";
 
 /** Derive QA pipeline status from a task and its related tasks */
 function getQAPipelineStatus(task: Task, allTasks: Task[]): {
@@ -53,17 +54,18 @@ function getFeatureBranch(task: Task): string | null {
 }
 
 // Task status display order for grouping
-const STATUS_ORDER: Array<Task["status"]> = ["in_progress", "review", "assigned", "blocked", "backlog", "done"];
+const STATUS_ORDER: Array<Task["status"]> = ["in_progress", "verifying", "review", "queued", "assigned", "blocked", "backlog", "done", "cancelled"];
 
 export default function Dashboard() {
-  const { connected, events, on } = useWebSocket(WS_URL);
+  const { connected, events, on } = useGlobalWS();
   const { addToast } = useToast();
+  const router = useRouter();
   const [agents, setAgents] = useState<Agent[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [approvalCount, setApprovalCount] = useState(0);
   const [loading, setLoading] = useState(true);
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(
-    new Set(["in_progress", "review", "assigned", "blocked"])
+    new Set(["in_progress", "verifying", "review", "queued", "assigned", "blocked"])
   );
   const initialLoadDone = useRef(false);
 
@@ -256,6 +258,7 @@ export default function Dashboard() {
                       currentTask={agentTasks[0]?.title}
                       projectId={agentTasks[0]?.projectId ?? undefined}
                       taskCount={agentTasks.length > 1 ? agentTasks.length : undefined}
+                      onClick={() => router.push("/agents")}
                     />
                   );
                 })}
@@ -383,6 +386,8 @@ export default function Dashboard() {
         {/* Right column */}
         <div className="space-y-5">
           <SubmitIdea onSubmit={handleSubmitIdea} />
+          <SystemHealth />
+          <AgentCollabGraph />
           <ActivityFeed events={events} loading={loading} />
         </div>
       </div>

@@ -2,6 +2,7 @@
 
 import Image from "next/image";
 import { useState, useEffect, useMemo } from "react";
+import { useGlobalWS } from "@/components/ws-provider";
 import { fetchTimeline, fetchAgents } from "@/lib/api";
 import type { AgentTimeline, Agent } from "@/lib/api";
 
@@ -10,12 +11,12 @@ import type { AgentTimeline, Agent } from "@/lib/api";
 // ---------------------------------------------------------------------------
 
 const STATUS_COLORS: Record<string, { bg: string; border: string; text: string }> = {
-  done:        { bg: "bg-emerald-100", border: "border-emerald-400", text: "text-emerald-800" },
-  in_progress: { bg: "bg-blue-100",    border: "border-blue-400",    text: "text-blue-800" },
-  review:      { bg: "bg-purple-100",  border: "border-purple-400",  text: "text-purple-800" },
-  assigned:    { bg: "bg-amber-100",   border: "border-amber-400",   text: "text-amber-800" },
-  blocked:     { bg: "bg-red-100",     border: "border-red-400",     text: "text-red-800" },
-  backlog:     { bg: "bg-gray-100",    border: "border-gray-300",    text: "text-gray-600" },
+  done:        { bg: "bg-emerald-100 dark:bg-emerald-900/40", border: "border-emerald-400 dark:border-emerald-600", text: "text-emerald-800 dark:text-emerald-300" },
+  in_progress: { bg: "bg-blue-100 dark:bg-blue-900/40",      border: "border-blue-400 dark:border-blue-600",    text: "text-blue-800 dark:text-blue-300" },
+  review:      { bg: "bg-purple-100 dark:bg-purple-900/40",   border: "border-purple-400 dark:border-purple-600",  text: "text-purple-800 dark:text-purple-300" },
+  assigned:    { bg: "bg-amber-100 dark:bg-amber-900/40",     border: "border-amber-400 dark:border-amber-600",   text: "text-amber-800 dark:text-amber-300" },
+  blocked:     { bg: "bg-red-100 dark:bg-red-900/40",         border: "border-red-400 dark:border-red-600",      text: "text-red-800 dark:text-red-300" },
+  backlog:     { bg: "bg-gray-100 dark:bg-gray-800",          border: "border-gray-300 dark:border-gray-600",    text: "text-gray-600 dark:text-gray-400" },
 };
 
 const AGENT_STATUS_COLORS: Record<string, string> = {
@@ -60,6 +61,7 @@ const TIME_RANGES = [
 // ---------------------------------------------------------------------------
 
 export default function TimelinePage() {
+  const { on } = useGlobalWS();
   const [timeline, setTimeline] = useState<AgentTimeline[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
   const [hours, setHours] = useState(72);
@@ -86,13 +88,22 @@ export default function TimelinePage() {
     return () => clearInterval(interval);
   }, [hours]);
 
+  // Refresh when tasks complete
+  useEffect(() => {
+    const unsub = on("task:update", (data) => {
+      if (data.status === "done" || data.status === "in_progress") {
+        fetchTimeline(hours).then((d) => { if (Array.isArray(d)) setTimeline(d); }).catch(() => {});
+      }
+    });
+    return unsub;
+  }, [on, hours]);
+
   // Compute time bounds for the entire timeline
   const { timeStart, timeEnd, totalMs, hourMarkers } = useMemo(() => {
     const now = Date.now();
     const start = now - hours * 3_600_000;
     const total = now - start;
 
-    // Generate hour markers
     const markers: { label: string; pct: number; isDay: boolean }[] = [];
     const startHour = new Date(start);
     startHour.setMinutes(0, 0, 0);
@@ -107,7 +118,6 @@ export default function TimelinePage() {
         ? formatDate(d.toISOString())
         : formatTime(d.toISOString());
       markers.push({ label, pct, isDay });
-      // For long ranges, show every 6 hours
       cursor += hours > 72 ? 6 * 3_600_000 : hours > 24 ? 3 * 3_600_000 : 3_600_000;
     }
 
@@ -125,6 +135,24 @@ export default function TimelinePage() {
     0
   );
 
+  // Utilization: % of time agents were busy
+  const utilization = useMemo(() => {
+    if (timeline.length === 0) return 0;
+    let totalBusy = 0;
+    for (const agent of timeline) {
+      for (const task of agent.tasks) {
+        const start = Math.max(new Date(task.startedAt).getTime(), timeStart);
+        const end = Math.min(
+          task.completedAt ? new Date(task.completedAt).getTime() : Date.now(),
+          timeEnd
+        );
+        if (end > start) totalBusy += end - start;
+      }
+    }
+    const totalAvailable = timeline.length * totalMs;
+    return totalAvailable > 0 ? Math.round((totalBusy / totalAvailable) * 100) : 0;
+  }, [timeline, timeStart, timeEnd, totalMs]);
+
   const agentMap = new Map(agents.map((a) => [a.id, a]));
 
   return (
@@ -132,8 +160,8 @@ export default function TimelinePage() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-gray-900">Agent Timeline</h1>
-          <p className="text-gray-500 text-sm mt-1">
+          <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Agent Timeline</h1>
+          <p className="text-gray-500 dark:text-gray-400 text-sm mt-1">
             Swimlane view of agent activity over the last {hours}h
           </p>
         </div>
@@ -144,8 +172,8 @@ export default function TimelinePage() {
               onClick={() => setHours(r.hours)}
               className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
                 hours === r.hours
-                  ? "bg-gray-900 text-white"
-                  : "bg-gray-100 text-gray-600 hover:bg-gray-200"
+                  ? "bg-gray-900 dark:bg-gray-100 text-white dark:text-gray-900"
+                  : "bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700"
               }`}
             >
               {r.label}
@@ -155,41 +183,47 @@ export default function TimelinePage() {
       </div>
 
       {/* Summary Stats */}
-      <div className="grid grid-cols-4 gap-4">
-        <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-4">
-          <p className="text-sm text-gray-500">Active Agents</p>
-          <p className="text-2xl font-bold text-gray-900">{timeline.length}</p>
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+        <div className="bg-white dark:bg-gray-900 rounded-xl shadow-sm border border-gray-100 dark:border-gray-800 p-4">
+          <p className="text-sm text-gray-500 dark:text-gray-400">Active Agents</p>
+          <p className="text-2xl font-bold text-gray-900 dark:text-white">{timeline.length}</p>
         </div>
-        <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-4">
-          <p className="text-sm text-gray-500">Total Tasks</p>
-          <p className="text-2xl font-bold text-gray-900">{totalTasks}</p>
+        <div className="bg-white dark:bg-gray-900 rounded-xl shadow-sm border border-gray-100 dark:border-gray-800 p-4">
+          <p className="text-sm text-gray-500 dark:text-gray-400">Total Tasks</p>
+          <p className="text-2xl font-bold text-gray-900 dark:text-white">{totalTasks}</p>
         </div>
-        <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-4">
-          <p className="text-sm text-gray-500">Completed</p>
+        <div className="bg-white dark:bg-gray-900 rounded-xl shadow-sm border border-gray-100 dark:border-gray-800 p-4">
+          <p className="text-sm text-gray-500 dark:text-gray-400">Completed</p>
           <p className="text-2xl font-bold text-emerald-600">{completedTasks}</p>
         </div>
-        <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-4">
-          <p className="text-sm text-gray-500">In Progress</p>
+        <div className="bg-white dark:bg-gray-900 rounded-xl shadow-sm border border-gray-100 dark:border-gray-800 p-4">
+          <p className="text-sm text-gray-500 dark:text-gray-400">In Progress</p>
           <p className="text-2xl font-bold text-blue-600">{activeTasks}</p>
+        </div>
+        <div className="bg-white dark:bg-gray-900 rounded-xl shadow-sm border border-gray-100 dark:border-gray-800 p-4">
+          <p className="text-sm text-gray-500 dark:text-gray-400">Utilization</p>
+          <p className={`text-2xl font-bold ${utilization >= 60 ? "text-emerald-600" : utilization >= 30 ? "text-amber-600" : "text-gray-400"}`}>
+            {utilization}%
+          </p>
         </div>
       </div>
 
       {/* Swimlane Timeline */}
-      <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+      <div className="bg-white dark:bg-gray-900 rounded-xl shadow-sm border border-gray-100 dark:border-gray-800 overflow-hidden">
         {/* Time axis header */}
-        <div className="flex border-b border-gray-200">
-          <div className="w-52 flex-shrink-0 px-4 py-2 bg-gray-50 border-r border-gray-200">
-            <span className="text-xs font-medium text-gray-500 uppercase tracking-wide">Agent</span>
+        <div className="flex border-b border-gray-200 dark:border-gray-700">
+          <div className="w-52 flex-shrink-0 px-4 py-2 bg-gray-50 dark:bg-gray-950 border-r border-gray-200 dark:border-gray-700">
+            <span className="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wide">Agent</span>
           </div>
-          <div className="flex-1 relative h-8 bg-gray-50">
+          <div className="flex-1 relative h-8 bg-gray-50 dark:bg-gray-950">
             {hourMarkers.map((m, i) => (
               <div
                 key={i}
                 className="absolute top-0 h-full flex items-center"
                 style={{ left: `${m.pct}%` }}
               >
-                <div className={`h-full border-l ${m.isDay ? "border-gray-400" : "border-gray-200"}`} />
-                <span className={`ml-1 text-xs whitespace-nowrap ${m.isDay ? "font-semibold text-gray-700" : "text-gray-400"}`}>
+                <div className={`h-full border-l ${m.isDay ? "border-gray-400 dark:border-gray-500" : "border-gray-200 dark:border-gray-700"}`} />
+                <span className={`ml-1 text-xs whitespace-nowrap ${m.isDay ? "font-semibold text-gray-700 dark:text-gray-300" : "text-gray-400 dark:text-gray-500"}`}>
                   {m.label}
                 </span>
               </div>
@@ -206,7 +240,7 @@ export default function TimelinePage() {
 
         {/* Agent swimlanes */}
         {timeline.length === 0 ? (
-          <div className="px-4 py-12 text-center text-gray-400">
+          <div className="px-4 py-12 text-center text-gray-400 dark:text-gray-500">
             No agent activity in the selected time range.
           </div>
         ) : (
@@ -217,10 +251,10 @@ export default function TimelinePage() {
             return (
               <div
                 key={agentData.agentId}
-                className="flex border-b border-gray-100 last:border-b-0 hover:bg-gray-50/50 transition-colors"
+                className="flex border-b border-gray-100 dark:border-gray-800 last:border-b-0 hover:bg-gray-50/50 dark:hover:bg-gray-800/30 transition-colors"
               >
                 {/* Agent label */}
-                <div className="w-52 flex-shrink-0 px-4 py-3 border-r border-gray-100 flex items-center gap-3">
+                <div className="w-52 flex-shrink-0 px-4 py-3 border-r border-gray-100 dark:border-gray-800 flex items-center gap-3">
                   {agentData.avatar ? (
                     <Image
                       src={agentData.avatar}
@@ -230,16 +264,16 @@ export default function TimelinePage() {
                       className="w-8 h-8 rounded-full object-cover flex-shrink-0"
                     />
                   ) : (
-                    <div className="w-8 h-8 bg-gray-100 rounded-full flex items-center justify-center text-sm font-bold text-gray-600 flex-shrink-0">
+                    <div className="w-8 h-8 bg-gray-100 dark:bg-gray-800 rounded-full flex items-center justify-center text-sm font-bold text-gray-600 dark:text-gray-400 flex-shrink-0">
                       {agentData.agentName[0]}
                     </div>
                   )}
                   <div className="min-w-0">
                     <div className="flex items-center gap-1.5">
                       <div className={`w-2 h-2 rounded-full flex-shrink-0 ${AGENT_STATUS_COLORS[status] ?? "bg-gray-400"}`} />
-                      <p className="text-sm font-medium text-gray-900 truncate">{agentData.agentName}</p>
+                      <p className="text-sm font-medium text-gray-900 dark:text-gray-100 truncate">{agentData.agentName}</p>
                     </div>
-                    <p className="text-xs text-gray-400 truncate">{agentData.role}</p>
+                    <p className="text-xs text-gray-400 dark:text-gray-500 truncate">{agentData.role}</p>
                   </div>
                 </div>
 
@@ -249,7 +283,7 @@ export default function TimelinePage() {
                   {hourMarkers.map((m, i) => (
                     <div
                       key={i}
-                      className={`absolute top-0 h-full border-l ${m.isDay ? "border-gray-200" : "border-gray-100"}`}
+                      className={`absolute top-0 h-full border-l ${m.isDay ? "border-gray-200 dark:border-gray-700" : "border-gray-100 dark:border-gray-800"}`}
                       style={{ left: `${m.pct}%` }}
                     />
                   ))}
@@ -261,7 +295,6 @@ export default function TimelinePage() {
                       ? new Date(task.completedAt).getTime()
                       : Date.now();
 
-                    // Clamp to visible range
                     const clampedStart = Math.max(taskStart, timeStart);
                     const clampedEnd = Math.min(taskEnd, timeEnd);
                     if (clampedStart >= clampedEnd) return null;
@@ -276,7 +309,7 @@ export default function TimelinePage() {
                         key={task.id}
                         className={`absolute top-1.5 h-7 rounded-md border ${colors.bg} ${colors.border} ${colors.text}
                           cursor-pointer transition-all duration-150
-                          ${isHovered ? "shadow-md z-20 ring-2 ring-offset-1 ring-blue-300" : "z-10"}
+                          ${isHovered ? "shadow-md z-20 ring-2 ring-offset-1 ring-blue-300 dark:ring-blue-600 dark:ring-offset-gray-900" : "z-10"}
                         `}
                         style={{
                           left: `${leftPct}%`,
@@ -285,7 +318,6 @@ export default function TimelinePage() {
                         onMouseEnter={() => setHoveredTask(task.id)}
                         onMouseLeave={() => setHoveredTask(null)}
                       >
-                        {/* Task label (only visible if bar is wide enough) */}
                         {widthPct > 3 && (
                           <div className="px-1.5 h-full flex items-center overflow-hidden">
                             <span className="text-xs font-medium truncate">
@@ -294,9 +326,9 @@ export default function TimelinePage() {
                           </div>
                         )}
 
-                        {/* Tooltip on hover */}
+                        {/* Tooltip */}
                         {isHovered && (
-                          <div className="absolute bottom-full left-0 mb-2 w-64 bg-gray-900 text-white rounded-lg shadow-xl p-3 z-50 pointer-events-none">
+                          <div className="absolute bottom-full left-0 mb-2 w-64 bg-gray-900 dark:bg-gray-800 text-white rounded-lg shadow-xl p-3 z-50 pointer-events-none border border-gray-700">
                             <p className="text-sm font-medium mb-1 leading-tight">{task.title}</p>
                             <div className="space-y-0.5 text-xs text-gray-300">
                               <p>Status: <span className="text-white font-medium">{task.status}</span></p>
@@ -311,8 +343,7 @@ export default function TimelinePage() {
                                 <p className="text-blue-300 font-medium">In progress ({formatDuration(Date.now() - new Date(task.startedAt).getTime())})</p>
                               )}
                             </div>
-                            {/* Arrow */}
-                            <div className="absolute top-full left-4 w-0 h-0 border-l-4 border-r-4 border-t-4 border-transparent border-t-gray-900" />
+                            <div className="absolute top-full left-4 w-0 h-0 border-l-4 border-r-4 border-t-4 border-transparent border-t-gray-900 dark:border-t-gray-800" />
                           </div>
                         )}
 
@@ -336,8 +367,8 @@ export default function TimelinePage() {
       </div>
 
       {/* Legend */}
-      <div className="flex items-center gap-6 text-xs text-gray-500">
-        <span className="font-medium text-gray-700">Status:</span>
+      <div className="flex items-center gap-6 text-xs text-gray-500 dark:text-gray-400 flex-wrap">
+        <span className="font-medium text-gray-700 dark:text-gray-300">Status:</span>
         {Object.entries(STATUS_COLORS).map(([status, colors]) => (
           <div key={status} className="flex items-center gap-1.5">
             <div className={`w-3 h-3 rounded-sm border ${colors.bg} ${colors.border}`} />
