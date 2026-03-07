@@ -840,9 +840,12 @@ export class AgentManager extends EventEmitter {
     await this.store.updateAgentStatus(agentId, 'idle');
 
     if (!result) {
-      console.warn(`[AgentManager] Empty chat result for ${agentId}, retrying once...`);
-      // Retry once on empty result — SDK sometimes returns empty on first call
-      const retryStream = query({ prompt, options: chatOptions });
+      console.warn(`[AgentManager] Empty chat result for ${agentId}, retrying with fresh session...`);
+      // Retry with a fresh session — the existing session may be corrupted
+      const freshOptions = { ...chatOptions };
+      delete freshOptions.sessionId;
+      delete freshOptions.resume;
+      const retryStream = query({ prompt, options: freshOptions });
       for await (const msg of retryStream) {
         if (msg.type === 'result') {
           const r = msg as SDKResultMessage;

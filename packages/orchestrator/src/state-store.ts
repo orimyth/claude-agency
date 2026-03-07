@@ -83,6 +83,10 @@ export class StateStore {
 
       // Migration: drop workspace_path if it exists (moved to project_repositories)
       try { await conn.query(`ALTER TABLE projects DROP COLUMN workspace_path`); } catch { /* may not exist */ }
+      // Migration: add budget/lifecycle columns to projects
+      try { await conn.query(`ALTER TABLE projects ADD COLUMN budget_usd DECIMAL(10,2) NULL`); } catch { /* already exists */ }
+      try { await conn.query(`ALTER TABLE projects ADD COLUMN spent_usd DECIMAL(10,2) DEFAULT 0`); } catch { /* already exists */ }
+      try { await conn.query(`ALTER TABLE projects ADD COLUMN archived_at TIMESTAMP NULL`); } catch { /* already exists */ }
 
       await conn.query(`
         CREATE TABLE IF NOT EXISTS project_repositories (
@@ -151,6 +155,15 @@ export class StateStore {
       try { await conn.query(`ALTER TABLE tasks MODIFY project_id VARCHAR(64) NULL`); } catch { /* already nullable */ }
       // Migration: add depends_on column
       try { await conn.query(`ALTER TABLE tasks ADD COLUMN depends_on VARCHAR(64) NULL`); } catch { /* already exists */ }
+      // Migration: add task lifecycle columns (from migration-001, done here for safety)
+      try { await conn.query(`ALTER TABLE tasks ADD COLUMN completion_summary TEXT NULL`); } catch { /* already exists */ }
+      try { await conn.query(`ALTER TABLE tasks ADD COLUMN retry_count INT DEFAULT 0`); } catch { /* already exists */ }
+      try { await conn.query(`ALTER TABLE tasks ADD COLUMN needs_review BOOLEAN DEFAULT TRUE`); } catch { /* already exists */ }
+      try { await conn.query(`ALTER TABLE tasks ADD COLUMN cancelled_at TIMESTAMP NULL`); } catch { /* already exists */ }
+      try { await conn.query(`ALTER TABLE tasks ADD COLUMN cancelled_by VARCHAR(50) NULL`); } catch { /* already exists */ }
+      try { await conn.query(`ALTER TABLE tasks ADD COLUMN group_id VARCHAR(36) NULL`); } catch { /* already exists */ }
+      try { await conn.query(`ALTER TABLE tasks ADD COLUMN phase INT DEFAULT 0`); } catch { /* already exists */ }
+      try { await conn.query(`ALTER TABLE tasks ADD COLUMN deadline DATETIME NULL`); } catch { /* already exists */ }
 
       await conn.query(`
         CREATE TABLE IF NOT EXISTS task_dependencies (
@@ -299,9 +312,6 @@ export class StateStore {
       try { await conn.query(`CREATE INDEX idx_tasks_status_priority ON tasks (status, priority DESC, created_at)`); } catch { /* already exists */ }
       try { await conn.query(`CREATE INDEX idx_tasks_status_assigned ON tasks (status, assigned_to)`); } catch { /* already exists */ }
       try { await conn.query(`CREATE INDEX idx_tasks_status_updated ON tasks (status, updated_at)`); } catch { /* already exists */ }
-
-      // Migration: add deadline column to tasks
-      try { await conn.query(`ALTER TABLE tasks ADD COLUMN deadline DATETIME NULL`); } catch { /* already exists */ }
 
       // Task progress notes — intermediate updates agents post while working
       await conn.query(`

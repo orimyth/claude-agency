@@ -75,6 +75,17 @@ export class GitOps {
       git(`git -C "${repo.localPath}" rev-parse ${base}`, { timeout: 5000 });
     } catch {
       base = mainBranch;
+      // Check if local main exists — if not, repo is empty (no commits)
+      try {
+        git(`git -C "${repo.localPath}" rev-parse ${mainBranch}`, { timeout: 5000 });
+      } catch {
+        // Empty repo — create initial commit so we have a branch to work from
+        git(`git -C "${repo.localPath}" checkout -b ${mainBranch}`, { timeout: 5000 });
+        git(`git -C "${repo.localPath}" commit --allow-empty -m "Initial commit"`, { timeout: 10000 });
+        try {
+          git(`git -C "${repo.localPath}" push -u origin ${mainBranch}`, { timeout: 30000 });
+        } catch { /* push may fail if no remote write access — non-fatal */ }
+      }
     }
 
     // Create worktree with new branch
