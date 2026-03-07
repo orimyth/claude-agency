@@ -153,6 +153,15 @@ export class StateStore {
       try { await conn.query(`ALTER TABLE tasks ADD COLUMN depends_on VARCHAR(64) NULL`); } catch { /* already exists */ }
 
       await conn.query(`
+        CREATE TABLE IF NOT EXISTS task_dependencies (
+          task_id VARCHAR(64) NOT NULL,
+          depends_on_task_id VARCHAR(64) NOT NULL,
+          PRIMARY KEY (task_id, depends_on_task_id),
+          INDEX idx_depends_on (depends_on_task_id)
+        )
+      `);
+
+      await conn.query(`
         CREATE TABLE IF NOT EXISTS messages (
           id VARCHAR(64) PRIMARY KEY,
           from_agent_id VARCHAR(64) NULL,
