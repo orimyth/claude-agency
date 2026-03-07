@@ -117,3 +117,79 @@ html {
     transform: translateX(-50%) translateY(0) scale(1);
   }
 }
+
+/* Floating emote animation */
+@keyframes emoteFloat {
+  0% {
+    opacity: 0;
+    transform: translateY(0) scale(0.5);
+  }
+  15% {
+    opacity: 1;
+    transform: translateY(-8px) scale(1);
+  }
+  85% {
+    opacity: 1;
+    transform: translateY(-28px) scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-36px) scale(0.7);
+  }
+}
+
+/* Typing sparkle particles */
+@keyframes sparkle {
+  0% {
+    opacity: 0;
+    transform: translate(0, 0) scale(0);
+  }
+  30% {
+    opacity: 1;
+    transform: translate(var(--sx), var(--sy)) scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: translate(var(--ex), var(--ey)) scale(0);
+  }
+}
+
+/* Steam rising animation */
+@keyframes steamRise {
+  0% {
+    opacity: 0.6;
+    transform: translateY(0) scaleX(1);
+  }
+  50% {
+    opacity: 0.3;
+    transform: translateY(-8px) scaleX(1.3);
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-16px) scaleX(0.8);
+  }
+}
+
+/* Detail panel slide in */
+@keyframes panelSlideIn {
+  from {
+    opacity: 0;
+    transform: translateX(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+/* Clock second hand tick */
+@keyframes clockTick {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+/* Screen flicker for monitors */
+@keyframes screenFlicker {
+  0%, 100% { opacity: 0.8; }
+  50% { opacity: 1; }
+}
