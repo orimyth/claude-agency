@@ -1753,6 +1753,54 @@ export class StateStore {
     }));
   }
 
+  /**
+   * Get agent activity timeline: task history per agent for swimlane visualization.
+   * Returns completed/in-progress tasks with timing info, grouped by agent.
+   */
+  async getAgentTimeline(hours = 72): Promise<Array<{
+    agentId: string;
+    tasks: Array<{
+      id: string;
+      title: string;
+      status: string;
+      startedAt: string;
+      completedAt: string | null;
+      durationMs: number | null;
+    }>;
+  }>> {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      `SELECT t.id, t.title, t.status, t.assigned_to, t.created_at, t.updated_at
+       FROM tasks t
+       WHERE t.assigned_to IS NOT NULL
+         AND t.created_at > DATE_SUB(NOW(), INTERVAL ? HOUR)
+       ORDER BY t.assigned_to, t.created_at ASC`,
+      [hours]
+    );
+
+    const byAgent = new Map<string, Array<{
+      id: string; title: string; status: string;
+      startedAt: string; completedAt: string | null; durationMs: number | null;
+    }>>();
+
+    for (const r of rows) {
+      const agentId = r.assigned_to;
+      if (!byAgent.has(agentId)) byAgent.set(agentId, []);
+      const started = new Date(r.created_at);
+      const updated = new Date(r.updated_at);
+      const completed = r.status === 'done' ? updated : null;
+      byAgent.get(agentId)!.push({
+        id: r.id,
+        title: r.title,
+        status: r.status,
+        startedAt: started.toISOString(),
+        completedAt: completed ? completed.toISOString() : null,
+        durationMs: completed ? completed.getTime() - started.getTime() : null,
+      });
+    }
+
+    return Array.from(byAgent.entries()).map(([agentId, tasks]) => ({ agentId, tasks }));
+  }
+
   private mapTask(row: RowDataPacket): Task {
     return {
       id: row.id,

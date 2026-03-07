@@ -669,6 +669,20 @@ export class APIServer {
       return;
     }
 
+    // --- Agent Timeline (swimlane visualization) ---
+    if (req.method === 'GET' && path === '/api/timeline') {
+      const hours = optionalInt(url.searchParams.get('hours'), 72, 1, 720);
+      const timeline = await this.store.getAgentTimeline(hours);
+      // Enrich with agent names
+      const blueprints = this.agentManager.getAllBlueprints();
+      const enriched = timeline.map(t => {
+        const bp = blueprints.find(b => b.id === t.agentId);
+        return { ...t, agentName: bp?.name ?? t.agentId, role: bp?.role ?? 'Unknown', avatar: bp?.avatar ?? null };
+      });
+      this.json(res, enriched);
+      return;
+    }
+
     // --- SDK Metrics (in-process quickQuery stats) ---
     if (req.method === 'GET' && path === '/api/sdk-metrics') {
       this.json(res, getSDKMetrics());

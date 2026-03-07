@@ -106,6 +106,32 @@ export async function fetchTasks(projectId?: string): Promise<Task[]> {
     ? `${API_BASE}/api/tasks?projectId=${projectId}`
     : `${API_BASE}/api/tasks`;
   const res = await fetch(url);
+  const data = await res.json();
+  // Support both old (array) and new (paginated envelope) response shapes
+  return Array.isArray(data) ? data : (data.tasks ?? []);
+}
+
+// --- Timeline types & API ---
+
+export interface TimelineTask {
+  id: string;
+  title: string;
+  status: string;
+  startedAt: string;
+  completedAt: string | null;
+  durationMs: number | null;
+}
+
+export interface AgentTimeline {
+  agentId: string;
+  agentName: string;
+  role: string;
+  avatar: string | null;
+  tasks: TimelineTask[];
+}
+
+export async function fetchTimeline(hours = 72): Promise<AgentTimeline[]> {
+  const res = await fetch(`${API_BASE}/api/timeline?hours=${hours}`);
   return res.json();
 }
 
