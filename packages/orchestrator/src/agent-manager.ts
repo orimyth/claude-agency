@@ -47,7 +47,7 @@ export class AgentManager extends EventEmitter {
   private activeSessions: Map<string, AbortController> = new Map();
   /** Persistent session IDs per agent — allows resuming conversations instead of starting fresh. */
   private agentSessionIds: Map<string, string> = new Map();
-  /** Persistent session IDs for chat (separate from task sessions). */
+  /** Persistent session IDs for chat, keyed by "agentId:channel" for isolation. */
   private chatSessionIds: Map<string, string> = new Map();
   private activeCount = 0;
   private languageOverride: string | null = null;
@@ -515,7 +515,7 @@ export class AgentManager extends EventEmitter {
    * Send a conversational message to an agent and get a response.
    * Unlike assignTask, this doesn't create tasks — it's for direct chat.
    */
-  async chat(agentId: string, message: string, context?: string): Promise<string> {
+  async chat(agentId: string, message: string, context?: string, channel = 'default'): Promise<string> {
     const blueprint = this.blueprints.get(agentId);
     if (!blueprint) throw new Error(`No blueprint for agent ${agentId}`);
 
@@ -530,8 +530,10 @@ export class AgentManager extends EventEmitter {
       ? `${langRule}\n\n${context}`
       : `${langRule}\n\nThe investor (your boss) just sent you this message on Slack:\n\n"${message}"\n\nRespond naturally. If they're asking you to build or do something, say you'll get the team on it. If it's casual chat, just be friendly and human. Keep it short — 1-3 sentences max, like a real Slack message.`;
 
-    // Resume chat session if available — keeps conversational context
-    const existingChatSession = this.chatSessionIds.get(agentId);
+    // Resume chat session if available — keyed by agent+channel for isolation.
+    // This means Alice's investor DM session stays separate from her #leadership chats.
+    const sessionKey = `${agentId}:${channel}`;
+    const existingChatSession = this.chatSessionIds.get(sessionKey);
     const chatOptions: Record<string, any> = {
       model: CHAT_MODEL,
       customSystemPrompt: blueprint.systemPrompt,
@@ -555,7 +557,7 @@ export class AgentManager extends EventEmitter {
         if (r.subtype === 'success') result = r.result;
         // Capture chat session ID for future resumption
         if ((r as any).sessionId) {
-          this.chatSessionIds.set(agentId, (r as any).sessionId);
+          this.chatSessionIds.set(sessionKey, (r as any).sessionId);
         }
         try {
           await this.store.recordUsage({
@@ -600,7 +602,7 @@ export class AgentManager extends EventEmitter {
       `Respond naturally as ${to.name}. Keep it short — 1-3 sentences, like a real Slack message. Only respond with your message.`,
     ].join('\n');
 
-    const response = await this.chat(toId, message, context);
+    const response = await this.chat(toId, message, context, channel);
     this.emit('message', toId, channel, response);
     return response;
   }

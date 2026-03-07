@@ -418,7 +418,7 @@ export class Agency {
           `Write a casual 2-4 sentence Slack update. Be like a real CEO checking in. If everything is quiet, keep it very short. If there are blocked tasks, flag them. Only output the message itself, nothing else.`,
         ].filter(Boolean).join('\n');
 
-        const report = await this.agentManager.chat('ceo', '', context);
+        const report = await this.agentManager.chat('ceo', '', context, 'status-reports');
         if (this.slack) {
           const ceoBp = this.agentManager.getBlueprint('ceo');
           await this.slack.sendAgentMessage('agency-general', 'Alice', 'CEO', report, ceoBp?.avatar);
@@ -469,7 +469,7 @@ export class Agency {
           `The JSON must be on its own line at the very end.`,
         ].filter(Boolean).join('\n');
 
-        const rawResponse = await this.agentManager.chat('ceo', msg.text, combinedContext);
+        const rawResponse = await this.agentManager.chat('ceo', msg.text, combinedContext, 'ceo-investor');
 
         // Parse combined response: split chat response from intent JSON
         const jsonMatch = rawResponse.match(/\{[^{}]*"intent"\s*:\s*"[^"]*"[^{}]*\}\s*$/);
@@ -596,7 +596,7 @@ export class Agency {
             `Only respond with your message, nothing else. No markdown, no bold, plain text only.`,
           ].join('\n');
 
-          const chatResponse = await this.agentManager.chat(agentId, msg.text, context);
+          const chatResponse = await this.agentManager.chat(agentId, msg.text, context, slackChannel);
           await this.slack!.sendAgentMessage(slackChannel, blueprint.name, blueprint.role, chatResponse, blueprint.avatar);
 
           await this.store.saveMessage({
@@ -840,7 +840,8 @@ export class Agency {
   private async routeToHr(investorMessage: string, ceoResponse: string): Promise<void> {
     try {
       const hrResponse = await this.agentManager.chat('hr', investorMessage,
-        `You are Bob (HR Manager). The investor asked: "${investorMessage}"\n\nAlice (CEO) responded: "${ceoResponse}"\n\nIf this is a hiring request, create the blueprint JSON immediately. Include all required fields: id, role, name, gender, systemPrompt. Respond with your message and the JSON blueprint if applicable.`
+        `You are Bob (HR Manager). The investor asked: "${investorMessage}"\n\nAlice (CEO) responded: "${ceoResponse}"\n\nIf this is a hiring request, create the blueprint JSON immediately. Include all required fields: id, role, name, gender, systemPrompt. Respond with your message and the JSON blueprint if applicable.`,
+        'leadership'
       );
       if (this.slack) {
         const hrBp = this.agentManager.getBlueprint('hr');
