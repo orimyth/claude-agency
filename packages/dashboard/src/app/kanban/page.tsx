@@ -1,9 +1,10 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
-import { fetchTasks, fetchAgents, fetchProjects } from "@/lib/api";
+import { fetchTasks, fetchAgents, fetchProjects, fetchProjectRepositories } from "@/lib/api";
 import { taskStyle } from "@/lib/status-colors";
-import type { Task, TaskStatus, Agent, Project } from "@/lib/api";
+import { mapTaskBranches, type TaskBranchInfo } from "@/lib/branch-utils";
+import type { Task, TaskStatus, Agent, Project, ProjectRepository } from "@/lib/api";
 
 // ---------------------------------------------------------------------------
 // Column definitions
@@ -29,6 +30,7 @@ function TaskCard({
   allTasks,
   isDragging,
   onDragStart,
+  branchInfo,
 }: {
   task: Task;
   agent: Agent | undefined;
@@ -36,6 +38,7 @@ function TaskCard({
   allTasks: Task[];
   isDragging: boolean;
   onDragStart: () => void;
+  branchInfo: TaskBranchInfo | undefined;
 }) {
   const dep = task.dependsOn ? allTasks.find((t) => t.id === task.dependsOn) : null;
   const isWaiting = dep && dep.status !== "done";
@@ -105,6 +108,43 @@ function TaskCard({
         </div>
       )}
 
+      {/* Branch / PR link */}
+      {branchInfo && (
+        <div className="mt-2 flex items-center gap-1.5 flex-wrap">
+          <a
+            href={branchInfo.branchUrl ?? "#"}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={(e) => e.stopPropagation()}
+            className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 text-[10px] font-mono text-gray-600 dark:text-gray-300 transition-colors max-w-[160px]"
+            title={branchInfo.branchName}
+          >
+            <svg className="w-3 h-3 flex-shrink-0 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6" />
+            </svg>
+            <span className="truncate">{branchInfo.branchName}</span>
+            {branchInfo.isActive && (
+              <span className="w-1.5 h-1.5 rounded-full bg-green-500 flex-shrink-0" title="Active branch" />
+            )}
+          </a>
+          {branchInfo.prUrl && (
+            <a
+              href={branchInfo.prUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              onClick={(e) => e.stopPropagation()}
+              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-purple-50 dark:bg-purple-900/30 hover:bg-purple-100 dark:hover:bg-purple-900/50 text-[10px] font-medium text-purple-600 dark:text-purple-400 transition-colors"
+              title="Open PR / Compare"
+            >
+              <svg className="w-3 h-3 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4" />
+              </svg>
+              PR
+            </a>
+          )}
+        </div>
+      )}
+
       {/* Description preview */}
       {task.description && task.description.length > 0 && (
         <p className="mt-1.5 text-[11px] text-gray-400 dark:text-gray-500 line-clamp-2 leading-relaxed">
@@ -130,6 +170,7 @@ function KanbanColumn({
   draggingId,
   setDraggingId,
   onDrop,
+  branchMap,
 }: {
   status: TaskStatus;
   label: string;
@@ -141,6 +182,7 @@ function KanbanColumn({
   draggingId: string | null;
   setDraggingId: (id: string | null) => void;
   onDrop: (taskId: string, newStatus: TaskStatus) => void;
+  branchMap: Map<string, TaskBranchInfo>;
 }) {
   const [dragOver, setDragOver] = useState(false);
 
@@ -199,6 +241,7 @@ function KanbanColumn({
               allTasks={allTasks}
               isDragging={draggingId === task.id}
               onDragStart={() => setDraggingId(task.id)}
+              branchInfo={branchMap.get(task.id)}
             />
           ))
         )}
@@ -215,16 +258,35 @@ export default function KanbanPage() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
+  const [repositories, setRepositories] = useState<ProjectRepository[]>([]);
   const [loading, setLoading] = useState(true);
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [filterProject, setFilterProject] = useState<string>("all");
   const [filterAgent, setFilterAgent] = useState<string>("all");
 
+  // Fetch repos for all projects
+  const loadRepos = async (projectsList: Project[]) => {
+    const allRepos: ProjectRepository[] = [];
+    await Promise.all(
+      projectsList.map((p) =>
+        fetchProjectRepositories(p.id)
+          .then((repos) => { if (Array.isArray(repos)) allRepos.push(...repos); })
+          .catch(() => {})
+      )
+    );
+    setRepositories(allRepos);
+  };
+
   useEffect(() => {
     Promise.all([
       fetchTasks().then((d) => { if (Array.isArray(d)) setTasks(d); }).catch(() => {}),
       fetchAgents().then((d) => { if (Array.isArray(d)) setAgents(d); }).catch(() => {}),
-      fetchProjects().then((d) => { if (Array.isArray(d)) setProjects(d); }).catch(() => {}),
+      fetchProjects().then((d) => {
+        if (Array.isArray(d)) {
+          setProjects(d);
+          loadRepos(d);
+        }
+      }).catch(() => {}),
     ]).finally(() => setLoading(false));
 
     const interval = setInterval(() => {
@@ -254,6 +316,9 @@ export default function KanbanPage() {
     const group = grouped.get(task.status);
     if (group) group.push(task);
   }
+
+  // Build branch map from repositories
+  const branchMap = mapTaskBranches(tasks, repositories);
 
   return (
     <div className="h-[calc(100vh-4rem)]">
@@ -320,6 +385,7 @@ export default function KanbanPage() {
               draggingId={draggingId}
               setDraggingId={setDraggingId}
               onDrop={handleDrop}
+              branchMap={branchMap}
             />
           ))}
         </div>
