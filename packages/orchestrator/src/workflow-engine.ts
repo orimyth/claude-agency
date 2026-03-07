@@ -104,6 +104,7 @@ export class WorkflowEngine extends EventEmitter {
       const stream = query({
         prompt: evaluationPrompt,
         options: {
+          model: 'claude-opus-4-6',
           customSystemPrompt: ceoBlueprint.systemPrompt,
           cwd: this.resolveWorkDir(),
           allowedTools: ['Bash'],

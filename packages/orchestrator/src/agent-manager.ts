@@ -21,7 +21,9 @@ if (!sdkEnv.PATH?.includes(nodeDir)) {
 /** Roles that get agency management tools (can create projects, tasks, etc.) */
 const MANAGEMENT_ROLES = new Set(['ceo', 'pm', 'architect', 'hr']);
 
-/** Mid-tier model for conversational responses (chat, notifications). */
+/** Best model for complex task execution (coding, architecture, planning). */
+const TASK_MODEL = 'claude-opus-4-6';
+/** Mid-tier model for conversational responses (chat, agent-to-agent). */
 const CHAT_MODEL = 'claude-sonnet-4-6';
 
 /** Worker roles that only get git push/repo listing APIs */
@@ -43,6 +45,10 @@ export class AgentManager extends EventEmitter {
   private config: AgencyConfig;
   private blueprints: Map<string, AgentBlueprint> = new Map();
   private activeSessions: Map<string, AbortController> = new Map();
+  /** Persistent session IDs per agent — allows resuming conversations instead of starting fresh. */
+  private agentSessionIds: Map<string, string> = new Map();
+  /** Persistent session IDs for chat (separate from task sessions). */
+  private chatSessionIds: Map<string, string> = new Map();
   private activeCount = 0;
   private languageOverride: string | null = null;
   private memoryManager: MemoryManager | null = null;
@@ -232,17 +238,30 @@ export class AgentManager extends EventEmitter {
     agentEnv.AGENCY_AGENT_ID = blueprint.id;
 
     try {
+      // Resume existing session if available — keeps context across tasks.
+      // This means the agent remembers previous work, decisions, and codebase knowledge.
+      const existingSession = this.agentSessionIds.get(blueprint.id);
+
+      const queryOptions: Record<string, any> = {
+        model: TASK_MODEL,
+        customSystemPrompt: blueprint.systemPrompt,
+        cwd: workDir,
+        allowedTools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep'],
+        abortController,
+        permissionMode: 'bypassPermissions',
+        maxTurns: 50,
+        env: agentEnv,
+      };
+
+      // If we have a previous session, resume it to maintain context
+      if (existingSession) {
+        queryOptions.sessionId = existingSession;
+        queryOptions.resume = true;
+      }
+
       const stream = query({
         prompt,
-        options: {
-          customSystemPrompt: blueprint.systemPrompt,
-          cwd: workDir,
-          allowedTools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep'],
-          abortController,
-          permissionMode: 'bypassPermissions',
-          maxTurns: 50,
-          env: agentEnv,
-        },
+        options: queryOptions,
       });
 
       let resultText = '';
@@ -269,6 +288,10 @@ export class AgentManager extends EventEmitter {
           lastResult = resultMsg;
           if (resultMsg.subtype === 'success') {
             resultText = resultMsg.result;
+          }
+          // Capture session ID for future resumption
+          if ((resultMsg as any).sessionId) {
+            this.agentSessionIds.set(blueprint.id, (resultMsg as any).sessionId);
           }
         }
       }
@@ -507,24 +530,33 @@ export class AgentManager extends EventEmitter {
       ? `${langRule}\n\n${context}`
       : `${langRule}\n\nThe investor (your boss) just sent you this message on Slack:\n\n"${message}"\n\nRespond naturally. If they're asking you to build or do something, say you'll get the team on it. If it's casual chat, just be friendly and human. Keep it short — 1-3 sentences max, like a real Slack message.`;
 
-    const stream = query({
-      prompt,
-      options: {
-        model: CHAT_MODEL,
-        customSystemPrompt: blueprint.systemPrompt,
-        cwd: workDir,
-        allowedTools: [],
-        maxTurns: 1,
-        permissionMode: 'bypassPermissions',
-        env: sdkEnv,
-      },
-    });
+    // Resume chat session if available — keeps conversational context
+    const existingChatSession = this.chatSessionIds.get(agentId);
+    const chatOptions: Record<string, any> = {
+      model: CHAT_MODEL,
+      customSystemPrompt: blueprint.systemPrompt,
+      cwd: workDir,
+      allowedTools: [],
+      maxTurns: 1,
+      permissionMode: 'bypassPermissions',
+      env: sdkEnv,
+    };
+    if (existingChatSession) {
+      chatOptions.sessionId = existingChatSession;
+      chatOptions.resume = true;
+    }
+
+    const stream = query({ prompt, options: chatOptions });
 
     let result = '';
     for await (const msg of stream) {
       if (msg.type === 'result') {
         const r = msg as SDKResultMessage;
         if (r.subtype === 'success') result = r.result;
+        // Capture chat session ID for future resumption
+        if ((r as any).sessionId) {
+          this.chatSessionIds.set(agentId, (r as any).sessionId);
+        }
         try {
           await this.store.recordUsage({
             id: crypto.randomUUID(),
