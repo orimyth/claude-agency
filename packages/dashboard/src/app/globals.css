@@ -77,3 +77,31 @@ body {
     transform: scale(1) translateY(0);
   }
 }
+
+/* Pixel office — character animations */
+@keyframes pixelBob {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-2px); }
+}
+
+@keyframes pixelWalk {
+  0% { transform: translateY(0) rotate(-2deg); }
+  50% { transform: translateY(-3px) rotate(2deg); }
+  100% { transform: translateY(0) rotate(-2deg); }
+}
+
+@keyframes pixelSit {
+  0%, 100% { transform: translateY(2px); }
+  50% { transform: translateY(1px); }
+}
+
+@keyframes bubbleFadeIn {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(4px) scale(0.9);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0) scale(1);
+  }
+}
